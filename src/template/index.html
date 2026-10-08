@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1.0"
+    >
+
+    <title>Deep Research Agent</title>
+
+    <link
+        rel="stylesheet"
+        href="/static/css/styles.css"
+    >
+</head>
+
+<body>
+    <main class="page-container">
+        <header class="app-header">
+            <p class="eyebrow">
+                Multi-Agent Research System
+            </p>
+
+            <h1>
+                Deep Research Agent
+            </h1>
+
+            <p class="subtitle">
+                Ask a research question. The system will plan,
+                search, extract evidence, evaluate coverage,
+                and produce a grounded report.
+            </p>
+        </header>
+
+        <section class="panel">
+            <form id="research-form">
+                <label
+                    for="research-question"
+                    class="form-label"
+                >
+                    Research question
+                </label>
+
+                <textarea
+                    id="research-question"
+                    name="question"
+                    rows="7"
+                    minlength="3"
+                    required
+                    placeholder="Example: How are AI coding assistants affecting software engineering productivity and code quality?"
+                ></textarea>
+
+                <div class="form-footer">
+                    <span class="source-label">
+                        Source: Web
+                    </span>
+
+                    <button
+                        id="research-button"
+                        type="submit"
+                    >
+                        Start Research
+                    </button>
+                </div>
+            </form>
+        </section>
+
+        <section
+            id="status-panel"
+            class="panel status-panel hidden"
+            aria-live="polite"
+        >
+            <div class="status-row">
+                <div
+                    id="status-spinner"
+                    class="spinner hidden"
+                    aria-hidden="true"
+                ></div>
+
+                <div>
+                    <strong id="status-title">
+                        Researching
+                    </strong>
+
+                    <p id="status-message">
+                    </p>
+                </div>
+            </div>
+        </section>
+
+        <section
+            id="result-panel"
+            class="panel result-panel hidden"
+        >
+            <div class="result-header">
+                <div>
+                    <p class="eyebrow">
+                        Research Result
+                    </p>
+
+                    <h2>
+                        Report
+                    </h2>
+                </div>
+
+                <div
+                    id="result-status"
+                    class="status-badge"
+                ></div>
+            </div>
+
+            <div
+                id="job-metadata"
+                class="metadata"
+            ></div>
+
+            <section class="report-section">
+                <h3>
+                    Summary
+                </h3>
+
+                <p id="report-summary">
+                </p>
+            </section>
+
+            <section class="report-section">
+                <h3>
+                    Key Findings
+                </h3>
+
+                <div id="report-findings">
+                </div>
+            </section>
+
+            <section class="report-section">
+                <h3>
+                    Limitations
+                </h3>
+
+                <ul id="report-limitations">
+                </ul>
+            </section>
+
+            <section class="report-section">
+                <h3>
+                    Sources
+                </h3>
+
+                <ol id="report-sources">
+                </ol>
+            </section>
+
+            <section
+                id="workflow-errors-section"
+                class="report-section hidden"
+            >
+                <h3>
+                    Workflow Notes
+                </h3>
+
+                <ul id="workflow-errors">
+                </ul>
+            </section>
+
+            <details
+                id="markdown-section"
+                class="markdown-section"
+            >
+                <summary>
+                    View generated Markdown
+                </summary>
+
+                <pre id="report-markdown"></pre>
+            </details>
+        </section>
+    </main>
+
+    <script
+        src="/static/js/app.js"
+        defer
+    ></script>
+</body>
+</html>
+
