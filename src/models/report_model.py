@@ -28,14 +28,13 @@ class DraftReport(BaseModel):
     @field_validator(
         "limitations",
         mode="before",
-        json_schema_input_type=str | list[str],
     )
     @classmethod
     def normalize_limitations(
         cls,
         value: str | list[str],
     ) -> list[str]:
-        """Normalizes a single limitation string into the application list format."""
+        """Normalize a single limitation string into a list."""
 
         if isinstance(value, str):
             value = value.strip()

@@ -1,22 +1,23 @@
 """Research Web Search node."""
 
-import logging
+import asyncio
 import json
+import logging
+from datetime import datetime, timezone
 
 from src.config import Settings
 from src.graph.graph_state import WorkflowState
-from src.models import (
-    ErrorType,
-    ResearchError,
-    SearchResult,
-)
-from src.tools.search import (
-    SearchProvider,
-    SearchProviderError,
-)
+from src.models import ErrorType, ResearchError, SearchResult
+from src.tools.search import SearchProvider, SearchProviderError
 
 
 logger = logging.getLogger(__name__)
+
+
+def _seconds_remaining(state: WorkflowState) -> float:
+    control = state["research_control"]
+    elapsed = (datetime.now(timezone.utc) - control.usage.started_at).total_seconds()
+    return max(0.0, control.budget.max_research_seconds - elapsed)
 
 
 async def research_web_search_node(
@@ -25,25 +26,24 @@ async def research_web_search_node(
     search_provider: SearchProvider,
     settings: Settings,
 ) -> dict:
-    """
-    Executes search queries belonging to the current research iteration.
-
-    Individual query failures are recoverable so successful queries from
-    the same iteration can continue through the pipeline.
-    """
-
-    target_iteration = state["research"]["iteration_count"] + 1
-
+    """Search the current iteration's queries without exceeding execution budgets."""
+    research = state["research"]
+    control = state["research_control"]
+    target_iteration = research["iteration_count"] + 1
     iteration_queries = [
-        search_query
-        for search_query
-        in state["research"]["search_queries"]
-        if (search_query.iteration == target_iteration)
+        query for query in research["search_queries"]
+        if query.iteration == target_iteration
     ]
-
-    current_results = list(state["research"]["search_results"])
+    current_results = list(research["search_results"])
     errors = list(state["errors"])
     new_results: list[SearchResult] = []
+
+    # Count provider attempts, including unsuccessful calls.
+    queries_executed = control.usage.queries_executed
+    query_limit = min(
+        settings.research_limits.max_total_queries_per_job,
+        control.budget.max_search_queries,
+    )
 
     logger.info(
         "Web search started.",
@@ -55,19 +55,39 @@ async def research_web_search_node(
             "iteration": target_iteration,
         },
     )
-    print('\nresearch web search search queries:', iteration_queries)
-    print('\nresearch web search search queries:',  json.dumps(
-            [item.model_dump() for item in iteration_queries],
-            indent=2,
-        ),)
+    print("\nresearch web search search queries:", iteration_queries)
+    print("\nresearch web search search queries:", json.dumps(
+        [item.model_dump() for item in iteration_queries], indent=2
+    ))
 
     for search_query in iteration_queries:
-        try:
-            results = await search_provider.search(
-                    search_query=search_query,
-                    max_results=(settings.research_limits.max_search_results_per_query),
-                )
+        if queries_executed >= query_limit:
+            logger.warning("Search execution budget exhausted; skipping remaining queries.")
+            break
 
+        seconds_remaining = _seconds_remaining(state)
+        if seconds_remaining <= 0:
+            logger.warning("Research time budget exhausted; stopping web search.")
+            break
+
+        queries_executed += 1
+        try:
+            results = await asyncio.wait_for(
+                search_provider.search(
+                    search_query=search_query,
+                    max_results=settings.research_limits.max_search_results_per_query,
+                ),
+                timeout=seconds_remaining,
+            )
+        except TimeoutError:
+            logger.warning("Web search timed out at the research deadline.")
+            errors.append(ResearchError(
+                error_type=ErrorType.SEARCH,
+                component="research_web_search",
+                message=f"Search timed out for query '{search_query.id}'.",
+                recoverable=True,
+            ))
+            break
         except SearchProviderError as exc:
             logger.exception(
                 "Web search failed.",
@@ -81,59 +101,32 @@ async def research_web_search_node(
                     "error_type": ErrorType.SEARCH.value,
                 },
             )
-
-            errors.append(
-                ResearchError(
-                    error_type=ErrorType.SEARCH,
-                    component="research_web_search",
-                    message=str(exc),
-                    recoverable=True,
-                )
-            )
-
+            errors.append(ResearchError(
+                error_type=ErrorType.SEARCH,
+                component="research_web_search",
+                message=str(exc),
+                recoverable=True,
+            ))
             continue
 
-        # print('\nsearch result:', results,)
-        print('\nsearch result:',  json.dumps(
-                [item.model_dump() for item in results],
-                indent=2,
-            ),)
-        print('\nfor query: ', search_query)
+        print("\nsearch result:", json.dumps([item.model_dump() for item in results], indent=2))
+        print("\nfor query: ", search_query)
 
-        # Discard scored provider results that do not meet the minimum relevance threshold.
-        # Results without a provider score are retained for compatibility with other providers.
+        # Retain unscored results for providers that do not expose relevance scores.
         filtered_results = [
-            result
-            for result in results
-            if (
-                result.provider_score is None
-                or result.provider_score >= settings.search.min_provider_score
-            )
+            result for result in results
+            if result.provider_score is None
+            or result.provider_score >= settings.search.min_provider_score
         ]
 
-        # Fallback: If every scored result was rejected, keep the best available result
-        # so difficult queries do not lose their entire source set.
+        # Keep one fallback result rather than dropping the entire source set.
         if not filtered_results and results:
-            filtered_results = [
-                max(
-                    results,
-                    key=lambda result: result.provider_score or 0.0,
-                )
-            ]
+            filtered_results = [max(results, key=lambda item: item.provider_score or 0.0)]
 
         new_results.extend(filtered_results)
 
-    updated_results = [
-        *current_results,
-        *new_results,
-    ]
-
-    # updated_results = _deduplicate_search_results(
-        #     [
-        #         *current_results,
-        #         *new_results,
-        #     ]
-        # )
+    updated_usage = control.usage.model_copy(update={"queries_executed": queries_executed})
+    updated_control = control.model_copy(update={"usage": updated_usage})
 
     logger.info(
         "Web search completed.",
@@ -143,17 +136,14 @@ async def research_web_search_node(
             "research_session_id": state["research_session_id"],
             "node": "research_web_search",
             "iteration": target_iteration,
+            "queries_executed": queries_executed,
+            "new_results": len(new_results),
         },
     )
 
     return {
-        "research": {
-            **state["research"],
-            "search_results": (
-                updated_results
-            ),
-        },
+        "research": {**research, "search_results": [*current_results, *new_results]},
+        "research_control": updated_control,
         "errors": errors,
     }
-
 

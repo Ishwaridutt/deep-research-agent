@@ -21,6 +21,10 @@ class ResearchStopReason(str, Enum):
     COVERAGE_SUFFICIENT = "coverage_sufficient"
     MAX_ITERATIONS = "max_iterations"
     QUERY_BUDGET_EXHAUSTED = "query_budget_exhausted"
+    EXTRACTION_BUDGET_EXHAUSTED = "extraction_budget_exhausted"
+    TIME_BUDGET_EXHAUSTED = "time_budget_exhausted"
+    NO_EVIDENCE_IMPROVEMENT = "no_evidence_improvement"
+    NO_ACTIONABLE_GAPS = "no_actionable_gaps"
 
 
 class ResearchExecutionStatus(str, Enum):

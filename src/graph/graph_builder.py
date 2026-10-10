@@ -245,10 +245,8 @@ def build_research_graph(
         RESEARCH_ROUTING,
     )
 
-    #
     # Autonomous research loop
     # heart of the app
-    #
 
     builder.add_conditional_edges(
         RESEARCH_ROUTING,
@@ -260,10 +258,8 @@ def build_research_graph(
         },
     )
 
-    #
     # Writer pipeline
-    #
-
+    
     builder.add_edge(
         WRITER_PREPARE_EVIDENCE,
         WRITER_SYNTHESIS,
@@ -287,9 +283,7 @@ def build_research_graph(
         },
     )
 
-    #
     # Finish
-    #
 
     builder.add_edge(
         FINALIZE_REPORT,

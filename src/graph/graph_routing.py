@@ -1,55 +1,30 @@
-"""Deterministic routing logic for the research workflow."""
+"""Deterministic routing and execution control for research."""
 
 import logging
-
-from enum import Enum
+from datetime import datetime, timezone
 from typing import Literal
 
 from src.config import Settings
 from src.graph.graph_state import WorkflowState
 from src.models import (
+    CoverageResult,
     CoverageStatus,
     ErrorType,
     ResearchError,
     ResearchStopReason,
 )
-
+from src.models.research_quality import (
+    ResearchControlState,
+    ResearchDecision,
+    ResearchRoundRecord,
+)
 
 logger = logging.getLogger(__name__)
-
-
-class TerminalCheckRoute(str, Enum):
-    """
-    Generic transition after a node that may create terminal errors.
-    """
-
-    CONTINUE = "continue"
-    TERMINAL_ERROR = "terminal_error"
-
 
 TerminalCheckRouteName = Literal[
     "continue",
     "terminal_error",
 ]
-
-
-class ResearchRoute(str, Enum):
-    """
-    Possible transitions after research coverage evaluation.
-    """
-
-    CONTINUE_RESEARCH = (
-        "continue_research"
-    )
-
-    WRITE_REPORT = (
-        "write_report"
-    )
-
-    TERMINAL_ERROR = (
-        "terminal_error"
-    )
-
 
 ResearchRouteName = Literal[
     "continue_research",
@@ -58,12 +33,8 @@ ResearchRouteName = Literal[
 ]
 
 
-def has_terminal_error(
-    state: WorkflowState,
-) -> bool:
-    """
-    Returns True when workflow state contains an unrecoverable error.
-    """
+def has_terminal_error(state: WorkflowState) -> bool:
+    """Check whether the workflow has an unrecoverable error."""
 
     return any(
         not error.recoverable
@@ -74,81 +45,174 @@ def has_terminal_error(
 def route_after_terminal_check(
     state: WorkflowState,
 ) -> TerminalCheckRouteName:
-    """
-    Routes execution based solely on terminal-error presence.
-
-    This function is pure and never mutates graph state.
-    """
-
-    if has_terminal_error(state):
-        return (
-            TerminalCheckRoute
-            .TERMINAL_ERROR
-            .value
-        )
+    """Route based on terminal-error presence."""
 
     return (
-        TerminalCheckRoute
-        .CONTINUE
-        .value
+        "terminal_error"
+        if has_terminal_error(state)
+        else "continue"
     )
+
+
+def _get_new_evidence_ids(
+    *,
+    state: WorkflowState,
+    coverage: CoverageResult,
+    previous_rounds: list[ResearchRoundRecord],
+) -> list[str]:
+    """
+    Identify newly referenced evidence.
+
+    Only count evidence IDs that:
+    - Exist in accumulated research evidence.
+    - Were referenced by a validated coverage assessment.
+    - Were not counted in previous rounds.
+    """
+
+    available_ids = {
+        item.id
+        for item in state["research"]["evidence"]
+    }
+
+    referenced_ids = {
+        evidence_id
+        for assessment in coverage.assessments
+        for evidence_id in assessment.evidence_ids
+    }
+
+    previous_ids = {
+        evidence_id
+        for record in previous_rounds
+        for evidence_id in record.new_evidence_ids
+    }
+
+    return sorted(
+        (referenced_ids & available_ids) - previous_ids
+    )
+
+
+def _get_elapsed_seconds(
+    control: ResearchControlState,
+) -> float:
+    """Calculate elapsed research execution time."""
+
+    started_at = control.usage.started_at
+
+    elapsed = (
+        datetime.now(timezone.utc) - started_at
+    ).total_seconds()
+
+    return max(0.0, elapsed)
 
 
 def _determine_stop_reason(
     *,
     state: WorkflowState,
     settings: Settings,
+    control: ResearchControlState,
+    consecutive_no_gain_rounds: int,
+    elapsed_seconds: float,
 ) -> ResearchStopReason | None:
     """
-    Determines whether autonomous research should stop.
+    Determine whether research must stop.
 
-    Coverage sufficiency takes precedence over configured limits because
-    successful coverage best describes why research completed.
+    Coverage sufficiency takes precedence over budget limits.
+    Configured limits are combined conservatively.
     """
 
-    coverage = (
-        state["research"]["coverage"]
-    )
+    research = state["research"]
+    coverage = research["coverage"]
+    budget = control.budget
+    usage = control.usage
+    limits = settings.research_limits
 
     if coverage is None:
         return None
 
-    if (
-        coverage.status
-        == CoverageStatus.SUFFICIENT
-    ):
-        return (
-            ResearchStopReason
-            .COVERAGE_SUFFICIENT
-        )
+    if coverage.status == CoverageStatus.SUFFICIENT:
+        return ResearchStopReason.COVERAGE_SUFFICIENT
 
-    if (
-        state["research"]["iteration_count"]
-        >= settings
-        .research_limits
-        .max_iterations
-    ):
-        return (
-            ResearchStopReason
-            .MAX_ITERATIONS
-        )
-
-    total_queries = len(
-        state["research"]["search_queries"]
+    max_rounds = min(
+        budget.max_rounds,
+        limits.max_iterations,
     )
 
+    if research["iteration_count"] >= max_rounds:
+        return ResearchStopReason.MAX_ITERATIONS
+
+    max_queries = min(
+        budget.max_search_queries,
+        limits.max_total_queries_per_job,
+    )
+
+    # Generated queries provide a conservative fallback until
+    # the search node records actual provider executions.
+    queries_used = max(
+        usage.queries_executed,
+        len(research["search_queries"]),
+    )
+
+    if queries_used >= max_queries:
+        return ResearchStopReason.QUERY_BUDGET_EXHAUSTED
+
     if (
-        total_queries
-        >= settings
-        .research_limits
-        .max_total_queries_per_job
+        usage.page_extraction_attempts
+        >= budget.max_extracted_pages
     ):
-        return (
-            ResearchStopReason
-            .QUERY_BUDGET_EXHAUSTED
-        )
+        return ResearchStopReason.EXTRACTION_BUDGET_EXHAUSTED
+
+    if elapsed_seconds >= budget.max_research_seconds:
+        return ResearchStopReason.TIME_BUDGET_EXHAUSTED
+
+    # Allow the initial research round to establish a baseline.
+    if (
+        research["iteration_count"] > 1
+        and consecutive_no_gain_rounds >= budget.max_consecutive_no_gain_rounds
+    ):
+        return ResearchStopReason.NO_EVIDENCE_IMPROVEMENT
+
+    if not coverage.gaps:
+        return ResearchStopReason.NO_ACTIONABLE_GAPS
 
     return None
+
+
+def _build_research_decision(
+    *,
+    coverage: CoverageResult,
+    stop_reason: ResearchStopReason | None,
+) -> ResearchDecision:
+    """Build an explicit routing decision."""
+
+    if stop_reason is None:
+        return ResearchDecision(
+            action="continue_research",
+            reason=(
+                "Unresolved research gaps remain and "
+                "execution budgets permit another iteration."
+            ),
+            has_unresolved_gaps=True,
+            budget_exhausted=False,
+        )
+
+    budget_stop_reasons = {
+        ResearchStopReason.MAX_ITERATIONS,
+        ResearchStopReason.QUERY_BUDGET_EXHAUSTED,
+        ResearchStopReason.EXTRACTION_BUDGET_EXHAUSTED,
+        ResearchStopReason.TIME_BUDGET_EXHAUSTED,
+        ResearchStopReason.NO_EVIDENCE_IMPROVEMENT,
+    }
+
+    return ResearchDecision(
+        action="write_report",
+        reason=stop_reason.value.replace("_", " "),
+        has_unresolved_gaps=(
+            coverage.status == CoverageStatus.INSUFFICIENT
+        ),
+        budget_exhausted=(
+            stop_reason in budget_stop_reasons
+        ),
+    )
 
 
 def research_routing_node(
@@ -157,168 +221,164 @@ def research_routing_node(
     settings: Settings,
 ) -> dict:
     """
-    Records why research should stop or indicates another pass is allowed.
+    Evaluate execution limits and record the research decision.
 
-    The node updates state but does not select graph edges directly.
+    Does not directly select graph edges.
     """
 
+    research = state["research"]
+    control = state["research_control"]
+    iteration = research["iteration_count"]
+
     if has_terminal_error(state):
-        logger.warning(
-            (
-                "Research routing detected "
-                "a terminal error."
-            ),
-            extra={
-                "event": (
-                    "research_terminal_error_detected"
-                ),
-                "job_id": state["job_id"],
-                "research_session_id": state[
-                    "research_session_id"
-                ],
-                "node": "research_routing",
-                "iteration": state[
-                    "research"
-                ]["iteration_count"],
-            },
+        decision = ResearchDecision(
+            action="terminal_error",
+            reason="A terminal workflow error occurred.",
         )
 
-        return {}
+        return {
+            "research_control": control.model_copy(
+                update={"last_decision": decision}
+            )
+        }
 
-    coverage = (
-        state["research"]["coverage"]
-    )
+    coverage = research["coverage"]
 
     if coverage is None:
         error = ResearchError(
-            error_type=(
-                ErrorType.COVERAGE
-            ),
-            component=(
-                "research_routing"
-            ),
+            error_type=ErrorType.COVERAGE,
+            component="research_routing",
             message=(
-                "Research routing could not "
-                "continue because no coverage "
-                "result was available."
+                "Research routing requires a completed "
+                "coverage evaluation."
             ),
             recoverable=False,
         )
 
-        logger.error(
-            "Research routing found no coverage result.",
-            extra={
-                "event": (
-                    "research_routing_missing_coverage"
-                ),
-                "job_id": state["job_id"],
-                "research_session_id": state[
-                    "research_session_id"
-                ],
-                "node": "research_routing",
-                "iteration": state[
-                    "research"
-                ]["iteration_count"],
-                "error_type": (
-                    ErrorType
-                    .COVERAGE
-                    .value
-                ),
-            },
+        decision = ResearchDecision(
+            action="terminal_error",
+            reason="Coverage evaluation is unavailable.",
         )
 
         return {
             "errors": [
                 *state["errors"],
                 error,
-            ]
+            ],
+            "research_control": control.model_copy(
+                update={"last_decision": decision}
+            ),
         }
 
-    stop_reason = (
-        _determine_stop_reason(
-            state=state,
-            settings=settings,
-        )
+    # Ignore any existing history record for this iteration.
+    # This keeps round recording idempotent.
+    previous_rounds = [
+        record
+        for record in control.history
+        if record.iteration < iteration
+    ]
+
+    new_evidence_ids = _get_new_evidence_ids(
+        state=state,
+        coverage=coverage,
+        previous_rounds=previous_rounds,
     )
 
-    if stop_reason is None:
-        logger.info(
-            "Research will continue.",
-            extra={
-                "event": (
-                    "research_continue"
-                ),
-                "job_id": state["job_id"],
-                "research_session_id": state[
-                    "research_session_id"
-                ],
-                "node": "research_routing",
-                "iteration": state[
-                    "research"
-                ]["iteration_count"],
-            },
+    # Do not penalize the first research round for having
+    # no evidence. Count stagnation from follow-up rounds.
+    if iteration <= 1 or new_evidence_ids:
+        consecutive_no_gain_rounds = 0
+    else:
+        consecutive_no_gain_rounds = (
+            control.usage.consecutive_no_gain_rounds + 1
         )
 
-        return {
-            "research": {
-                **state["research"],
-                "stop_reason": None,
-            }
+    elapsed_seconds = _get_elapsed_seconds(control)
+
+    stop_reason = _determine_stop_reason(
+        state=state,
+        settings=settings,
+        control=control,
+        consecutive_no_gain_rounds=consecutive_no_gain_rounds,
+        elapsed_seconds=elapsed_seconds,
+    )
+
+    decision = _build_research_decision(
+        coverage=coverage,
+        stop_reason=stop_reason,
+    )
+
+    round_record = ResearchRoundRecord(
+        iteration=iteration,
+        new_evidence_ids=new_evidence_ids,
+        unresolved_gaps=list(coverage.gaps),
+        decision=decision,
+    )
+
+    updated_usage = control.usage.model_copy(
+        update={
+            "consecutive_no_gain_rounds": (
+                consecutive_no_gain_rounds
+            ),
         }
+    )
+
+    updated_control = control.model_copy(
+        update={
+            "usage": updated_usage,
+            "pending_gaps": list(coverage.gaps),
+            "history": [
+                *previous_rounds,
+                round_record,
+            ],
+            "last_decision": decision,
+        }
+    )
 
     logger.info(
-        "Research will stop.",
+        "Research routing decision completed.",
         extra={
-            "event": "research_stop",
+            "event": (
+                "research_continue"
+                if stop_reason is None
+                else "research_stop"
+            ),
             "job_id": state["job_id"],
-            "research_session_id": state[
-                "research_session_id"
-            ],
+            "research_session_id": state["research_session_id"],
             "node": "research_routing",
-            "iteration": state[
-                "research"
-            ]["iteration_count"],
+            "iteration": iteration,
+            "action": decision.action,
+            "stop_reason": (
+                stop_reason.value
+                if stop_reason is not None
+                else None
+            ),
+            "gap_count": len(coverage.gaps),
+            "new_evidence_count": len(new_evidence_ids),
+            "elapsed_seconds": round(elapsed_seconds, 2),
         },
     )
 
     return {
         "research": {
-            **state["research"],
+            **research,
             "stop_reason": stop_reason,
-        }
+        },
+        "research_control": updated_control,
     }
 
 
 def route_after_research(
     state: WorkflowState,
 ) -> ResearchRouteName:
-    """
-    Selects the next graph edge after research routing.
-
-    This function is pure and performs no state mutation.
-    """
+    """Select the next graph edge after research routing."""
 
     if has_terminal_error(state):
-        return (
-            ResearchRoute
-            .TERMINAL_ERROR
-            .value
-        )
+        return "terminal_error"
 
-    if (
-        state["research"]["stop_reason"]
-        is not None
-    ):
-        return (
-            ResearchRoute
-            .WRITE_REPORT
-            .value
-        )
+    decision = state["research_control"].last_decision
 
-    return (
-        ResearchRoute
-        .CONTINUE_RESEARCH
-        .value
-    )
+    if decision is None:
+        return "terminal_error"
 
-
+    return decision.action

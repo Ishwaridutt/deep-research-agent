@@ -45,7 +45,9 @@ class ApplicationSettings(EnvironmentSettings):
 
 
 class LLMSettings(EnvironmentSettings):
-    """Configuration for LLM-backed research and writing nodes."""
+    """Configuration for provider-independent LLM execution."""
+
+    llm_provider: Literal["groq", "google_genai"] = "groq"
 
     planner_model: str = Field(min_length=1)
     query_generator_model: str = Field(min_length=1)
@@ -54,14 +56,21 @@ class LLMSettings(EnvironmentSettings):
     writer_model: str = Field(min_length=1)
     citation_model: str = Field(min_length=1)
 
-    llm_timeout_seconds: int = Field(
-        default=60,
-        ge=1,
-    )
+    llm_timeout_seconds: int = Field(default=60, ge=1)
 
-    llm_max_retries: int = Field(
+    # Provider-level retries for transient transport/API failures.
+    llm_max_retries: int = Field(default=2, ge=0)
+
+    llm_structured_output_method: Literal[
+        "json_schema",
+        "function_calling",
+    ] = "json_schema"
+
+    # Total structured-output attempts, including the initial call.
+    llm_structured_output_attempts: int = Field(
         default=2,
-        ge=0,
+        ge=1,
+        le=3,
     )
 
 

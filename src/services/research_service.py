@@ -1,5 +1,6 @@
-"""Application service for executing deep research workflows."""
+"""Application service for synchronous and persisted research workflows."""
 
+import asyncio
 import logging
 from typing import cast
 
@@ -14,33 +15,86 @@ from src.models import (
     ResearchExecutionStatus,
     ResearchSource,
 )
+from src.models.pipeline_event import ResearchJobCreated
+from src.persistence import ResearchJobStore
 from src.services.generate_research_ids import (
     generate_job_id,
     generate_research_session_id,
+)
+from src.services.research_pipeline_stream_service import (
+    PipelineRecorder,
+    run_graph_with_events,
 )
 
 
 logger = logging.getLogger(__name__)
 
 
-class ResearchService:
-    """
-    Application-level entry point for running a research workflow.
+class ResearchJobQueueFull(Exception):
+    """The local execution queue has reached its configured limit."""
 
-    HTTP routes depend on this service rather than invoking LangGraph,
-    constructing workflow state, or generating IDs themselves.
-    """
+
+class ResearchService:
+    """Owns research execution; HTTP handlers do not invoke LangGraph."""
 
     def __init__(
         self,
         *,
         graph: CompiledStateGraph,
         settings: Settings,
+        job_store: ResearchJobStore,
+        max_concurrent_jobs: int = 2,
+        max_pending_jobs: int = 20,
     ) -> None:
-        """Stores the compiled workflow and application configuration."""
-
         self._graph = graph
         self._settings = settings
+        self._job_store = job_store
+        self._task_slots = asyncio.Semaphore(max_concurrent_jobs)
+        self._tasks: dict[str, asyncio.Task[None]] = {}
+        self._admission_lock = asyncio.Lock()
+        self._max_pending_jobs = max_pending_jobs
+        self._shutting_down = False
+
+    def _create_state(
+        self,
+        *,
+        question: str,
+        allowed_sources: list[ResearchSource] | None,
+        research_session_id: str | None,
+    ) -> WorkflowState:
+        sources = list(allowed_sources) if allowed_sources is not None else [ResearchSource.WEB]
+        return create_initial_workflow_state(
+            job_id=generate_job_id(),
+            research_session_id=(research_session_id or "").strip() or generate_research_session_id(),
+            question=question,
+            allowed_sources=sources,
+        )
+
+    def _graph_config(self, state: WorkflowState) -> dict:
+        return {
+            "run_name": "deep_research_job",
+            "tags": ["deep-research-agent", "research-job"],
+            "metadata": {
+                "job_id": state["job_id"],
+                "research_session_id": state["research_session_id"],
+            },
+            "recursion_limit": self._settings.app.graph_recursion_limit,
+        }
+
+    def _failed_result(self, state: WorkflowState, message: str) -> ResearchExecutionResult:
+        return ResearchExecutionResult(
+            job_id=state["job_id"],
+            research_session_id=state["research_session_id"],
+            status=ResearchExecutionStatus.FAILED,
+            stop_reason=None,
+            report=None,
+            errors=[ResearchError(
+                error_type=ErrorType.INTERNAL,
+                component="research_service",
+                message=message,
+                recoverable=False,
+            )],
+        )
 
     async def research(
         self,
@@ -49,149 +103,170 @@ class ResearchService:
         allowed_sources: list[ResearchSource] | None = None,
         research_session_id: str | None = None,
     ) -> ResearchExecutionResult:
-        """
-        Executes one complete research job.
+        """Preserve the existing synchronous /api/research behavior."""
 
-        A new job ID is always created. A research session ID is reused when
-        supplied, otherwise a new one is generated.
-        """
-
-        job_id = generate_job_id()
-
-        supplied_session_id = (
-            research_session_id.strip()
-            if research_session_id
-            else ""
-        )
-
-        session_id = (
-            supplied_session_id
-            or generate_research_session_id()
-        )
-
-        sources = (
-            list(allowed_sources)
-            if allowed_sources is not None
-            else [ResearchSource.WEB]
-        )
-
-        initial_state = create_initial_workflow_state(
-            job_id=job_id,
-            research_session_id=session_id,
+        state = self._create_state(
             question=question,
-            allowed_sources=sources,
+            allowed_sources=allowed_sources,
+            research_session_id=research_session_id,
         )
-
         logger.info(
             "Research workflow execution started.",
             extra={
                 "event": "research_workflow_started",
-                "job_id": job_id,
-                "research_session_id": session_id,
+                "job_id": state["job_id"],
+                "research_session_id": state["research_session_id"],
                 "node": "research_service",
             },
         )
-
-        config = {
-            "run_name": "deep_research_job",
-            "tags": [
-                "deep-research-agent",
-                "research-job",
-            ],
-            "metadata": {
-                "job_id": job_id,
-                "research_session_id": session_id,
-            },
-            "recursion_limit": self._settings.app.graph_recursion_limit,
-        }
-
         try:
-            graph_result = await self._graph.ainvoke(
-                initial_state,
-                config=config,
-            )
-
+            result = await self._graph.ainvoke(state, config=self._graph_config(state))
         except Exception as exc:
-            logger.exception(
-                "Research workflow execution failed unexpectedly.",
-                extra={
-                    "event": "research_workflow_failed",
-                    "job_id": job_id,
-                    "research_session_id": session_id,
-                    "node": "research_service",
-                    "error_type": ErrorType.INTERNAL.value,
-                },
-            )
+            logger.exception("Research workflow execution failed unexpectedly.")
+            return self._failed_result(state, f"The research workflow failed unexpectedly: {exc}")
+        return self._build_result(state=cast(WorkflowState, result))
 
-            error = ResearchError(
-                error_type=ErrorType.INTERNAL,
-                component="research_service",
-                message=f"The research workflow failed unexpectedly: {exc}",
-                recoverable=False,
-            )
-
-            return ResearchExecutionResult(
-                job_id=job_id,
-                research_session_id=session_id,
-                status=ResearchExecutionStatus.FAILED,
-                stop_reason=None,
-                report=None,
-                errors=[error],
-            )
-
-        final_state = cast(
-            WorkflowState,
-            graph_result,
-        )
-
-        return self._build_result(
-            state=final_state,
-        )
-
-    def _build_result(
+    async def start_job(
         self,
         *,
-        state: WorkflowState,
-    ) -> ResearchExecutionResult:
-        """Converts final LangGraph state into an application-level result."""
+        question: str,
+        allowed_sources: list[ResearchSource] | None = None,
+        research_session_id: str | None = None,
+    ) -> ResearchJobCreated:
+        """Persist a queued job and start execution independently of SSE."""
+
+        async with self._admission_lock:
+            if self._shutting_down or len(self._tasks) >= self._max_pending_jobs:
+                raise ResearchJobQueueFull("The research job queue is currently full.")
+
+            state = self._create_state(
+                question=question,
+                allowed_sources=allowed_sources,
+                research_session_id=research_session_id,
+            )
+            await self._job_store.create_job(
+                job_id=state["job_id"],
+                research_session_id=state["research_session_id"],
+                question=question,
+                allowed_sources=[source.value for source in state["allowed_sources"]],
+            )
+
+            task = asyncio.create_task(self._run_persisted_job(state))
+            self._tasks[state["job_id"]] = task
+            task.add_done_callback(
+                lambda finished, job_id=state["job_id"]: self._on_job_finished(job_id, finished)
+            )
+        return ResearchJobCreated(
+            job_id=state["job_id"], research_session_id=state["research_session_id"],
+        )
+
+    def _on_job_finished(self, job_id: str, task: asyncio.Task[None]) -> None:
+        """Release the job slot and surface unexpected task-level errors."""
+
+        self._tasks.pop(job_id, None)
+        if not task.cancelled():
+            error = task.exception()
+            if error is not None:
+                logger.error(
+                    "Research job task terminated unexpectedly.",
+                    extra={"job_id": job_id, "event": "research_job_task_failed"},
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+
+    async def _run_persisted_job(self, state: WorkflowState) -> None:
+        """Run the graph once, commit events, and atomically commit the result."""
+
+        recorder = PipelineRecorder(
+            job_id=state["job_id"],
+            persist=self._job_store.append_event,
+        )
+        failure_message: str | None = None
+
+        try:
+            async with self._task_slots:
+                await self._job_store.mark_running(state["job_id"])
+                final_state = await run_graph_with_events(
+                    graph=self._graph,
+                    state=state,
+                    config=self._graph_config(state),
+                    recorder=recorder,
+                )
+                result = self._build_result(state=final_state)
+        except asyncio.CancelledError:
+            failure_message = "Research job stopped during server shutdown."
+            result = self._failed_result(state, failure_message)
+            # Persist terminal status before propagating task cancellation.
+            await self._finish_persisted_job(recorder, result, failure_message)
+            raise
+        except Exception:
+            logger.exception(
+                "Persisted research job failed.",
+                extra={"job_id": state["job_id"], "event": "research_job_failed"},
+            )
+            failure_message = "Research job failed unexpectedly."
+            result = self._failed_result(state, failure_message)
+
+        await self._finish_persisted_job(recorder, result, failure_message)
+
+    async def _finish_persisted_job(
+        self,
+        recorder: PipelineRecorder,
+        result: ResearchExecutionResult,
+        failure_message: str | None,
+    ) -> None:
+        completed = result.status == ResearchExecutionStatus.COMPLETED
+        terminal_event = recorder.make(
+            "workflow_completed" if completed else "workflow_failed",
+            "workflow",
+            "completed" if completed else "failed",
+            details={"reason": failure_message} if failure_message else {},
+        )
+        await self._job_store.finish_job(
+            result=result,
+            terminal_event=terminal_event,
+            error_message=failure_message,
+        )
+
+    async def get_job(self, job_id: str) -> dict | None:
+        return await self._job_store.get_job(job_id)
+
+    async def get_events(self, job_id: str, *, after: int = 0):
+        return await self._job_store.get_events(job_id, after=after)
+
+    async def shutdown(self) -> None:
+        """Stop local tasks before SQLite and shared providers are closed."""
+
+        async with self._admission_lock:
+            self._shutting_down = True
+            tasks = list(self._tasks.values())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._tasks.clear()
+
+    def _build_result(self, *, state: WorkflowState) -> ResearchExecutionResult:
+        """Convert the final LangGraph state into an application result."""
 
         errors = list(state["errors"])
         final_report = state["writer"]["final_report"]
+        terminal_errors = [error for error in errors if not error.recoverable]
 
-        terminal_errors = [
-            error
-            for error in errors
-            if not error.recoverable
-        ]
-
-        # A completed graph without a final report is an invalid terminal state.
+        # A graph that ends without producing a report is not successful.
         if final_report is None and not terminal_errors:
-            errors.append(
-                ResearchError(
-                    error_type=ErrorType.INTERNAL,
-                    component="research_service",
-                    message=(
-                        "Research workflow completed without producing "
-                        "a final report."
-                    ),
-                    recoverable=False,
-                )
+            error = ResearchError(
+                error_type=ErrorType.INTERNAL,
+                component="research_service",
+                message="Research workflow completed without producing a final report.",
+                recoverable=False,
             )
+            errors.append(error)
+            terminal_errors.append(error)
 
-            terminal_errors = [
-                error
-                for error in errors
-                if not error.recoverable
-            ]
-
-        if terminal_errors:
-            status = ResearchExecutionStatus.FAILED
-            report = None
-
-        else:
-            status = ResearchExecutionStatus.COMPLETED
-            report = final_report
-
+        status = (
+            ResearchExecutionStatus.FAILED if terminal_errors
+            else ResearchExecutionStatus.COMPLETED
+        )
         logger.info(
             "Research workflow execution finished.",
             extra={
@@ -202,14 +277,11 @@ class ResearchService:
                 "iteration": state["research"]["iteration_count"],
             },
         )
-
         return ResearchExecutionResult(
             job_id=state["job_id"],
             research_session_id=state["research_session_id"],
             status=status,
             stop_reason=state["research"]["stop_reason"],
-            report=report,
+            report=None if terminal_errors else final_report,
             errors=errors,
         )
-
-    

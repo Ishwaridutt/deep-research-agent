@@ -10,7 +10,7 @@ from fastapi.responses import (
 )
 
 
-_FRONTEND_DIRECTORY = Path(__file__).resolve().parent.parent/ "template"
+_FRONTEND_DIRECTORY = Path(__file__).resolve().parent.parent/ "static"
 
 
 _INDEX_FILE = (

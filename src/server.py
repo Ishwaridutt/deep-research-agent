@@ -1,7 +1,7 @@
 """FastAPI application composition root."""
 
 import logging
-
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Protocol
@@ -14,6 +14,7 @@ from src.config import Settings, get_settings
 from src.config.logging import configure_logging
 from src.graph.graph_builder import build_research_graph
 from src.llm import create_llm_service
+from src.persistence import ResearchJobStore
 from src.retrieval import RetrievalSessionFactory
 from src.retrieval.embeddings import RetrievalEmbeddingService
 from src.routes import create_research_router, health_router, index_router
@@ -26,23 +27,22 @@ logger = logging.getLogger(__name__)
 
 _SRC_DIRECTORY = Path(__file__).resolve().parent
 _STATIC_DIRECTORY = _SRC_DIRECTORY / "static"
+_DEFAULT_DB_PATH = _SRC_DIRECTORY.parent / "data" / "research.sqlite3"
 
 
 class AsyncClosable(Protocol):
     """Contract for long-lived resources requiring async cleanup."""
 
     async def close(self) -> None:
-        """Releases resources owned by the object."""
-
+        """Release resources owned by the object."""
         ...
 
 
 async def _close_resource(*, name: str, resource: AsyncClosable) -> None:
-    """Safely closes one long-lived application resource."""
+    """Safely close one long-lived application resource."""
 
     try:
         await resource.close()
-
     except Exception:
         logger.exception(
             "Application resource cleanup failed.",
@@ -53,42 +53,32 @@ async def _close_resource(*, name: str, resource: AsyncClosable) -> None:
                 "error_type": "internal",
             },
         )
-
     else:
         logger.info(
             "Application resource closed.",
-            extra={
-                "event": "resource_closed",
-                "node": "server",
-                "resource": name,
-            },
+            extra={"event": "resource_closed", "node": "server", "resource": name},
         )
 
 
 def _create_retrieval_session_factory(settings: Settings) -> RetrievalSessionFactory:
-    """Creates shared retrieval dependencies and the per-job session factory."""
+    """Create shared retrieval dependencies and the per-job session factory."""
 
     retrieval_settings = settings.retrieval
 
-    # Load the local embedding model once for the lifetime of the server process.
+    # Load the local embedding model once for the server process lifetime.
     embedding_service = RetrievalEmbeddingService(
         model_name=retrieval_settings.embedding_model,
         device=retrieval_settings.embedding_device,
         batch_size=retrieval_settings.embedding_batch_size,
     )
 
-    # Only the tokenizer is loaded here; the evidence LLM itself remains remote.
+    # The tokenizer is local; the evidence LLM remains remote.
     context_tokenizer = AutoTokenizer.from_pretrained(
         retrieval_settings.context_tokenizer_model,
     )
 
     def count_context_tokens(text: str) -> int:
-        return len(
-            context_tokenizer.encode(
-                text,
-                add_special_tokens=False,
-            )
-        )
+        return len(context_tokenizer.encode(text, add_special_tokens=False))
 
     return RetrievalSessionFactory(
         embedding_service=embedding_service,
@@ -109,8 +99,9 @@ def _create_research_service(
     settings: Settings,
     search_provider: SearchProvider,
     web_extractor: WebExtractor,
+    job_store: ResearchJobStore,
 ) -> ResearchService:
-    """Creates the complete research application service."""
+    """Create the complete research application service."""
 
     llm_service = create_llm_service(settings)
     retrieval_session_factory = _create_retrieval_session_factory(settings)
@@ -123,60 +114,47 @@ def _create_research_service(
         retrieval_session_factory=retrieval_session_factory,
     )
 
-    return ResearchService(
-        graph=graph,
-        settings=settings,
-    )
+    return ResearchService(graph=graph, settings=settings, job_store=job_store)
 
 
 def create_app() -> FastAPI:
-    """Creates and configures the FastAPI application."""
+    """Create the application and its shared resources."""
 
     settings = get_settings()
     configure_logging(settings.observability)
 
     search_provider = create_search_provider(settings)
     web_extractor = create_web_extractor(settings)
+    job_store = ResearchJobStore(Path(os.getenv("RESEARCH_DB_PATH", str(_DEFAULT_DB_PATH))))
 
-    # Create the graph and shared application dependencies once per server process.
+    # Build the graph and expensive shared dependencies once per process.
     research_service = _create_research_service(
         settings=settings,
         search_provider=search_provider,
         web_extractor=web_extractor,
+        job_store=job_store,
     )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        """Manages process-wide external resources."""
+        """Initialize persistence and clean up all process-owned resources."""
 
+        await job_store.initialize()
         logger.info(
             "Application started.",
-            extra={
-                "event": "application_started",
-                "node": "server",
-            },
+            extra={"event": "application_started", "node": "server"},
         )
-
         try:
             yield
-
         finally:
-            await _close_resource(
-                name="search_provider",
-                resource=search_provider,
-            )
-
-            await _close_resource(
-                name="web_extractor",
-                resource=web_extractor,
-            )
-
+            # Tasks must stop before closing SQLite and shared providers.
+            await research_service.shutdown()
+            await job_store.close()
+            await _close_resource(name="search_provider", resource=search_provider)
+            await _close_resource(name="web_extractor", resource=web_extractor)
             logger.info(
                 "Application stopped.",
-                extra={
-                    "event": "application_stopped",
-                    "node": "server",
-                },
+                extra={"event": "application_stopped", "node": "server"},
             )
 
     app = FastAPI(
@@ -185,23 +163,14 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
-    # Register API and UI routes after shared services are initialized.
     app.include_router(index_router)
     app.include_router(health_router)
-    app.include_router(
-        create_research_router(
-            research_service=research_service,
-        )
-    )
-
+    app.include_router(create_research_router(research_service=research_service))
     app.mount(
-        "/static",
-        StaticFiles(directory=str(_STATIC_DIRECTORY)),
-        name="static",
+        "/static", StaticFiles(directory=str(_STATIC_DIRECTORY)), name="static",
     )
 
     return app
 
 
 app = create_app()
-

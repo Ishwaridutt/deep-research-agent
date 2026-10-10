@@ -13,6 +13,12 @@ from src.services.research_service import (
     ResearchService,
 )
 
+from src.services.research_pipeline_stream_service import (
+    run_graph_with_events,
+    PipelineRecorder,
+    encode_sse
+)
+
 __all__ = [
     "generate_evidence_id",
     "generate_job_id",
@@ -22,5 +28,8 @@ __all__ = [
     "generate_source_id",
     "generate_subquestion_id",
     "ResearchService",
+    "run_graph_with_events",
+    "PipelineRecorder",
+    "encode_sse"
 ]
 

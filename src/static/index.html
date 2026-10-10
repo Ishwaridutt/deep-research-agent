@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#0b111e">
+    <meta name="description" content="Evidence-grounded deep research with transparent, live execution progress.">
+    <title>Deep Research Agent · Workspace</title>
+    <link rel="stylesheet" href="/static/css/styles.css">
+    <script src="/static/js/app.js" defer></script>
+</head>
+<body>
+    <div class="ambient ambient-one" aria-hidden="true"></div>
+    <div class="ambient ambient-two" aria-hidden="true"></div>
+
+    <main class="page-container">
+        <header class="app-header">
+            <div class="brand-row">
+                <span class="brand-symbol" aria-hidden="true">✳</span>
+                <span class="brand-name">DEEP RESEARCH <span class="brand-muted">/ WORKSPACE</span></span>
+                <span class="app-version">RESEARCH AGENT</span>
+            </div>
+            <div class="hero">
+                <p class="eyebrow"><span class="eyebrow-line"></span> Research, with receipts</p>
+                <h1>Go deeper.<br><span>See every step.</span></h1>
+                <p class="subtitle">An evidence-first research workflow that plans, searches, checks coverage and explains when it needs another pass.</p>
+            </div>
+        </header>
+
+        <section class="panel composer-panel" aria-labelledby="composer-title">
+            <div class="panel-topline">
+                <div>
+                    <p class="section-kicker">01 / START HERE</p>
+                    <h2 id="composer-title">Start a new investigation</h2>
+                </div>
+                <span class="source-indicator"><span class="source-dot" aria-hidden="true"></span> Web research</span>
+            </div>
+            <form id="research-form">
+                <label for="research-question" class="form-label">What would you like to understand?</label>
+                <textarea id="research-question" name="question" rows="5" minlength="3" required placeholder="How are AI coding assistants changing developer productivity, code quality, and team workflows?"></textarea>
+                <div class="composer-footer">
+                    <span class="helper-text">Research is evaluated against its sources before the report is written.</span>
+                    <button id="research-button" type="submit"><span>Start research</span><span aria-hidden="true">↗</span></button>
+                </div>
+            </form>
+            <div class="examples" aria-label="Example research questions">
+                <span class="examples-label">TRY AN EXAMPLE</span>
+                <button type="button" class="example-chip" data-question="How are AI coding assistants affecting software engineering productivity and code quality?">AI &amp; developer productivity</button>
+                <button type="button" class="example-chip" data-question="Compare open-source and proprietary large language models for enterprise adoption in 2026.">Open vs. closed models</button>
+            </div>
+        </section>
+
+        <section id="status-panel" class="status-panel hidden" aria-live="polite" role="status">
+            <div class="status-symbol" aria-hidden="true"><span id="status-spinner" class="spinner hidden"></span><span id="status-static-icon" class="status-static-icon">✦</span></div>
+            <div class="status-copy"><strong id="status-title">Preparing research</strong><p id="status-message"></p></div>
+            <span id="connection-state" class="connection-state hidden">Connecting</span>
+        </section>
+
+        <section id="pipeline-panel" class="panel workflow-panel hidden" aria-labelledby="pipeline-heading">
+            <div class="section-header">
+                <div><p class="section-kicker">02 / LIVE EXECUTION</p><h2 id="pipeline-heading">Inside the research</h2><p class="section-desc">Actual workflow events, not an estimated progress bar.</p></div>
+                <div class="execution-meta"><span id="workflow-elapsed">00:00 elapsed</span><button type="button" id="copy-job-link" class="text-button" title="Copy a link to this research job">Copy job link ↗</button></div>
+            </div>
+            <div class="workflow-grid">
+                <div id="pipeline-timeline" class="pipeline-timeline" aria-label="Research pipeline stages"></div>
+                <aside class="insight-column" aria-label="Research insights">
+                    <div class="insight-card">
+                        <p class="insight-label">LATEST COVERAGE CHECK</p>
+                        <div id="coverage-status" class="insight-value">Awaiting evaluation</div>
+                        <p id="coverage-description" class="insight-explanation">The evidence evaluator will check research coverage after extraction.</p>
+                        <div class="insight-stats"><div><strong id="coverage-gap-count">—</strong><span>Open gaps</span></div><div><strong id="coverage-assessment-count">—</strong><span>Objectives assessed</span></div></div>
+                    </div>
+                    <div class="insight-card activity-card">
+                        <div class="insight-heading"><p class="insight-label">ACTIVITY</p><span id="event-count" class="activity-count">0 events</span></div>
+                        <ol id="activity-feed" class="activity-feed" aria-label="Recent research activity"></ol>
+                        <p id="activity-empty" class="activity-empty">Events will appear as the agent works.</p>
+                    </div>
+                </aside>
+            </div>
+        </section>
+
+        <section id="result-panel" class="panel result-panel hidden" aria-labelledby="report-heading">
+            <div class="result-header">
+                <div><p class="section-kicker">03 / RESEARCH OUTPUT</p><h2 id="report-heading">Research report</h2></div>
+                <div id="result-status" class="status-badge"></div>
+            </div>
+            <div id="job-metadata" class="metadata"></div>
+            <section class="report-section"><h3>Executive summary</h3><p id="report-summary" class="report-summary"></p></section>
+            <section class="report-section"><h3>Key findings</h3><div id="report-findings"></div></section>
+            <section class="report-section"><h3>Limitations</h3><ul id="report-limitations"></ul></section>
+            <section class="report-section"><h3>Sources</h3><ol id="report-sources"></ol></section>
+            <section id="workflow-errors-section" class="report-section hidden"><h3>Workflow notes</h3><ul id="workflow-errors"></ul></section>
+            <details id="markdown-section" class="markdown-section"><summary>View generated Markdown</summary><pre id="report-markdown"></pre></details>
+        </section>
+
+        <footer class="app-footer"><span>DEEP RESEARCH AGENT</span><span>Grounded evidence · Transparent execution</span></footer>
+    </main>
+</body>
+</html>
