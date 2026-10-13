@@ -1,6 +1,10 @@
 """Structured writer, citation, and final report models."""
 
+from typing import Any
+
 from pydantic import BaseModel, Field, field_validator
+
+from src.models.source_model import SourceType
 
 
 class ReportFinding(BaseModel):
@@ -77,8 +81,10 @@ class ReportSource(BaseModel):
     """Source metadata exposed in the final report."""
 
     source_id: str = Field(min_length=1)
+    source_type: SourceType = SourceType.WEB
     title: str = Field(min_length=1)
     uri: str = Field(min_length=1)
+    locations: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class ResearchReport(BaseModel):

@@ -10,6 +10,7 @@ from src.models import (
     ResearchError,
     ResearchReport,
     ResearchSource,
+    ResearchSourceMode,
     ResearchStopReason,
     SearchQuery,
     SearchResult,
@@ -38,7 +39,8 @@ class ResearchAgentState(TypedDict):
     search_queries: list[SearchQuery]
     search_results: list[SearchResult]
     sources: list[Source]
-    retrieval_results: list[RetrievalResult]
+    web_retrieval_results: list[RetrievalResult]
+    document_retrieval_results: list[RetrievalResult]
     evidence: list[Evidence]
 
     iteration_count: int
@@ -85,8 +87,11 @@ class WorkflowState(TypedDict):
     job_id: str
     research_session_id: str
     question: str
+    owner_id: str | None
 
     allowed_sources: list[ResearchSource]
+    source_mode: ResearchSourceMode
+    selected_document_ids: list[str]
 
     research: ResearchAgentState
 
@@ -103,6 +108,9 @@ def create_initial_workflow_state(
     research_session_id: str,
     question: str,
     allowed_sources: list[ResearchSource],
+    source_mode: ResearchSourceMode = ResearchSourceMode.WEB,
+    owner_id: str | None = None,
+    selected_document_ids: list[str] | None = None,
     research_budget: ResearchBudget | None = None,
 ) -> WorkflowState:
     """
@@ -116,13 +124,17 @@ def create_initial_workflow_state(
         job_id=job_id,
         research_session_id=research_session_id,
         question=question,
+        owner_id=owner_id,
         allowed_sources=allowed_sources,
+        source_mode=source_mode,
+        selected_document_ids=list(selected_document_ids or []),
         research=ResearchAgentState(
             subquestions=[],
             search_queries=[],
             search_results=[],
             sources=[],
-            retrieval_results=[],
+            web_retrieval_results=[],
+            document_retrieval_results=[],
             evidence=[],
             iteration_count=0,
             coverage=None,

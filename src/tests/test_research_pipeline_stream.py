@@ -4,9 +4,43 @@ import asyncio
 
 from src.services.research_pipeline_stream_service import (
     PipelineRecorder,
+    _safe_details,
     encode_sse,
     run_graph_with_events,
 )
+
+
+def test_source_progress_details_expose_counts_not_private_data():
+    selection = _safe_details(
+        "research_source_selection",
+        {
+            "source_mode": "hybrid",
+            "selected_document_ids": ["private-1", "private-2"],
+        },
+    )
+    retrieval = _safe_details(
+        "research_retrieval",
+        {
+            "research": {
+                "web_retrieval_results": [
+                    {"chunks": [{"content": "SECRET"}]}
+                ],
+                "document_retrieval_results": [
+                    {"chunks": [{"filename": "private.pdf"}, {}]}
+                ],
+            }
+        },
+    )
+
+    assert selection == {"source_mode": "hybrid", "document_count": 2}
+    assert retrieval == {
+        "web_result_count": 1,
+        "document_result_count": 1,
+        "web_chunk_count": 1,
+        "document_chunk_count": 2,
+    }
+    assert "SECRET" not in str(retrieval)
+    assert "private.pdf" not in str(retrieval)
 
 
 class FakeGraph:

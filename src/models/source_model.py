@@ -11,8 +11,9 @@ class SourceType(str, Enum):
 
     WEB = "web"
 
-    # Future phases.
     DOCUMENT = "document"
+
+    # Future phases.
     MCP = "mcp"
     API = "api"
     IMAGE = "image"

@@ -2,12 +2,12 @@
 
 from enum import Enum
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
 
 load_dotenv()
 
@@ -258,6 +258,37 @@ class WriterSettings(EnvironmentSettings):
     )
 
 
+class DocumentSettings(EnvironmentSettings):
+    """Configuration for private document processing."""
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        env_prefix="DOCUMENT_",
+        extra="ignore",
+    )
+
+    max_total_size_bytes: int = Field(
+        default=40 * 1024 * 1024,
+        gt=0,
+    )
+
+    upload_directory: Path = Path("uploaded")
+
+    supported_extensions: tuple[str, ...] = (
+        ".pdf",
+        ".docx",
+        ".txt",
+        ".md",
+    )
+
+    @property
+    def max_total_size_mb(self) -> float:
+        """Maximum retained document size in MiB."""
+        return self.max_total_size_bytes / (1024 * 1024)
+
+
 class UploadLimitSettings(EnvironmentSettings):
     """Future Phase 3 limits for user-supplied files."""
 
@@ -309,6 +340,7 @@ class Settings(BaseModel):
     retrieval: RetrievalSettings
     research_limits: ResearchLimitSettings
     writer: WriterSettings
+    documents: DocumentSettings
     upload_limits: UploadLimitSettings
     voice_limits: VoiceLimitSettings
     observability: ObservabilitySettings
@@ -325,6 +357,7 @@ def get_settings() -> Settings:
         retrieval=RetrievalSettings(),
         research_limits=ResearchLimitSettings(),
         writer=WriterSettings(),
+        documents=DocumentSettings(),
         upload_limits=UploadLimitSettings(),
         voice_limits=VoiceLimitSettings(),
         observability=ObservabilitySettings(),

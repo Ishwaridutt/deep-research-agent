@@ -48,6 +48,10 @@ from src.models.source_model import (
 from src.models.execution_model import (
     ResearchExecutionResult,
 )
+from src.models.document_models import (
+    ResearchSourceMode,
+    ResearchSourceSelection,
+)
 
 from src.models.retrieval_model import (
     RetrievalChunk, 
@@ -92,6 +96,8 @@ __all__ = [
     "SubQuestion",
     "ResearchExecutionResult",
     "ResearchExecutionStatus",
+    "ResearchSourceMode",
+    "ResearchSourceSelection",
     "RetrievalChunk",
     "RetrievalDocument",
     "RetrievalRequest",

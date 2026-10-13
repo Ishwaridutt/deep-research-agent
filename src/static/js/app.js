@@ -6,6 +6,12 @@ const ui = {
     form: $("research-form"),
     question: $("research-question"),
     submit: $("research-button"),
+    sourceIndicator: $("source-indicator-text"),
+    documentPanel: $("document-panel"),
+    documentUpload: $("document-upload"),
+    refreshDocuments: $("refresh-documents"),
+    documentStatus: $("document-status"),
+    documentList: $("document-list"),
     status: $("status-panel"),
     spinner: $("status-spinner"),
     statusIcon: $("status-static-icon"),
@@ -40,6 +46,7 @@ const STAGES = {
     input_guardrail: "Input validation",
     research_planner: "Research planning",
     research_query_generator: "Generate search queries",
+    research_source_selection: "Prepare selected sources",
     research_web_search: "Web search",
     research_source_processor: "Extract web pages",
     research_retrieval: "Find relevant passages",
@@ -54,7 +61,7 @@ const STAGES = {
 
 const PLANNING = ["input_guardrail", "research_planner"];
 const RESEARCH = [
-    "research_query_generator", "research_web_search", "research_source_processor",
+    "research_query_generator", "research_source_selection", "research_web_search", "research_source_processor",
     "research_retrieval", "research_evidence_extractor", "research_coverage_evaluator",
     "research_routing",
 ];
@@ -65,6 +72,7 @@ const EVENT_TYPES = [
 ];
 const TERMINAL = new Set(["completed", "failed"]);
 const STORAGE_KEY = "deep-research:last-job";
+const OWNER_KEY = "deep-research:owner-id";
 
 let jobId = null;
 let jobStartedAt = null;
@@ -81,6 +89,23 @@ let resultShown = false;
 let terminalEventSeen = false;
 let collapsedRounds = new Set();
 let previousLatestRound = null;
+let documents = [];
+let selectedDocumentIds = new Set();
+
+function getOwnerId() {
+    try {
+        let value = localStorage.getItem(OWNER_KEY);
+        if (!value) {
+            value = `browser-${crypto.randomUUID()}`;
+            localStorage.setItem(OWNER_KEY, value);
+        }
+        return value;
+    } catch {
+        return `browser-${Date.now()}`;
+    }
+}
+
+const ownerId = getOwnerId();
 
 function show(element) { element.classList.remove("hidden"); }
 function hide(element) { element.classList.add("hidden"); }
@@ -95,9 +120,99 @@ function create(tag, className = "", content = null) {
     if (content !== null) node.textContent = String(content);
     return node;
 }
+function sourceMode() {
+    return document.querySelector('input[name="source-mode"]:checked')?.value || "web";
+}
+function usesDocuments(mode = sourceMode()) { return mode !== "web"; }
+function formatBytes(value) {
+    if (!Number.isFinite(value)) return "Unknown size";
+    return value < 1024 * 1024
+        ? `${Math.max(1, Math.round(value / 1024))} KB`
+        : `${(value / (1024 * 1024)).toFixed(1)} MB`;
+}
+function renderDocuments() {
+    clear(ui.documentList);
+    if (!documents.length) {
+        ui.documentList.append(create("p", "empty-message", "No documents uploaded yet."));
+        return;
+    }
+    for (const item of documents) {
+        const row = create("label", "document-item");
+        const input = create("input");
+        input.type = "checkbox";
+        input.value = item.document_id;
+        input.checked = selectedDocumentIds.has(item.document_id);
+        input.disabled = ui.submit.disabled;
+        input.addEventListener("change", () => {
+            input.checked
+                ? selectedDocumentIds.add(item.document_id)
+                : selectedDocumentIds.delete(item.document_id);
+        });
+        row.append(
+            input,
+            create("span", "", item.filename),
+            create("small", "", `${formatBytes(item.size_bytes)} · ${label(item.status)}`),
+        );
+        ui.documentList.append(row);
+    }
+}
+async function loadDocuments() {
+    ui.documentStatus.textContent = "Loading documents…";
+    try {
+        const response = await fetch("/documents", {
+            headers: { "X-Owner-Id": ownerId },
+            cache: "no-store",
+        });
+        documents = await readJson(response);
+        const availableIds = new Set(documents.map(item => item.document_id));
+        selectedDocumentIds = new Set(
+            [...selectedDocumentIds].filter(id => availableIds.has(id))
+        );
+        renderDocuments();
+        ui.documentStatus.textContent = `${documents.length} document${documents.length === 1 ? "" : "s"} available.`;
+    } catch (error) {
+        ui.documentStatus.textContent = error instanceof Error ? error.message : "Unable to load documents.";
+    }
+}
+async function uploadPendingDocuments() {
+    const files = [...ui.documentUpload.files];
+    if (!files.length) return true;
+
+    ui.documentStatus.textContent = `Uploading ${files.length} document${files.length === 1 ? "" : "s"}…`;
+    try {
+        for (const file of files) {
+            const body = new FormData();
+            body.append("file", file);
+            const response = await fetch("/documents", {
+                method: "POST",
+                headers: { "X-Owner-Id": ownerId },
+                body,
+            });
+            const uploaded = await readJson(response);
+            selectedDocumentIds.add(uploaded.document_id);
+        }
+        ui.documentUpload.value = "";
+        await loadDocuments();
+        return true;
+    } catch (error) {
+        const message = error instanceof Error ? error.message : "Document upload failed.";
+        ui.documentStatus.textContent = message;
+        showStatus("Document upload failed", message, "error");
+        return false;
+    }
+}
+function updateSourceControls() {
+    const mode = sourceMode();
+    ui.sourceIndicator.textContent = ({ web: "Web research", documents: "Document research", hybrid: "Hybrid research" })[mode];
+    usesDocuments(mode) ? show(ui.documentPanel) : hide(ui.documentPanel);
+    if (usesDocuments(mode) && !documents.length) void loadDocuments();
+}
 function setBusy(busy) {
     ui.submit.disabled = busy;
     ui.question.disabled = busy;
+    ui.documentUpload.disabled = busy;
+    ui.refreshDocuments.disabled = busy;
+    document.querySelectorAll('input[name="source-mode"], .document-item input').forEach(input => { input.disabled = busy; });
     document.querySelectorAll(".example-chip").forEach(button => { button.disabled = busy; });
     ui.submit.querySelector("span").textContent = busy ? "Research in progress" : "Start research";
     busy ? show(ui.spinner) : hide(ui.spinner);
@@ -213,6 +328,16 @@ function roundCoverage(round) {
     return events.filter(event => event.iteration === round &&
         event.stage === "research_coverage_evaluator" && event.event_type === "stage_completed").at(-1);
 }
+function researchStages(round) {
+    const selection = events.find(event =>
+        event.iteration === round
+        && event.stage === "research_source_selection"
+        && event.event_type === "stage_completed");
+    if (selection?.details?.source_mode === "documents") {
+        return RESEARCH.filter(stage => !["research_web_search", "research_source_processor"].includes(stage));
+    }
+    return RESEARCH;
+}
 function buildRoundCard(round, latest) {
     const retry = roundEvent(round, "research_retry");
     const stop = roundEvent(round, "research_stopped");
@@ -233,7 +358,7 @@ function buildRoundCard(round, latest) {
     summary.append(left, create("span", "round-status", status));
     details.append(summary);
     const body = create("div", "round-details");
-    body.append(renderStages(RESEARCH, round));
+    body.append(renderStages(researchStages(round), round));
     const decision = retry || stop;
     if (decision) {
         const note = create("div", "round-note");
@@ -307,6 +432,15 @@ function activityDescription(event) {
     if (event.event_type === "research_stopped") return ["Research concluded", event.details?.reason || "Moving to report synthesis"];
     if (event.event_type === "stage_failed") return [`${stage} failed`, "Stage error"];
     if (event.event_type === "stage_started") return [`${stage} started`, event.iteration ? `Round ${event.iteration}` : "Workflow"];
+    if (event.event_type === "stage_completed" && event.stage === "research_source_selection") {
+        const count = event.details?.document_count || 0;
+        return ["Sources prepared", count ? `${count} private document${count === 1 ? "" : "s"} ready` : "Web sources selected"];
+    }
+    if (event.event_type === "stage_completed" && event.stage === "research_retrieval") {
+        const web = event.details?.web_chunk_count || 0;
+        const docs = event.details?.document_chunk_count || 0;
+        return ["Relevant passages retrieved", `${web} web · ${docs} document`];
+    }
     if (event.event_type === "stage_completed") return [`${stage} completed`, event.iteration ? `Round ${event.iteration}` : "Workflow"];
     return [label(event.event_type), stage];
 }
@@ -467,14 +601,24 @@ function renderSources(sources) {
     sources.forEach(source => {
         const item = create("li");
         const url = safeHttpUrl(source.uri || source.url);
+        const title = `${source.source_type === "document" ? "Document · " : ""}${source.title || url || "Source"}`;
         if (url) {
-            const anchor = create("a", "", source.title || url);
+            const anchor = create("a", "", title);
             anchor.href = url;
             anchor.target = "_blank";
             anchor.rel = "noopener noreferrer";
             item.append(anchor);
         } else {
-            item.textContent = source.title || "Source link unavailable";
+            item.textContent = title;
+        }
+        if (source.source_type === "document" && source.locations?.length) {
+            const locations = [...new Set(source.locations.map(location => {
+                const page = location.page_start
+                    ? `Page ${location.page_start}${location.page_end && location.page_end !== location.page_start ? `–${location.page_end}` : ""}`
+                    : null;
+                return [page, location.section].filter(Boolean).join(" · ");
+            }).filter(Boolean))];
+            if (locations.length) item.append(create("small", "source-location", locations.join("; ")));
         }
         ui.sources.append(item);
     });
@@ -535,7 +679,7 @@ function renderTerminalJob(job) {
         }, 3500);
     }
 }
-async function startResearch(question) {
+async function startResearch(question, mode, documentIds) {
     runToken += 1;
     const token = runToken;
     stopNetwork();
@@ -547,10 +691,15 @@ async function startResearch(question) {
     setConnection("");
     hide(ui.pipeline);
     try {
+        const headers = { "Content-Type": "application/json" };
+        if (usesDocuments(mode)) headers["X-Owner-Id"] = ownerId;
         const response = await fetch("/api/research/jobs", {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ question, sources: ["web"] }),
+            headers,
+            body: JSON.stringify({
+                question,
+                source_selection: { mode, document_ids: documentIds },
+            }),
         });
         const data = await readJson(response);
         if (token !== runToken) return;
@@ -570,6 +719,13 @@ async function restoreJob(id) {
     try {
         const snapshot = await getStatus(id);
         if (token !== runToken) return;
+        const allowed = new Set(snapshot.allowed_sources || []);
+        const mode = allowed.has("documents")
+            ? (allowed.has("web") ? "hybrid" : "documents")
+            : "web";
+        const modeInput = document.querySelector(`input[name="source-mode"][value="${mode}"]`);
+        if (modeInput) modeInput.checked = true;
+        updateSourceControls();
         showJob(id, token);
         jobStartedAt = parseTimestamp(snapshot.created_at) || Date.now();
         ui.question.value = snapshot.question || "";
@@ -584,15 +740,34 @@ async function restoreJob(id) {
     }
 }
 
-ui.form.addEventListener("submit", event => {
+ui.form.addEventListener("submit", async event => {
     event.preventDefault();
     const question = ui.question.value.trim();
     if (question.length < 3) {
         showStatus("Invalid question", "Please enter at least 3 characters.", "error");
         return;
     }
-    void startResearch(question);
+    const mode = sourceMode();
+    if (usesDocuments(mode) && ui.documentUpload.files.length) {
+        setBusy(true);
+        showStatus("Uploading documents", "Saving the selected files before research starts.", "loading");
+        if (!await uploadPendingDocuments()) {
+            setBusy(false);
+            return;
+        }
+    }
+    const documentIds = usesDocuments(mode) ? [...selectedDocumentIds] : [];
+    if (usesDocuments(mode) && !documentIds.length) {
+        setBusy(false);
+        showStatus("Select a document", "Document and hybrid research require at least one uploaded document.", "error");
+        return;
+    }
+    void startResearch(question, mode, documentIds);
 });
+document.querySelectorAll('input[name="source-mode"]').forEach(input => {
+    input.addEventListener("change", updateSourceControls);
+});
+ui.refreshDocuments.addEventListener("click", () => void loadDocuments());
 document.querySelectorAll(".example-chip").forEach(button => {
     button.addEventListener("click", () => {
         ui.question.value = button.dataset.question || "";
@@ -615,4 +790,5 @@ window.addEventListener("beforeunload", () => stopNetwork());
 const urlJob = new URLSearchParams(window.location.search).get("job");
 let savedJob = null;
 try { savedJob = localStorage.getItem(STORAGE_KEY); } catch { /* Optional browser storage. */ }
+updateSourceControls();
 if (urlJob || savedJob) void restoreJob(urlJob || savedJob);

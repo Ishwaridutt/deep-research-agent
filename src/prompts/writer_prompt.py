@@ -61,6 +61,7 @@ The application will validate evidence references after you finish.
             f'<evidence id="{item.id}">\n'
             f"Subquestion ID: {item.subquestion_id}\n"
             f"Source ID: {item.source_id}\n"
+            f"Source type: {item.source_type.value}\n"
             f"Content:\n{item.content}\n"
             f"</evidence>"
         )

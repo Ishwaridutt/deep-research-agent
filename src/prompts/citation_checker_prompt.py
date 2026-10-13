@@ -77,6 +77,7 @@ This is a verification task, not a research or writing-expansion task.
             f'<evidence id="{item.id}">\n'
             f"Subquestion ID: {item.subquestion_id}\n"
             f"Source ID: {item.source_id}\n"
+            f"Source type: {item.source_type.value}\n"
             f"Content:\n{item.content}\n"
             f"</evidence>"
         )

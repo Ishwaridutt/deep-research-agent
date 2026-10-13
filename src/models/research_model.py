@@ -4,14 +4,16 @@ from enum import Enum
 
 from pydantic import BaseModel, Field
 
+from src.models.document_models import ResearchSourceSelection
+
 
 class ResearchSource(str, Enum):
     """Sources that a research job may be allowed to use."""
 
     WEB = "web"
+    DOCUMENTS = "documents"
 
     # Future phases.
-    DOCUMENTS = "documents"
     MCP = "mcp"
 
 
@@ -41,9 +43,8 @@ class ResearchRequest(BaseModel):
         min_length=3,
     )
 
-    sources: list[ResearchSource] = Field(
-        default_factory=lambda: [ResearchSource.WEB],
-        min_length=1,
+    source_selection: ResearchSourceSelection = Field(
+        default_factory=ResearchSourceSelection,
     )
 
 

@@ -3,6 +3,9 @@ uvicorn[standard]
 pydantic
 pydantic-settings
 python-dotenv
+python-multipart
+python-docx
+pypdf
 
 langchain
 langchain-core

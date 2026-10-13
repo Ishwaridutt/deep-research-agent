@@ -10,6 +10,7 @@ from src.agents.research import (
     research_evidence_extractor_node,
     research_planner_node,
     research_query_generator_node,
+    research_source_selection_node,
     research_source_processor_node,
     research_web_search_node,
     research_retrieval_node,
@@ -25,11 +26,13 @@ from src.guardrails.input_guardrail import input_guardrail_node
 from src.graph.graph_routing import (
     research_routing_node,
     route_after_research,
+    route_after_source_selection,
     route_after_terminal_check,
 )
 from src.graph.graph_state import WorkflowState
 from src.llm import LLMService
 from src.retrieval import RetrievalSessionFactory
+from src.services.document_service import DocumentService
 from src.tools.extraction import WebExtractor
 from src.tools.search import SearchProvider
 
@@ -37,6 +40,7 @@ from src.tools.search import SearchProvider
 INPUT_GUARDRAIL = "input_guardrail"
 RESEARCH_PLANNER = "research_planner"
 RESEARCH_QUERY_GENERATOR = "research_query_generator"
+RESEARCH_SOURCE_SELECTION = "research_source_selection"
 RESEARCH_WEB_SEARCH = "research_web_search"
 RESEARCH_SOURCE_PROCESSOR = "research_source_processor"
 RESEARCH_RETRIEVAL = "research_retrieval"
@@ -56,9 +60,10 @@ def build_research_graph(
     search_provider: SearchProvider,
     web_extractor: WebExtractor,
     retrieval_session_factory: RetrievalSessionFactory,
+    document_service: DocumentService,
 ) -> CompiledStateGraph:
     """
-    Builds and compiles the complete Phase 1 research workflow.
+    Build and compile the research workflow with selected source branches.
 
     External dependencies are created outside the graph and injected here.
     Agent nodes therefore remain independent of provider construction.
@@ -102,6 +107,15 @@ def build_research_graph(
             research_web_search_node,
             search_provider=search_provider,
             settings=settings,
+        ),
+    )
+
+    builder.add_node(
+        RESEARCH_SOURCE_SELECTION,
+        partial(
+            research_source_selection_node,
+            document_service=document_service,
+            retrieval_session_factory=retrieval_session_factory,
         ),
     )
 
@@ -217,7 +231,17 @@ def build_research_graph(
 
     builder.add_edge(
         RESEARCH_QUERY_GENERATOR,
-        RESEARCH_WEB_SEARCH,
+        RESEARCH_SOURCE_SELECTION,
+    )
+
+    builder.add_conditional_edges(
+        RESEARCH_SOURCE_SELECTION,
+        route_after_source_selection,
+        {
+            "web_research": RESEARCH_WEB_SEARCH,
+            "document_research": RESEARCH_RETRIEVAL,
+            "terminal_error": END,
+        },
     )
 
     builder.add_edge(

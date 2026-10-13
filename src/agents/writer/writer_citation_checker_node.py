@@ -180,30 +180,53 @@ def _build_report_sources(
 ) -> list[ReportSource]:
     """Builds source metadata used by the final supported findings."""
 
+    referenced_evidence = [
+        evidence_by_id[evidence_id]
+        for finding in findings
+        for evidence_id in finding.evidence_ids
+        if evidence_id in evidence_by_id
+    ]
+    source_ids = list(dict.fromkeys(
+        evidence.source_id for evidence in referenced_evidence
+    ))
+
     report_sources: list[ReportSource] = []
-    seen_source_ids: set[str] = set()
+    for source_id in source_ids:
+        source = sources_by_id.get(source_id)
+        if source is None:
+            continue
 
-    for finding in findings:
-        for evidence_id in finding.evidence_ids:
-            evidence = evidence_by_id.get(evidence_id)
-
-            if evidence is None:
+        # Only citation-safe document locations are exposed in the report.
+        locations = []
+        for evidence in referenced_evidence:
+            if evidence.source_id != source_id or source.source_type.value != "document":
                 continue
-
-            source = sources_by_id.get(evidence.source_id)
-
-            if source is None or source.id in seen_source_ids:
-                continue
-
-            seen_source_ids.add(source.id)
-
-            report_sources.append(
-                ReportSource(
-                    source_id=source.id,
-                    title=source.title or str(source.uri),
-                    uri=str(source.uri),
+            location = {
+                key: evidence.provenance[key]
+                for key in (
+                    "chunk_id",
+                    "filename",
+                    "page_start",
+                    "page_end",
+                    "section",
+                    "char_start",
+                    "char_end",
                 )
+                if evidence.provenance.get(key) is not None
+            }
+            location.setdefault("chunk_id", evidence.chunk_id)
+            if location not in locations:
+                locations.append(location)
+
+        report_sources.append(
+            ReportSource(
+                source_id=source.id,
+                source_type=source.source_type,
+                title=source.title or str(source.uri),
+                uri=str(source.uri),
+                locations=locations,
             )
+        )
 
     return report_sources
 
@@ -438,5 +461,3 @@ async def writer_citation_checker_node(
             "final_report": final_report,
         }
     }
-
-    

@@ -22,8 +22,7 @@ def input_guardrail_node(
     """
     Validates workflow input before any research agent receives it.
 
-    Phase 1 supports web research only. Future document and MCP source
-    modes will extend this guardrail without changing downstream agents.
+    Validate the selected web and private-document research sources.
     """
 
     errors = list(
@@ -92,10 +91,14 @@ def input_guardrail_node(
             )
         )
 
+    supported_sources = {
+        ResearchSource.WEB,
+        ResearchSource.DOCUMENTS,
+    }
     unsupported_sources = [
         source
         for source in allowed_sources
-        if source != ResearchSource.WEB
+        if source not in supported_sources
     ]
 
     if unsupported_sources:
@@ -115,12 +118,39 @@ def input_guardrail_node(
                 ),
                 message=(
                     "The following research sources "
-                    "are not enabled in Phase 1: "
+                    "are not enabled: "
                     f"{unsupported_names}."
                 ),
                 recoverable=False,
             )
         )
+
+    if ResearchSource.DOCUMENTS in allowed_sources:
+        if not state["owner_id"]:
+            errors.append(
+                ResearchError(
+                    error_type=ErrorType.VALIDATION,
+                    component="input_guardrail",
+                    message=(
+                        "X-Owner-Id is required when private documents "
+                        "are selected."
+                    ),
+                    recoverable=False,
+                )
+            )
+
+        if not state["selected_document_ids"]:
+            errors.append(
+                ResearchError(
+                    error_type=ErrorType.VALIDATION,
+                    component="input_guardrail",
+                    message=(
+                        "At least one private document must be selected "
+                        "for document research."
+                    ),
+                    recoverable=False,
+                )
+            )
 
     if errors != state["errors"]:
         logger.warning(

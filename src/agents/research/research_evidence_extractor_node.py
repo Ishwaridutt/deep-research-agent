@@ -5,7 +5,13 @@ import logging
 from src.config import Settings
 from src.graph.graph_state import WorkflowState
 from src.llm import LLMCallMetadata, LLMRole, LLMService, LLMServiceError
-from src.models import ErrorType, Evidence, EvidenceExtractionOutput, ResearchError
+from src.models import (
+    ErrorType,
+    Evidence,
+    EvidenceExtractionOutput,
+    ResearchError,
+    SourceType,
+)
 from src.prompts.evidence_extractor_prompt import build_evidence_extractor_messages
 from src.services import generate_evidence_id
 
@@ -74,7 +80,13 @@ async def research_evidence_extractor_node(
 
     new_evidence: list[Evidence] = []
 
-    for retrieval_result in state["research"]["retrieval_results"]:
+    # Retrieval stays source-specific; accepted evidence shares one downstream flow.
+    retrieval_results = [
+        *state["research"]["web_retrieval_results"],
+        *state["research"]["document_retrieval_results"],
+    ]
+
+    for retrieval_result in retrieval_results:
         if remaining_evidence_capacity <= 0:
             break
 
@@ -86,22 +98,16 @@ async def research_evidence_extractor_node(
         if subquestion is None:
             continue
 
-        # Preserve the chunk-to-source relationship so LLM output can be mapped back to citation provenance.
-        source_id_by_chunk_id = {
-            retrieved_chunk.chunk.chunk_id: retrieved_chunk.chunk.document_id
+        chunks_by_id = {
+            retrieved_chunk.chunk.chunk_id: retrieved_chunk.chunk
             for retrieved_chunk in retrieval_result.chunks
         }
-
-        print('\nin extraction pipeline retrieval_result:', retrieval_result)
 
         evidence_extraction_prompt = build_evidence_extractor_messages(
             original_question=state["question"],
             subquestion=subquestion,
             retrieval_result=retrieval_result,
         )
-
-        print('\n evidence_extraction_prompt ')
-        print(evidence_extraction_prompt)
 
         metadata = LLMCallMetadata(
             job_id=state["job_id"],
@@ -118,10 +124,7 @@ async def research_evidence_extractor_node(
                 metadata=metadata,
             )
 
-            print('Recieved resp extraction_output: ', extraction_output)
-
         except LLMServiceError as exc:
-            print('\nError in evidence extraction:', extraction_output)
             logger.exception(
                 "Evidence extraction failed",
                 extra={
@@ -152,9 +155,9 @@ async def research_evidence_extractor_node(
                 break
 
             content = candidate.content.strip()
-            source_id = source_id_by_chunk_id.get(candidate.chunk_id)
+            chunk = chunks_by_id.get(candidate.chunk_id)
 
-            if not content or source_id is None:
+            if not content or chunk is None:
                 continue
 
             if candidate.relevance_score < settings.research_limits.min_evidence_relevance:
@@ -174,7 +177,19 @@ async def research_evidence_extractor_node(
                 Evidence(
                     id=generate_evidence_id(),
                     subquestion_id=subquestion.id,
-                    source_id=source_id,
+                    source_id=(
+                        chunk.metadata.get("private_document_id")
+                        or chunk.document_id
+                    ),
+                    chunk_id=chunk.chunk_id,
+                    source_type=SourceType(chunk.source_type),
+                    provenance={
+                        **chunk.metadata,
+                        "document_id": chunk.document_id,
+                        "chunk_index": chunk.chunk_index,
+                        "title": chunk.title,
+                        "section": chunk.section,
+                    },
                     content=content,
                     relevance_score=candidate.relevance_score,
                 )

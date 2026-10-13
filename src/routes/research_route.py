@@ -24,12 +24,16 @@ def create_research_router(*, research_service: ResearchService) -> APIRouter:
         response_model=ResearchExecutionResult,
         status_code=status.HTTP_200_OK,
     )
-    async def research(request: ResearchRequest) -> ResearchExecutionResult:
+    async def research(
+        request: ResearchRequest,
+        x_owner_id: str | None = Header(default=None, alias="X-Owner-Id"),
+    ) -> ResearchExecutionResult:
         """Existing endpoint: run research and return its final result."""
 
         return await research_service.research(
             question=request.question,
-            allowed_sources=request.sources,
+            source_selection=request.source_selection,
+            owner_id=x_owner_id,
         )
 
     @router.post(
@@ -37,13 +41,17 @@ def create_research_router(*, research_service: ResearchService) -> APIRouter:
         response_model=ResearchJobCreated,
         status_code=status.HTTP_202_ACCEPTED,
     )
-    async def create_research_job(request: ResearchRequest) -> ResearchJobCreated:
+    async def create_research_job(
+        request: ResearchRequest,
+        x_owner_id: str | None = Header(default=None, alias="X-Owner-Id"),
+    ) -> ResearchJobCreated:
         """Queue a persistent research job; return its ID immediately."""
 
         try:
             return await research_service.start_job(
                 question=request.question,
-                allowed_sources=request.sources,
+                source_selection=request.source_selection,
+                owner_id=x_owner_id,
             )
         except ResearchJobQueueFull as exc:
             raise HTTPException(status_code=429, detail=str(exc)) from exc

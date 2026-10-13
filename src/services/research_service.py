@@ -14,6 +14,8 @@ from src.models import (
     ResearchExecutionResult,
     ResearchExecutionStatus,
     ResearchSource,
+    ResearchSourceMode,
+    ResearchSourceSelection,
 )
 from src.models.pipeline_event import ResearchJobCreated
 from src.persistence import ResearchJobStore
@@ -25,6 +27,7 @@ from src.services.research_pipeline_stream_service import (
     PipelineRecorder,
     run_graph_with_events,
 )
+from src.services.research_job_resources import ResearchJobResources
 
 
 logger = logging.getLogger(__name__)
@@ -59,24 +62,43 @@ class ResearchService:
         self,
         *,
         question: str,
-        allowed_sources: list[ResearchSource] | None,
+        source_selection: ResearchSourceSelection | None,
+        owner_id: str | None,
         research_session_id: str | None,
     ) -> WorkflowState:
-        sources = list(allowed_sources) if allowed_sources is not None else [ResearchSource.WEB]
+        selection = source_selection or ResearchSourceSelection()
+        sources = {
+            ResearchSourceMode.WEB: [ResearchSource.WEB],
+            ResearchSourceMode.DOCUMENTS: [ResearchSource.DOCUMENTS],
+            ResearchSourceMode.HYBRID: [
+                ResearchSource.WEB,
+                ResearchSource.DOCUMENTS,
+            ],
+        }[selection.mode]
         return create_initial_workflow_state(
             job_id=generate_job_id(),
             research_session_id=(research_session_id or "").strip() or generate_research_session_id(),
             question=question,
             allowed_sources=sources,
+            source_mode=selection.mode,
+            owner_id=(owner_id or "").strip() or None,
+            selected_document_ids=list(dict.fromkeys(selection.document_ids)),
         )
 
-    def _graph_config(self, state: WorkflowState) -> dict:
+    def _graph_config(
+        self,
+        state: WorkflowState,
+        resources: ResearchJobResources,
+    ) -> dict:
         return {
             "run_name": "deep_research_job",
             "tags": ["deep-research-agent", "research-job"],
             "metadata": {
                 "job_id": state["job_id"],
                 "research_session_id": state["research_session_id"],
+            },
+            "configurable": {
+                "job_resources": resources,
             },
             "recursion_limit": self._settings.app.graph_recursion_limit,
         }
@@ -100,16 +122,19 @@ class ResearchService:
         self,
         *,
         question: str,
-        allowed_sources: list[ResearchSource] | None = None,
+        source_selection: ResearchSourceSelection | None = None,
+        owner_id: str | None = None,
         research_session_id: str | None = None,
     ) -> ResearchExecutionResult:
         """Preserve the existing synchronous /api/research behavior."""
 
         state = self._create_state(
             question=question,
-            allowed_sources=allowed_sources,
+            source_selection=source_selection,
+            owner_id=owner_id,
             research_session_id=research_session_id,
         )
+        resources = ResearchJobResources()
         logger.info(
             "Research workflow execution started.",
             extra={
@@ -120,17 +145,23 @@ class ResearchService:
             },
         )
         try:
-            result = await self._graph.ainvoke(state, config=self._graph_config(state))
+            result = await self._graph.ainvoke(
+                state,
+                config=self._graph_config(state, resources),
+            )
         except Exception as exc:
             logger.exception("Research workflow execution failed unexpectedly.")
             return self._failed_result(state, f"The research workflow failed unexpectedly: {exc}")
+        finally:
+            resources.clear()
         return self._build_result(state=cast(WorkflowState, result))
 
     async def start_job(
         self,
         *,
         question: str,
-        allowed_sources: list[ResearchSource] | None = None,
+        source_selection: ResearchSourceSelection | None = None,
+        owner_id: str | None = None,
         research_session_id: str | None = None,
     ) -> ResearchJobCreated:
         """Persist a queued job and start execution independently of SSE."""
@@ -141,7 +172,8 @@ class ResearchService:
 
             state = self._create_state(
                 question=question,
-                allowed_sources=allowed_sources,
+                source_selection=source_selection,
+                owner_id=owner_id,
                 research_session_id=research_session_id,
             )
             await self._job_store.create_job(
@@ -181,32 +213,43 @@ class ResearchService:
             persist=self._job_store.append_event,
         )
         failure_message: str | None = None
+        resources = ResearchJobResources()
 
         try:
-            async with self._task_slots:
-                await self._job_store.mark_running(state["job_id"])
-                final_state = await run_graph_with_events(
-                    graph=self._graph,
-                    state=state,
-                    config=self._graph_config(state),
-                    recorder=recorder,
+            try:
+                async with self._task_slots:
+                    await self._job_store.mark_running(state["job_id"])
+                    final_state = await run_graph_with_events(
+                        graph=self._graph,
+                        state=state,
+                        config=self._graph_config(state, resources),
+                        recorder=recorder,
+                    )
+                    result = self._build_result(state=final_state)
+            except asyncio.CancelledError:
+                failure_message = "Research job stopped during server shutdown."
+                result = self._failed_result(state, failure_message)
+                # Persist terminal status before propagating task cancellation.
+                await self._finish_persisted_job(
+                    recorder,
+                    result,
+                    failure_message,
                 )
-                result = self._build_result(state=final_state)
-        except asyncio.CancelledError:
-            failure_message = "Research job stopped during server shutdown."
-            result = self._failed_result(state, failure_message)
-            # Persist terminal status before propagating task cancellation.
-            await self._finish_persisted_job(recorder, result, failure_message)
-            raise
-        except Exception:
-            logger.exception(
-                "Persisted research job failed.",
-                extra={"job_id": state["job_id"], "event": "research_job_failed"},
-            )
-            failure_message = "Research job failed unexpectedly."
-            result = self._failed_result(state, failure_message)
+                raise
+            except Exception:
+                logger.exception(
+                    "Persisted research job failed.",
+                    extra={
+                        "job_id": state["job_id"],
+                        "event": "research_job_failed",
+                    },
+                )
+                failure_message = "Research job failed unexpectedly."
+                result = self._failed_result(state, failure_message)
 
-        await self._finish_persisted_job(recorder, result, failure_message)
+            await self._finish_persisted_job(recorder, result, failure_message)
+        finally:
+            resources.clear()
 
     async def _finish_persisted_job(
         self,

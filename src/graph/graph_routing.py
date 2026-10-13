@@ -11,6 +11,7 @@ from src.models import (
     CoverageStatus,
     ErrorType,
     ResearchError,
+    ResearchSource,
     ResearchStopReason,
 )
 from src.models.research_quality import (
@@ -29,6 +30,12 @@ TerminalCheckRouteName = Literal[
 ResearchRouteName = Literal[
     "continue_research",
     "write_report",
+    "terminal_error",
+]
+
+SourceSelectionRouteName = Literal[
+    "web_research",
+    "document_research",
     "terminal_error",
 ]
 
@@ -52,6 +59,18 @@ def route_after_terminal_check(
         if has_terminal_error(state)
         else "continue"
     )
+
+
+def route_after_source_selection(
+    state: WorkflowState,
+) -> SourceSelectionRouteName:
+    """Route the iteration through only the selected source pipeline."""
+
+    if has_terminal_error(state):
+        return "terminal_error"
+    if ResearchSource.WEB in state["allowed_sources"]:
+        return "web_research"
+    return "document_research"
 
 
 def _get_new_evidence_ids(

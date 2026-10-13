@@ -9,10 +9,14 @@ from src.routes.index_route import (
 from src.routes.research_route import (
     create_research_router,
 )
+from src.routes.document_routes import (
+    router as document_router,
+)
 
 
 __all__ = [
     "create_research_router",
     "health_router",
     "index_router",
+    "document_router",
 ]

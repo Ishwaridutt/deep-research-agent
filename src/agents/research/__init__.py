@@ -18,6 +18,9 @@ from src.agents.research.research_retrieval_node import (
 from src.agents.research.research_source_processor_node import (
     research_source_processor_node,
 )
+from src.agents.research.research_source_selection_node import (
+    research_source_selection_node,
+)
 from src.agents.research.research_web_search_node import (
     research_web_search_node,
 )
@@ -30,6 +33,7 @@ __all__ = [
     "research_query_generator_node",
     "research_retrieval_node",
     "research_source_processor_node",
+    "research_source_selection_node",
     "research_web_search_node",
 ]
 

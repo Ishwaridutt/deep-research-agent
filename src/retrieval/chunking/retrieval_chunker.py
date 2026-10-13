@@ -36,8 +36,11 @@ class RetrievalChunker:
             )
         return chunks
 
-    def chunk_document(self, document: RetrievalDocument) -> list[RetrievalChunk]:
-        """Chunks a single retrieval document while preserving provenance."""
+    def chunk_document(
+        self,
+        document: RetrievalDocument,
+    ) -> list[RetrievalChunk]:
+        """Chunk one document while retaining its source provenance."""
 
         if not document.content or not document.content.strip():
             return []
@@ -51,6 +54,15 @@ class RetrievalChunker:
             metadata["start_index"] = generated_chunk.start_index
             metadata["end_index"] = generated_chunk.end_index
 
+            base_char_start = document.metadata.get("char_start")
+            if isinstance(base_char_start, int):
+                metadata["char_start"] = (
+                    base_char_start + generated_chunk.start_index
+                )
+                metadata["char_end"] = (
+                    base_char_start + generated_chunk.end_index
+                )
+
             chunks.append(
                 RetrievalChunk(
                     chunk_id=f"{document.document_id}:{chunk_index}",
@@ -60,7 +72,7 @@ class RetrievalChunker:
                     chunk_index=chunk_index,
                     token_count=generated_chunk.token_count,
                     title=document.title,
-                    section=None,
+                    section=document.metadata.get("section_title"),
                     metadata=metadata,
                 )
             )

@@ -12,13 +12,20 @@ from transformers import AutoTokenizer
 
 from src.config import Settings, get_settings
 from src.config.logging import configure_logging
+from src.documents.document_dependencies import create_document_service
 from src.graph.graph_builder import build_research_graph
 from src.llm import create_llm_service
 from src.persistence import ResearchJobStore
 from src.retrieval import RetrievalSessionFactory
 from src.retrieval.embeddings import RetrievalEmbeddingService
-from src.routes import create_research_router, health_router, index_router
+from src.routes import (
+    create_research_router,
+    document_router,
+    health_router,
+    index_router,
+)
 from src.services import ResearchService
+from src.services.document_service import DocumentService
 from src.tools.extraction import WebExtractor, create_web_extractor
 from src.tools.search import SearchProvider, create_search_provider
 
@@ -60,17 +67,14 @@ async def _close_resource(*, name: str, resource: AsyncClosable) -> None:
         )
 
 
-def _create_retrieval_session_factory(settings: Settings) -> RetrievalSessionFactory:
+def _create_retrieval_session_factory(
+    settings: Settings,
+    *,
+    embedding_service: RetrievalEmbeddingService,
+) -> RetrievalSessionFactory:
     """Create shared retrieval dependencies and the per-job session factory."""
 
     retrieval_settings = settings.retrieval
-
-    # Load the local embedding model once for the server process lifetime.
-    embedding_service = RetrievalEmbeddingService(
-        model_name=retrieval_settings.embedding_model,
-        device=retrieval_settings.embedding_device,
-        batch_size=retrieval_settings.embedding_batch_size,
-    )
 
     # The tokenizer is local; the evidence LLM remains remote.
     context_tokenizer = AutoTokenizer.from_pretrained(
@@ -100,18 +104,19 @@ def _create_research_service(
     search_provider: SearchProvider,
     web_extractor: WebExtractor,
     job_store: ResearchJobStore,
+    retrieval_session_factory: RetrievalSessionFactory,
+    document_service: DocumentService,
 ) -> ResearchService:
     """Create the complete research application service."""
 
     llm_service = create_llm_service(settings)
-    retrieval_session_factory = _create_retrieval_session_factory(settings)
-
     graph = build_research_graph(
         settings=settings,
         llm_service=llm_service,
         search_provider=search_provider,
         web_extractor=web_extractor,
         retrieval_session_factory=retrieval_session_factory,
+        document_service=document_service,
     )
 
     return ResearchService(graph=graph, settings=settings, job_store=job_store)
@@ -127,12 +132,27 @@ def create_app() -> FastAPI:
     web_extractor = create_web_extractor(settings)
     job_store = ResearchJobStore(Path(os.getenv("RESEARCH_DB_PATH", str(_DEFAULT_DB_PATH))))
 
+    # Web retrieval sessions and private-document indexing share this model and tokenizer.
+    embedding_service = RetrievalEmbeddingService(
+        model_name=settings.retrieval.embedding_model,
+        device=settings.retrieval.embedding_device,
+        batch_size=settings.retrieval.embedding_batch_size,
+    )
+    retrieval_session_factory = _create_retrieval_session_factory(
+        settings,
+        embedding_service=embedding_service,
+    )
+    document_service = create_document_service(
+        settings=settings,
+    )
     # Build the graph and expensive shared dependencies once per process.
     research_service = _create_research_service(
         settings=settings,
         search_provider=search_provider,
         web_extractor=web_extractor,
         job_store=job_store,
+        retrieval_session_factory=retrieval_session_factory,
+        document_service=document_service,
     )
 
     @asynccontextmanager
@@ -162,10 +182,12 @@ def create_app() -> FastAPI:
         debug=settings.app.debug,
         lifespan=lifespan,
     )
+    app.state.document_service = document_service
 
     app.include_router(index_router)
     app.include_router(health_router)
     app.include_router(create_research_router(research_service=research_service))
+    app.include_router(document_router)
     app.mount(
         "/static", StaticFiles(directory=str(_STATIC_DIRECTORY)), name="static",
     )

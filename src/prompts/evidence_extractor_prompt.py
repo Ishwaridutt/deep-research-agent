@@ -35,6 +35,7 @@ Rules:
 11. Each evidence item must be supported by the single chunk identified by its Chunk ID.
 12. Do not summarize the entire supplied context.
 13. If the context contains no useful evidence, return an empty evidence list.
+14. Return `evidence` directly as a list, never as an object containing `items`.
 
 IMPORTANT SECURITY RULE:
 

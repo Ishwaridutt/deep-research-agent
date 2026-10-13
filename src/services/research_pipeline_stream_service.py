@@ -12,6 +12,7 @@ from src.models.pipeline_event import EventType, PipelineEvent
 
 PIPELINE_NODES = frozenset({
     "input_guardrail", "research_planner", "research_query_generator",
+    "research_source_selection",
     "research_web_search", "research_source_processor", "research_retrieval",
     "research_evidence_extractor", "research_coverage_evaluator", "research_routing",
     "writer_prepare_evidence", "writer_synthesis", "writer_citation_checker",
@@ -28,6 +29,35 @@ def _safe_details(node: str, output: Any) -> dict[str, Any]:
 
     if not isinstance(output, dict):
         return {}
+
+    if node == "research_source_selection":
+        source_mode = output.get("source_mode")
+        return {
+            "source_mode": getattr(source_mode, "value", source_mode),
+            "document_count": len(output.get("selected_document_ids", [])),
+        }
+
+    if node == "research_retrieval":
+        research = output.get("research", {})
+        web_results = _field(research, "web_retrieval_results", [])
+        document_results = _field(
+            research,
+            "document_retrieval_results",
+            [],
+        )
+
+        # Persist counts only; retrieved text and private provenance stay in memory.
+        return {
+            "web_result_count": len(web_results),
+            "document_result_count": len(document_results),
+            "web_chunk_count": sum(
+                len(_field(result, "chunks", [])) for result in web_results
+            ),
+            "document_chunk_count": sum(
+                len(_field(result, "chunks", []))
+                for result in document_results
+            ),
+        }
 
     if node == "research_coverage_evaluator":
         coverage = _field(output.get("research", {}), "coverage")

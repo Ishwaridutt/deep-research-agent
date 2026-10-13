@@ -33,11 +33,28 @@
                     <p class="section-kicker">01 / START HERE</p>
                     <h2 id="composer-title">Start a new investigation</h2>
                 </div>
-                <span class="source-indicator"><span class="source-dot" aria-hidden="true"></span> Web research</span>
+                <span class="source-indicator"><span class="source-dot" aria-hidden="true"></span><span id="source-indicator-text">Web research</span></span>
             </div>
             <form id="research-form">
                 <label for="research-question" class="form-label">What would you like to understand?</label>
                 <textarea id="research-question" name="question" rows="5" minlength="3" required placeholder="How are AI coding assistants changing developer productivity, code quality, and team workflows?"></textarea>
+                <fieldset class="source-picker">
+                    <legend class="form-label">Research sources</legend>
+                    <label class="source-option"><input type="radio" name="source-mode" value="web" checked><span><strong>Web</strong><small>Search current public sources</small></span></label>
+                    <label class="source-option"><input type="radio" name="source-mode" value="documents"><span><strong>Documents</strong><small>Use selected private files</small></span></label>
+                    <label class="source-option"><input type="radio" name="source-mode" value="hybrid"><span><strong>Hybrid</strong><small>Combine web and private files</small></span></label>
+                </fieldset>
+                <section id="document-panel" class="document-panel hidden" aria-labelledby="document-panel-title">
+                    <div class="document-panel-head">
+                        <div><strong id="document-panel-title">Private documents</strong><small>Select new files or reuse existing uploads. New files upload when research starts.</small></div>
+                        <button id="refresh-documents" class="text-button" type="button">Refresh</button>
+                    </div>
+                    <div class="upload-row">
+                        <input id="document-upload" type="file" accept=".pdf,.docx,.txt,.md" multiple>
+                    </div>
+                    <p id="document-status" class="document-status" aria-live="polite"></p>
+                    <div id="document-list" class="document-list"></div>
+                </section>
                 <div class="composer-footer">
                     <span class="helper-text">Research is evaluated against its sources before the report is written.</span>
                     <button id="research-button" type="submit"><span>Start research</span><span aria-hidden="true">↗</span></button>
