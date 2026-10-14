@@ -47,7 +47,9 @@ class ApplicationSettings(EnvironmentSettings):
 class LLMSettings(EnvironmentSettings):
     """Configuration for provider-independent LLM execution."""
 
-    llm_provider: Literal["groq", "google_genai"] = "groq"
+    llm_provider: Literal["openai", "google_genai", "groq"] = "groq"
+    llm_provider_order: str = "openai,google_genai,groq"
+    llm_private_data_providers: str = "openai,google_genai,groq"
 
     planner_model: str = Field(min_length=1)
     query_generator_model: str = Field(min_length=1)
@@ -78,6 +80,8 @@ class SearchSettings(EnvironmentSettings):
     """Configuration for web search and webpage extraction providers."""
 
     tavily_api_key: SecretStr = Field(min_length=1)
+    brave_api_key: SecretStr | None = None
+    firecrawl_api_key: SecretStr | None = None
 
     search_provider: str = "tavily"
     web_extractor_provider: str = "tavily"
@@ -107,6 +111,33 @@ class SearchSettings(EnvironmentSettings):
         "markdown",
         "text",
     ] = "markdown"
+
+    brave_api_url: str = "https://api.search.brave.com/res/v1/web/search"
+    brave_api_version: str = "2023-01-01"
+    firecrawl_api_url: str = "https://api.firecrawl.dev/v2/scrape"
+
+    provider_max_retries: int = Field(default=1, ge=0)
+    provider_retry_delay_seconds: float = Field(default=0.25, ge=0.0)
+    provider_circuit_failure_threshold: int = Field(default=2, ge=1)
+    provider_circuit_recovery_seconds: float = Field(default=60.0, ge=0.0)
+
+    arxiv_enabled: bool = True
+    wikipedia_enabled: bool = True
+
+    arxiv_api_url: str = "https://export.arxiv.org/api/query"
+    wikipedia_api_url: str = "https://en.wikipedia.org/w/api.php"
+    public_api_user_agent: str = "DeepResearchAgent/0.1"
+
+    arxiv_timeout_seconds: int = Field(default=20, ge=1)
+    wikipedia_timeout_seconds: int = Field(default=20, ge=1)
+
+    arxiv_full_text_enabled: bool = True
+    arxiv_max_pdf_pages: int = Field(default=20, ge=1)
+
+    search_max_concurrency: int = Field(default=3, ge=1)
+    web_results_per_query: int = Field(default=5, ge=1)
+    arxiv_results_per_query: int = Field(default=3, ge=1)
+    wikipedia_results_per_query: int = Field(default=3, ge=1)
 
 
 class RetrievalSettings(EnvironmentSettings):
@@ -222,6 +253,16 @@ class ResearchLimitSettings(EnvironmentSettings):
     # the raw HTTP download. Tavily performs the remote fetch in Phase 1.
     max_source_download_bytes: int = Field(
         default=5_000_000,
+        ge=1,
+    )
+
+    min_source_content_chars: int = Field(
+        default=80,
+        ge=1,
+    )
+
+    max_source_content_chars: int = Field(
+        default=50_000,
         ge=1,
     )
 

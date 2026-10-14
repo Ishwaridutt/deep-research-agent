@@ -1,7 +1,7 @@
 """Research Planner node."""
 
-import logging
 import json
+import logging
 
 from src.config import Settings
 from src.graph.graph_state import WorkflowState
@@ -15,6 +15,7 @@ from src.models import (
     ErrorType,
     PlannerOutput,
     ResearchError,
+    ResearchSource,
     SubQuestion,
 )
 from src.prompts.planner_prompt import build_planner_messages
@@ -115,17 +116,17 @@ async def research_planner_node(
         job_id=state["job_id"],
         research_session_id=state["research_session_id"],
         node="research_planner",
+        contains_private_data=ResearchSource.DOCUMENTS in state["allowed_sources"],
     )
 
     try:
         planner_output = await llm_service.invoke_structured(
-                role=LLMRole.PLANNER,
-                messages=planner_prompt,
-                output_schema=PlannerOutput,
-                metadata=metadata,
-            )
-
-        print('\n planner output:', planner_output.model_dump_json(indent=2))
+            role=LLMRole.PLANNER,
+            messages=planner_prompt,
+            output_schema=PlannerOutput,
+            metadata=metadata,
+        )
+        print("\nplanner output:", planner_output.model_dump_json(indent=2))
       
     except LLMServiceError as exc:
         logger.exception(
@@ -198,19 +199,13 @@ async def research_planner_node(
             "job_id": state["job_id"],
             "research_session_id": state["research_session_id"],
             "node": "research_planner",
-            # "data": subquestions,
+            "subquestion_count": len(subquestions),
         },
     )
-    print('\nsubquestions:', json.dumps(
+    print("\nsubquestions:", json.dumps(
         [item.model_dump() for item in subquestions],
         indent=2,
-    ),)
-    # pprint.pprint(subquestions)
-    # pprint.pprint( 
-    #     subquestions,
-    #     width=120,
-    #     sort_dicts=False,
-    #     )
+    ))
 
     return {
         "research": {

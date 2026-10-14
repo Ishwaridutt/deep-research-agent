@@ -68,6 +68,7 @@ textarea:disabled { opacity: .65; }
 .upload-row { margin-top: 13px; }
 .upload-row input { width: 100%; min-width: 0; color: #b9c8dc; font-size: .78rem; }
 .document-status { min-height: 1.2em; margin: 9px 0 0; color: var(--muted); font-size: .75rem; }
+.document-status[data-type="error"] { color: var(--error); font-weight: 650; }
 .document-list { display: grid; gap: 7px; margin-top: 10px; }
 .document-item { justify-content: flex-start; padding: 9px 10px; border: 1px solid #2e4058; border-radius: 8px; color: #d1dcec; font-size: .79rem; }
 .document-item input { accent-color: var(--accent); }
@@ -92,6 +93,19 @@ textarea:disabled { opacity: .65; }
 .status-panel[data-type="success"] { border-color: #356f6a; }
 .status-panel[data-type="error"] { border-color: #824953; }
 .status-panel[data-type="error"] .status-symbol { color: var(--error); }
+.status-panel[data-issue="document-selection"] { position: fixed; z-index: 1000; top: 20px; right: 20px; width: min(430px, calc(100vw - 40px)); margin: 0; border: 2px solid var(--error); background: #3a202b; box-shadow: 0 18px 55px rgba(0,0,0,.55), 0 0 0 4px rgba(240,154,159,.18); }
+.status-panel[data-issue="document-selection"] .status-symbol { background: #5b2d3a; }
+.status-panel[data-issue="document-selection"].attention-pulse { animation: validation-toast .55s cubic-bezier(.2,.8,.2,1); }
+.document-panel.attention-pulse { animation: validation-panel .55s ease-in-out 2; }
+@keyframes validation-toast {
+    0% { opacity: .35; transform: translateY(-18px) scale(.94); }
+    45% { opacity: 1; transform: translateX(-10px) scale(1.02); }
+    70% { transform: translateX(6px) scale(1); }
+    100% { transform: none; }
+}
+@keyframes validation-panel {
+    50% { border-color: var(--error); background: #321d29; box-shadow: 0 0 0 5px rgba(240,154,159,.28); }
+}
 .connection-state { white-space: nowrap; color: var(--warning); font-size: .75rem; }
 .spinner { width: 17px; height: 17px; border: 2px solid #5a7196; border-top-color: #d8e3ff; border-radius: 50%; animation: spin .8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
@@ -190,6 +204,7 @@ pre { overflow-x: auto; max-height: 500px; margin-top: 13px; padding: 19px; back
     .workflow-grid, .insight-column { grid-template-columns: 1fr; }
     .group-head { flex-wrap: wrap; }
     .status-panel { align-items: flex-start; } .connection-state { display: none; }
+    .status-panel[data-issue="document-selection"] { top: 13px; right: 13px; left: 13px; width: auto; }
     .app-footer { flex-direction: column; gap: 4px; }
 }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .001ms !important; transition-duration: .001ms !important; scroll-behavior: auto !important; } }

@@ -16,6 +16,7 @@ from src.models import (
     ErrorType,
     Evidence,
     ResearchError,
+    ResearchSource,
     SubQuestion,
 )
 from src.models.coverage_model import (
@@ -402,6 +403,7 @@ async def research_coverage_evaluator_node(
             research_session_id=state["research_session_id"],
             node="research_coverage_evaluator",
             iteration=iteration,
+            contains_private_data=ResearchSource.DOCUMENTS in state["allowed_sources"],
         )
 
         try:

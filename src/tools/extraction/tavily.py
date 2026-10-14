@@ -9,6 +9,7 @@ from src.tools.extraction.base import (
     WebExtractionError,
     WebExtractor,
 )
+from src.tools.provider_resilience import fallback_allowed_for_exception
 
 
 class TavilyWebExtractor(WebExtractor):
@@ -53,21 +54,17 @@ class TavilyWebExtractor(WebExtractor):
             )
 
         except Exception as exc:
-            print('Error while extracting data:', exc)
-            raise WebExtractionError(f"Tavily extraction failed for '{url}'.") from exc
+            print("Tavily extraction failed:", type(exc).__name__)
+            raise WebExtractionError(
+                f"Tavily extraction failed for '{url}'.",
+                fallback_allowed=fallback_allowed_for_exception(exc),
+            ) from exc
 
         results = response.get("results", [])
 
-
         if not results:
-            failed_results = response.get("failed_results", [])
-            failure_message = self._get_failure_message(failed_results)
-
             raise WebExtractionError(
-                (
-                    f"Tavily could not extract '{url}'."
-                    f"{failure_message}"
-                )
+                f"Tavily could not extract '{url}'."
             )
 
         result = results[0]
@@ -83,12 +80,12 @@ class TavilyWebExtractor(WebExtractor):
                 )
             )
 
-        print('Extracted data for url---->')
-        print(extracted_url)
-        # print(content)
+        print("Extracted data for URL:", extracted_url)
         return ExtractedWebPage(
             url=extracted_url,
             content=content,
+            content_format=self._output_format,
+            provider_metadata={"extraction_provider": "tavily"},
         )
 
     async def close(
@@ -97,24 +94,3 @@ class TavilyWebExtractor(WebExtractor):
         """Closes Tavily's underlying async HTTP client."""
 
         await self._client.close()
-
-    @staticmethod
-    def _get_failure_message(
-        failed_results: list,
-    ) -> str:
-        """Creates a short provider error message when available."""
-
-        if not failed_results:
-            return ""
-
-        first_failure = failed_results[0]
-
-        if not isinstance(first_failure, dict):
-            return ""
-
-        error_message = str(first_failure.get("error") or "").strip()
-
-        if not error_message:
-            return ""
-
-        return f" Provider message: {error_message}"

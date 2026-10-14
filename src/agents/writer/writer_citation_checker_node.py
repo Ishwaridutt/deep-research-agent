@@ -19,6 +19,7 @@ from src.models import (
     ReportSource,
     ResearchError,
     ResearchReport,
+    ResearchSource,
     SemanticCitationCheckOutput,
     Source,
 )
@@ -370,6 +371,7 @@ async def writer_citation_checker_node(
         research_session_id=state["research_session_id"],
         node="writer_citation_checker",
         iteration=iteration,
+        contains_private_data=ResearchSource.DOCUMENTS in state["allowed_sources"],
     )
 
     try:

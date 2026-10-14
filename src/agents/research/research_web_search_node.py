@@ -55,9 +55,9 @@ async def research_web_search_node(
             "iteration": target_iteration,
         },
     )
-    print("\nresearch web search search queries:", iteration_queries)
-    print("\nresearch web search search queries:", json.dumps(
-        [item.model_dump() for item in iteration_queries], indent=2
+    print("\nresearch web search queries:", json.dumps(
+        [item.model_dump() for item in iteration_queries],
+        indent=2,
     ))
 
     for search_query in iteration_queries:
@@ -109,8 +109,11 @@ async def research_web_search_node(
             ))
             continue
 
-        print("\nsearch result:", json.dumps([item.model_dump() for item in results], indent=2))
-        print("\nfor query: ", search_query)
+        print("\nsearch results:", json.dumps(
+            [item.model_dump(mode="json") for item in results],
+            indent=2,
+        ))
+        print("\nfor query:", search_query)
 
         # Retain unscored results for providers that do not expose relevance scores.
         filtered_results = [

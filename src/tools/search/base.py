@@ -2,8 +2,10 @@
 
 from typing import Protocol
 from src.models import SearchQuery, SearchResult
+from src.tools.provider_resilience import ProviderOperationError
 
-class SearchProviderError(RuntimeError):
+
+class SearchProviderError(ProviderOperationError):
     """Raised when a web search provider cannot complete a request."""
 
 

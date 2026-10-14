@@ -14,6 +14,7 @@ from src.models import (
     RetrievalResult,
     SearchQuery,
     Source,
+    SourceProvider,
     SourceType,
 )
 from src.retrieval import RetrievalSession, RetrievalSessionFactory
@@ -89,6 +90,9 @@ def _web_documents(
             title=source.title,
             metadata={
                 "url": str(source.uri),
+                "provider": source.provider.value,
+                "canonical_id": source.canonical_id,
+                "provider_metadata": dict(source.provider_metadata),
                 "search_result_ids": list(source.search_result_ids),
             },
         )
@@ -117,6 +121,8 @@ def _with_document_sources(
                 Source(
                     id=document_id,
                     source_type=SourceType.DOCUMENT,
+                    provider=SourceProvider.PRIVATE_DOCUMENT,
+                    canonical_id=f"document:{document_id}",
                     title=chunk.metadata.get("filename") or chunk.title or document_id,
                     uri=f"document://{document_id}",
                     content=chunk.content,

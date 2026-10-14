@@ -10,6 +10,7 @@ from src.models import (
     Evidence,
     EvidenceExtractionOutput,
     ResearchError,
+    ResearchSource,
     SourceType,
 )
 from src.prompts.evidence_extractor_prompt import build_evidence_extractor_messages
@@ -114,6 +115,7 @@ async def research_evidence_extractor_node(
             research_session_id=state["research_session_id"],
             node="research_evidence_extractor",
             iteration=target_iteration,
+            contains_private_data=ResearchSource.DOCUMENTS in state["allowed_sources"],
         )
 
         try:

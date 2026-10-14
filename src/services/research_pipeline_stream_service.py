@@ -24,7 +24,12 @@ def _field(value: Any, key: str, default: Any = None) -> Any:
     return value.get(key, default) if isinstance(value, dict) else getattr(value, key, default)
 
 
-def _safe_details(node: str, output: Any) -> dict[str, Any]:
+def _safe_details(
+    node: str,
+    output: Any,
+    *,
+    iteration: int | None = None,
+) -> dict[str, Any]:
     """Never leak prompts, webpage bodies, evidence, or final reports into SSE."""
 
     if not isinstance(output, dict):
@@ -32,9 +37,84 @@ def _safe_details(node: str, output: Any) -> dict[str, Any]:
 
     if node == "research_source_selection":
         source_mode = output.get("source_mode")
+        if source_mode is None:
+            return {}
         return {
             "source_mode": getattr(source_mode, "value", source_mode),
             "document_count": len(output.get("selected_document_ids", [])),
+        }
+
+    if node == "research_web_search":
+        research = output.get("research", {})
+        queries = _field(research, "search_queries", [])
+        query_ids = {
+            _field(query, "id")
+            for query in queries
+            if iteration is None or _field(query, "iteration") == iteration
+        }
+        results = [
+            result for result in _field(research, "search_results", [])
+            if _field(result, "query_id") in query_ids
+        ]
+        provider_counts: dict[str, int] = {}
+        failed_branches: set[str] = set()
+        fallback_activated = False
+        for result in results:
+            provider = _field(result, "provider")
+            provider = getattr(provider, "value", provider)
+            if isinstance(provider, str):
+                provider_counts[provider] = provider_counts.get(provider, 0) + 1
+
+            metadata = _field(result, "provider_metadata", {})
+            diagnostics = _field(metadata, "search_diagnostics", {})
+            failed_branches.update(
+                branch for branch in _field(diagnostics, "failed_branches", [])
+                if isinstance(branch, str)
+            )
+            fallback_activated = fallback_activated or bool(
+                _field(diagnostics, "web_fallback_activated", False)
+            )
+
+        return {
+            "result_count": len(results),
+            "provider_counts": provider_counts,
+            "failed_branches": sorted(failed_branches),
+            "partial_failure_count": len(failed_branches),
+            "web_fallback_activated": fallback_activated,
+        }
+
+    if node == "research_source_processor":
+        research = output.get("research", {})
+        queries = _field(research, "search_queries", [])
+        query_ids = {
+            _field(query, "id")
+            for query in queries
+            if iteration is None or _field(query, "iteration") == iteration
+        }
+        result_ids = {
+            _field(result, "id")
+            for result in _field(research, "search_results", [])
+            if _field(result, "query_id") in query_ids
+        }
+        sources = [
+            source for source in _field(research, "sources", [])
+            if result_ids.intersection(_field(source, "search_result_ids", []))
+        ]
+        provider_counts: dict[str, int] = {}
+        extraction_fallback_count = 0
+        for source in sources:
+            provider = _field(source, "provider")
+            provider = getattr(provider, "value", provider)
+            if isinstance(provider, str):
+                provider_counts[provider] = provider_counts.get(provider, 0) + 1
+            metadata = _field(source, "provider_metadata", {})
+            if _field(metadata, "extraction_provider") == "firecrawl":
+                extraction_fallback_count += 1
+
+        return {
+            "source_count": len(sources),
+            "provider_counts": provider_counts,
+            "extraction_fallback_count": extraction_fallback_count,
         }
 
     if node == "research_retrieval":
@@ -83,6 +163,28 @@ def _safe_details(node: str, output: Any) -> dict[str, Any]:
         }
 
     return {}
+
+
+def _safe_terminal_error_details(output: Any) -> dict[str, Any]:
+    """Expose only public ResearchError fields for a failed stage."""
+
+    if not isinstance(output, dict):
+        return {}
+    terminal_errors = [
+        error for error in output.get("errors", [])
+        if _field(error, "recoverable", True) is False
+    ]
+    if not terminal_errors:
+        return {}
+
+    error = terminal_errors[0]
+    error_type = _field(error, "error_type")
+    return {
+        "error_type": getattr(error_type, "value", error_type),
+        "component": str(_field(error, "component", "workflow"))[:100],
+        "reason": str(_field(error, "message", "Workflow stage failed."))[:300],
+        "error_count": len(terminal_errors),
+    }
 
 
 class PipelineRecorder:
@@ -179,7 +281,23 @@ async def run_graph_with_events(
 
         elif kind == "on_chain_end" and run_id in active:
             stage, iteration = active.pop(run_id)
-            details = _safe_details(stage, event.get("data", {}).get("output"))
+            output = event.get("data", {}).get("output")
+            details = _safe_details(
+                stage,
+                output,
+                iteration=iteration,
+            )
+            failure_details = _safe_terminal_error_details(output)
+            if failure_details:
+                await recorder.emit(
+                    "stage_failed",
+                    stage,
+                    "failed",
+                    iteration=iteration,
+                    details={**details, **failure_details},
+                )
+                continue
+
             await recorder.emit(
                 "stage_completed", stage, "completed", iteration=iteration, details=details,
             )

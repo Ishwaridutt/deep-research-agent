@@ -1,6 +1,7 @@
 """Focused offline tests for Phase 3 source selection and graph integration."""
 
 import asyncio
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +13,8 @@ from src.graph.graph_routing import route_after_source_selection
 from src.graph.graph_state import create_initial_workflow_state
 from src.guardrails.input_guardrail import input_guardrail_node
 from src.models import (
+    ErrorType,
+    ResearchError,
     ResearchExecutionStatus,
     ResearchRequest,
     ResearchSource,
@@ -19,6 +22,7 @@ from src.models import (
     ResearchSourceSelection,
 )
 from src.services.research_job_resources import ResearchJobResources
+from src.services.research_pipeline_stream_service import PipelineRecorder
 from src.services.research_service import ResearchService
 
 
@@ -164,6 +168,69 @@ def test_source_selection_records_authorization_failure_and_clears():
         assert factory.sessions[0].clear_calls == 1
         assert result["errors"][-1].recoverable is False
         assert result["errors"][-1].message == "Document not found."
+
+    asyncio.run(run())
+
+
+def test_service_logs_and_persists_terminal_graph_error(caplog):
+    """Surface graph-state failures in application logs and terminal events."""
+
+    async def run() -> None:
+        state = create_document_state()
+        state["errors"] = [ResearchError(
+            error_type=ErrorType.VALIDATION,
+            component="research_source_selection",
+            message="Document not found.",
+            recoverable=False,
+        )]
+
+        class CapturingJobStore:
+            def __init__(self) -> None:
+                self.finish_kwargs = None
+
+            async def finish_job(self, **kwargs):
+                self.finish_kwargs = kwargs
+
+        store = CapturingJobStore()
+        service = ResearchService(
+            graph=SimpleNamespace(),
+            settings=SimpleNamespace(
+                app=SimpleNamespace(graph_recursion_limit=10)
+            ),
+            job_store=store,
+        )
+
+        with caplog.at_level(logging.ERROR, logger="src.services.research_service"):
+            result = service._build_result(state=state)
+
+        record = next(
+            record for record in caplog.records
+            if getattr(record, "event", None) == "research_workflow_failed"
+        )
+        assert record.status == "failed"
+        assert record.error_type == "validation"
+        assert record.component == "research_source_selection"
+        assert record.data == {
+            "error_count": 1,
+            "reason": "Document not found.",
+        }
+
+        async def persist(_event):
+            return None
+
+        await service._finish_persisted_job(
+            PipelineRecorder(job_id="job-1", persist=persist),
+            result,
+            failure_message=None,
+        )
+
+        assert store.finish_kwargs["error_message"] == "Document not found."
+        assert store.finish_kwargs["terminal_event"].details == {
+            "error_type": "validation",
+            "component": "research_source_selection",
+            "reason": "Document not found.",
+            "error_count": 1,
+        }
 
     asyncio.run(run())
 

@@ -4,8 +4,10 @@ from typing import Any
 
 from tavily import AsyncTavilyClient
 
-from src.models import SearchQuery, SearchResult
+from src.guardrails import url_dedup_key
+from src.models import SearchQuery, SearchResult, SourceProvider
 from src.services import generate_search_result_id
+from src.tools.provider_resilience import fallback_allowed_for_exception
 from src.tools.search.base import (
     SearchProvider,
     SearchProviderError,
@@ -61,7 +63,8 @@ class TavilySearchProvider(SearchProvider):
                 (
                     "Tavily search failed for query "
                     f"'{search_query.id}'."
-                )
+                ),
+                fallback_allowed=fallback_allowed_for_exception(exc),
             ) from exc
 
         raw_results = response.get(
@@ -112,7 +115,10 @@ class TavilySearchProvider(SearchProvider):
             if not title or not url:
                 continue
 
-            normalized_url = self._normalize_url(url)
+            try:
+                normalized_url = self._normalize_url(url)
+            except ValueError:
+                continue
             # if already exists, skip the url
             if normalized_url in seen_urls:
                 continue
@@ -127,6 +133,8 @@ class TavilySearchProvider(SearchProvider):
                 SearchResult(
                     id=generate_search_result_id(),
                     query_id=search_query.id,
+                    provider=SourceProvider.TAVILY,
+                    canonical_id=f"web:{normalized_url}",
                     title=title,
                     url=url,
                     snippet=snippet or None,
@@ -147,7 +155,7 @@ class TavilySearchProvider(SearchProvider):
         guardrail before webpage extraction.
         """
 
-        return url.strip().rstrip("/").lower()
+        return url_dedup_key(url)
 
     @staticmethod
     def _safe_score(

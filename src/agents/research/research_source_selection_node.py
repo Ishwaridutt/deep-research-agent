@@ -61,6 +61,17 @@ async def research_source_selection_node(
         resources.clear()
         error_type = ErrorType.VALIDATION
         message = str(exc)
+        logger.warning(
+            "Private-document source selection was rejected.",
+            extra={
+                "event": "document_source_selection_rejected",
+                "job_id": state["job_id"],
+                "research_session_id": state["research_session_id"],
+                "node": "research_source_selection",
+                "error_type": error_type.value,
+                "data": {"reason": message},
+            },
+        )
     except Exception:
         logger.exception(
             "Private-document source preparation failed.",

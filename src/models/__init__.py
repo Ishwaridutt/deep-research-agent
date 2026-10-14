@@ -43,6 +43,7 @@ from src.models.research_model import (
 from src.models.source_model import (
     SearchResult,
     Source,
+    SourceProvider,
     SourceType,
 )
 from src.models.execution_model import (
@@ -92,6 +93,7 @@ __all__ = [
     "SemanticCitationCheckOutput",
     "SemanticFindingCheck",
     "Source",
+    "SourceProvider",
     "SourceType",
     "SubQuestion",
     "ResearchExecutionResult",

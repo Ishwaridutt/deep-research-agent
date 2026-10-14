@@ -8,6 +8,7 @@ from langgraph.graph.state import CompiledStateGraph
 
 from src.config import Settings
 from src.graph.graph_state import WorkflowState, create_initial_workflow_state
+from src.llm import LLMService
 from src.models import (
     ErrorType,
     ResearchError,
@@ -37,6 +38,22 @@ class ResearchJobQueueFull(Exception):
     """The local execution queue has reached its configured limit."""
 
 
+def _failure_details(result: ResearchExecutionResult) -> dict:
+    """Build a sanitized summary from errors already safe for the public API."""
+
+    terminal_errors = [error for error in result.errors if not error.recoverable]
+    errors = terminal_errors or result.errors
+    if not errors:
+        return {}
+    error = errors[0]
+    return {
+        "error_type": error.error_type.value,
+        "component": error.component,
+        "reason": error.message,
+        "error_count": len(errors),
+    }
+
+
 class ResearchService:
     """Owns research execution; HTTP handlers do not invoke LangGraph."""
 
@@ -46,12 +63,14 @@ class ResearchService:
         graph: CompiledStateGraph,
         settings: Settings,
         job_store: ResearchJobStore,
+        llm_service: LLMService | None = None,
         max_concurrent_jobs: int = 2,
         max_pending_jobs: int = 20,
     ) -> None:
         self._graph = graph
         self._settings = settings
         self._job_store = job_store
+        self._llm_service = llm_service
         self._task_slots = asyncio.Semaphore(max_concurrent_jobs)
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._admission_lock = asyncio.Lock()
@@ -154,6 +173,8 @@ class ResearchService:
             return self._failed_result(state, f"The research workflow failed unexpectedly: {exc}")
         finally:
             resources.clear()
+            if self._llm_service is not None:
+                self._llm_service.release_job(state["job_id"])
         return self._build_result(state=cast(WorkflowState, result))
 
     async def start_job(
@@ -250,6 +271,8 @@ class ResearchService:
             await self._finish_persisted_job(recorder, result, failure_message)
         finally:
             resources.clear()
+            if self._llm_service is not None:
+                self._llm_service.release_job(state["job_id"])
 
     async def _finish_persisted_job(
         self,
@@ -258,16 +281,19 @@ class ResearchService:
         failure_message: str | None,
     ) -> None:
         completed = result.status == ResearchExecutionStatus.COMPLETED
+        details = {} if completed else _failure_details(result)
+        if failure_message:
+            details["reason"] = failure_message
         terminal_event = recorder.make(
             "workflow_completed" if completed else "workflow_failed",
             "workflow",
             "completed" if completed else "failed",
-            details={"reason": failure_message} if failure_message else {},
+            details=details,
         )
         await self._job_store.finish_job(
             result=result,
             terminal_event=terminal_event,
-            error_message=failure_message,
+            error_message=None if completed else details.get("reason"),
         )
 
     async def get_job(self, job_id: str) -> dict | None:
@@ -310,17 +336,7 @@ class ResearchService:
             ResearchExecutionStatus.FAILED if terminal_errors
             else ResearchExecutionStatus.COMPLETED
         )
-        logger.info(
-            "Research workflow execution finished.",
-            extra={
-                "event": "research_workflow_finished",
-                "job_id": state["job_id"],
-                "research_session_id": state["research_session_id"],
-                "node": "research_service",
-                "iteration": state["research"]["iteration_count"],
-            },
-        )
-        return ResearchExecutionResult(
+        result = ResearchExecutionResult(
             job_id=state["job_id"],
             research_session_id=state["research_session_id"],
             status=status,
@@ -328,3 +344,31 @@ class ResearchService:
             report=None if terminal_errors else final_report,
             errors=errors,
         )
+        log_details = _failure_details(result)
+        log = logger.error if terminal_errors else logger.info
+        log(
+            (
+                "Research workflow execution failed."
+                if terminal_errors
+                else "Research workflow execution finished."
+            ),
+            extra={
+                "event": (
+                    "research_workflow_failed"
+                    if terminal_errors
+                    else "research_workflow_finished"
+                ),
+                "job_id": state["job_id"],
+                "research_session_id": state["research_session_id"],
+                "node": "research_service",
+                "iteration": state["research"]["iteration_count"],
+                "status": status.value,
+                "error_type": log_details.get("error_type"),
+                "component": log_details.get("component"),
+                "data": {
+                    "error_count": log_details.get("error_count", 0),
+                    "reason": log_details.get("reason"),
+                },
+            },
+        )
+        return result

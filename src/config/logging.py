@@ -21,6 +21,10 @@ class JsonFormatter(logging.Formatter):
         "source_id",
         "error_type",
         "resource",
+        "provider",
+        "role",
+        "status",
+        "component",
         "data",
     )
 

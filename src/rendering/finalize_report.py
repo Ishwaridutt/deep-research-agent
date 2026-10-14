@@ -19,8 +19,7 @@ def finalize_report_node(
     """Renders the validated ResearchReport into deterministic Markdown."""
 
     final_report = state["writer"]["final_report"]
-    print('final_report---->')
-    print(final_report)
+    print("\nfinal report:", final_report)
 
     if final_report is None:
         error = ResearchError(

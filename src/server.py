@@ -26,7 +26,8 @@ from src.routes import (
 )
 from src.services import ResearchService
 from src.services.document_service import DocumentService
-from src.tools.extraction import WebExtractor, create_web_extractor
+from src.tools.cleaning import SourceCleaner
+from src.tools.extraction import SourceContentExtractor, create_source_content_extractor
 from src.tools.search import SearchProvider, create_search_provider
 
 
@@ -102,7 +103,8 @@ def _create_research_service(
     *,
     settings: Settings,
     search_provider: SearchProvider,
-    web_extractor: WebExtractor,
+    source_extractor: SourceContentExtractor,
+    source_cleaner: SourceCleaner,
     job_store: ResearchJobStore,
     retrieval_session_factory: RetrievalSessionFactory,
     document_service: DocumentService,
@@ -114,12 +116,18 @@ def _create_research_service(
         settings=settings,
         llm_service=llm_service,
         search_provider=search_provider,
-        web_extractor=web_extractor,
+        source_extractor=source_extractor,
+        source_cleaner=source_cleaner,
         retrieval_session_factory=retrieval_session_factory,
         document_service=document_service,
     )
 
-    return ResearchService(graph=graph, settings=settings, job_store=job_store)
+    return ResearchService(
+        graph=graph,
+        settings=settings,
+        job_store=job_store,
+        llm_service=llm_service,
+    )
 
 
 def create_app() -> FastAPI:
@@ -129,7 +137,11 @@ def create_app() -> FastAPI:
     configure_logging(settings.observability)
 
     search_provider = create_search_provider(settings)
-    web_extractor = create_web_extractor(settings)
+    source_extractor = create_source_content_extractor(settings)
+    source_cleaner = SourceCleaner(
+        min_chars=settings.research_limits.min_source_content_chars,
+        max_chars=settings.research_limits.max_source_content_chars,
+    )
     job_store = ResearchJobStore(Path(os.getenv("RESEARCH_DB_PATH", str(_DEFAULT_DB_PATH))))
 
     # Web retrieval sessions and private-document indexing share this model and tokenizer.
@@ -149,7 +161,8 @@ def create_app() -> FastAPI:
     research_service = _create_research_service(
         settings=settings,
         search_provider=search_provider,
-        web_extractor=web_extractor,
+        source_extractor=source_extractor,
+        source_cleaner=source_cleaner,
         job_store=job_store,
         retrieval_session_factory=retrieval_session_factory,
         document_service=document_service,
@@ -171,7 +184,7 @@ def create_app() -> FastAPI:
             await research_service.shutdown()
             await job_store.close()
             await _close_resource(name="search_provider", resource=search_provider)
-            await _close_resource(name="web_extractor", resource=web_extractor)
+            await _close_resource(name="source_extractor", resource=source_extractor)
             logger.info(
                 "Application stopped.",
                 extra={"event": "application_stopped", "node": "server"},

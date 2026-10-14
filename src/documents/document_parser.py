@@ -1,3 +1,4 @@
+from itertools import islice
 from pathlib import Path
 
 from docx import Document as DocxDocument
@@ -19,10 +20,13 @@ class DocumentParser:
         document_id: str,
         path: Path,
         document_format: DocumentFormat,
+        max_pages: int | None = None,
     ) -> ParsedDocument:
         """Parse one stored document while retaining available source locations."""
 
         if document_format == DocumentFormat.PDF:
+            pages = PdfReader(path).pages
+
             blocks = [
                 ParsedDocumentBlock(
                     text=text.strip(),
@@ -31,7 +35,10 @@ class DocumentParser:
                         page_end=i,
                     ),
                 )
-                for i, page in enumerate(PdfReader(path).pages, 1)
+                for i, page in enumerate(
+                    islice(pages, max_pages),
+                    1,
+                )
                 if (text := page.extract_text())
             ]
 

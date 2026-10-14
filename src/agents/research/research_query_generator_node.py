@@ -13,6 +13,7 @@ from src.models import (
     ErrorType,
     QueryGeneratorOutput,
     ResearchError,
+    ResearchSource,
     SearchQuery,
     SubQuestion,
 )
@@ -91,8 +92,8 @@ async def research_query_generator_node(
             "iteration": next_iteration,
         },
     )
-    print("\n graph state in query gen research:", research)
-    print("\n graph state in query gen research:", research["search_queries"])
+    print("\nquery generator research state:", research)
+    print("\nexisting search queries:", research["search_queries"])
 
     target_subquestions = _get_target_subquestions(state)
     generated_queries: list[SearchQuery] = []
@@ -128,6 +129,7 @@ async def research_query_generator_node(
             research_session_id=state["research_session_id"],
             node="research_query_generator",
             iteration=next_iteration,
+            contains_private_data=ResearchSource.DOCUMENTS in state["allowed_sources"],
         )
 
         try:
@@ -225,7 +227,10 @@ async def research_query_generator_node(
             "new_queries": len(generated_queries),
         },
     )
-    print("\nupdated_queries:", json.dumps([item.model_dump() for item in updated_queries], indent=2))
+    print("\nupdated queries:", json.dumps(
+        [item.model_dump() for item in updated_queries],
+        indent=2,
+    ))
 
     return {
         "research": {**research, "search_queries": updated_queries},

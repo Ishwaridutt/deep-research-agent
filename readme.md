@@ -1,347 +1,710 @@
 # Deep Research Agent
 
-An evidence-grounded, multi-agent research application built with **Python, FastAPI, LangGraph, LangChain, and a lightweight SQLite job store**.
+**Deep Research Agent** is an evidence-grounded research application that turns a question into a structured, source-backed report. It plans the investigation, searches public sources and private documents, retrieves only the most relevant passages, evaluates evidence coverage, performs bounded follow-up research, and verifies citations before rendering the final report.
 
-Given a question, the system develops a research plan, searches the web, retrieves relevant passages, extracts evidence, checks coverage, and produces a report with citations. If evidence is insufficient, it can perform a **bounded, gap-targeted follow-up research round** rather than repeating the entire investigation.
+The project addresses a common failure mode in research assistants: sending large amounts of unfiltered content directly to an LLM and trusting a single response. This application separates discovery, extraction, retrieval, evidence validation, coverage analysis, writing, and citation checking into explicit stages that can be inspected, tested, retried, and observed in real time.
 
-The web interface shows the workflow as it runs: planning, searching, extraction, retrieval, coverage checks, research retries, writing, citation checking, and report finalization.
+> **Project status:** Web, document, and hybrid research flows are implemented. Public-source search, provider fallbacks, shared hybrid retrieval, SQLite-backed jobs, replayable Server-Sent Events (SSE), and the browser UI have offline test coverage. Authentication, durable distributed execution, restart recovery, and production hardening are not yet implemented.
 
-> **Project status:** Phase 1 (end-to-end research pipeline) and the main Phase 2 features (research-quality controls, bounded loops, SQLite-backed jobs, SSE events, and live UI) have been implemented. The SQLite/event-streaming unit tests have passed. Full end-to-end validation and research-output quality tuning are still in progress. The recently proposed Groq/Gemini configuration and structured-output retry changes should be verified in your local branch before treating them as operational.
+## Table of Contents
 
-## Contents
-
-- [Features](#features)
-- [How it works](#how-it-works)
+- [Problem and Approach](#problem-and-approach)
+- [Key Features](#key-features)
+- [Tech Stack](#tech-stack)
 - [Architecture](#architecture)
-- [Repository structure](#repository-structure)
-- [Getting started](#getting-started)
+- [Research Pipeline](#research-pipeline)
+- [Public-Source Pipeline](#public-source-pipeline)
+- [Private-Document Pipeline](#private-document-pipeline)
+- [Retrieval Pipeline](#retrieval-pipeline)
+- [Evidence, Coverage, and Writing](#evidence-coverage-and-writing)
+- [LLM and Provider Fallbacks](#llm-and-provider-fallbacks)
+- [Jobs, Events, and UI Updates](#jobs-events-and-ui-updates)
+- [State and Resource Lifetimes](#state-and-resource-lifetimes)
+- [Getting Started](#getting-started)
+- [Usage and API Examples](#usage-and-api-examples)
 - [Configuration](#configuration)
-- [API](#api)
-- [Live pipeline events](#live-pipeline-events)
-- [Persistence and job lifecycle](#persistence-and-job-lifecycle)
+- [Project Structure](#project-structure)
 - [Testing](#testing)
-- [Current limitations](#current-limitations)
-- [Implementation progress](#implementation-progress)
+- [Current Limitations](#current-limitations)
+- [Contributing](#contributing)
+- [License](#license)
 
-## Features
+## Problem and Approach
 
-### Research pipeline
+| Research problem | How the project addresses it |
+|---|---|
+| A broad question is difficult to answer in one prompt. | The planner converts the question into bounded subquestions and objectives. |
+| Search results contain duplicates, snippets, boilerplate, and irrelevant text. | Provider adapters normalize results, canonical identifiers merge duplicates, deterministic cleaning removes noise, and retrieval selects relevant passages. |
+| One provider can be unavailable or rate-limited. | Search, extraction, and LLM calls use ordered fallbacks with bounded retries and circuit breakers. |
+| Public and private sources require different handling. | Web content and private documents use separate retrieval sessions while sharing one chunker and one hybrid-ranking implementation. |
+| An LLM may stop too early or repeat broad searches. | A coverage evaluator identifies specific gaps, and a deterministic router permits only bounded, gap-targeted follow-up rounds. |
+| Generated claims may not be supported by cited evidence. | The writer can reference only accepted evidence, and the citation checker removes unsupported findings before final rendering. |
+| Long-running work is hard to understand from a request spinner. | Persisted stage events drive a live, replayable SSE timeline in the UI. |
 
-- **Question planning:** Breaks a research question into subquestions and objectives.
-- **Targeted query generation:** Generates search queries for each objective; follow-up rounds focus on unresolved coverage gaps.
-- **Web search and extraction:** Uses configurable search/extraction providers (currently Tavily), validates public URLs, preserves source provenance, and avoids extracting an already-known URL again.
-- **Hybrid retrieval:** Chunks extracted pages, combines semantic and lexical relevance, ranks passages, and sends a bounded selection to evidence extraction instead of sending entire webpages to the LLM.
-- **Evidence extraction:** Produces structured, source-linked evidence associated with research subquestions.
-- **Coverage evaluation:** Assesses subquestions as `supported`, `partial`, `missing`, or `conflicting`, with evidence-strength assessments and actionable gaps.
-- **Bounded follow-up research:** Enforces iteration, query, page-extraction, time, and no-progress safeguards; stops when coverage is sufficient or additional research is no longer justified.
-- **Report generation:** Synthesizes an executive summary, findings, limitations, and sources from accepted evidence.
-- **Citation verification:** Checks grounding and citations before deterministic Markdown rendering.
+## Key Features
 
-### Application and UI
+- **Multi-stage LangGraph workflow:** Explicit nodes handle input validation, planning, query generation, source selection, retrieval, evidence extraction, coverage evaluation, writing, citation checking, and rendering.
+- **Three research modes:** Run web-only, document-only, or hybrid research from the same API and UI.
+- **Parallel public search:** Search the general web, arXiv, and Wikipedia concurrently for every generated query.
+- **Canonical deduplication:** Merge equivalent pages, papers, and articles using canonical IDs, URLs, arXiv IDs, DOIs, and Wikipedia page IDs.
+- **Search fallback:** Retry Tavily and fall back to Brave when the configured Brave credentials are available.
+- **Extraction fallback:** Use provider-native arXiv and Wikipedia extractors; retry Tavily extraction and fall back to Firecrawl for general webpages when configured.
+- **Deterministic source cleaning:** Normalize Unicode, whitespace, HTML, duplicated lines, PDF hyphenation, and content length without spending an LLM call.
+- **Shared retrieval pipeline:** Chonkie creates structure-aware chunks, a dense in-memory index and BM25 search the same corpus, and weighted Reciprocal Rank Fusion combines their rankings.
+- **Bounded LLM context:** Enforce token limits and per-document diversity before sending retrieved text to the evidence extractor.
+- **Private-document provenance:** Preserve document, filename, page, section, character-offset, and chunk metadata through retrieval, evidence, and final citations.
+- **Evidence coverage loop:** Detect missing, partial, conflicting, and supported objectives, then research only actionable gaps while budgets permit.
+- **Citation-safe reporting:** Validate evidence references deterministically, perform semantic support checks, remove unsupported findings, and render Markdown from the validated report.
+- **Ordered LLM fallback:** Configure OpenAI, Gemini, and Groq independently for each logical role, with private-data provider allowlisting.
+- **Persistent job history:** Store asynchronous job status, final results, errors, and ordered progress events in SQLite.
+- **SSE-first UI:** Stream replayable progress events, recover the latest job after refresh, and use status polling only when SSE is unavailable.
+- **Structured observability:** Emit JSON logs with job, session, node, iteration, provider, role, status, and sanitized failure metadata.
 
-- **FastAPI API** with both a synchronous endpoint and persistent asynchronous research jobs.
-- **SQLite persistence** for job metadata, final results, and ordered workflow events.
-- **Server-Sent Events (SSE)** to display execution progress in real time.
-- **Per-round workflow timeline** showing stage completion, coverage results, and why another research round was triggered.
-- **Browser refresh recovery:** Reloads the most recent job or a shared job link and replays saved events.
-- **Structured logging** with job/session identifiers and node metadata.
-- **Pluggable LLM architecture:** Research nodes call a shared LLM service rather than depending directly on a provider SDK.
+## Tech Stack
 
-## How it works
-
-```mermaid
-flowchart TD
-    A[Research question] --> B[Input guardrail]
-    B --> C[Research planner]
-    C --> D[Query generator]
-    D --> E[Web search]
-    E --> F[URL validation & source extraction]
-    F --> G[Hybrid retrieval]
-    G --> H[Evidence extraction]
-    H --> I[Coverage evaluator]
-    I --> J{Research router}
-    J -->|Gaps remain and budgets allow| D
-    J -->|Sufficient or stopping limit reached| K[Prepare writer evidence]
-    K --> L[Report synthesis]
-    L --> M[Citation checking]
-    M --> N[Deterministic report rendering]
-    N --> O[Final report]
-```
-
-### Research rounds and stopping decisions
-
-The coverage evaluator assesses whether the gathered evidence answers each planned subquestion. If it detects missing information, it returns **specific gaps** and may suggest follow-up queries. The router decides whether another round is allowed, based on deterministic budgets rather than an unrestricted LLM decision.
-
-Research can stop because of:
-
-- Sufficient evidence coverage.
-- Maximum research iterations, queries, extraction attempts, or elapsed time.
-- No improvement in newly referenced evidence across follow-up rounds.
-- No actionable research gaps remaining.
-
-When research must stop before achieving full coverage, the writing stage should present supported findings and disclose unresolved limitations rather than invent missing information.
+| Area | Technology |
+|---|---|
+| Language | Python 3.13+, JavaScript, HTML, CSS |
+| API | FastAPI, Uvicorn, Pydantic, pydantic-settings |
+| Workflow | LangGraph |
+| LLM abstraction | LangChain |
+| LLM providers | OpenAI, Google Gemini, Groq |
+| Public search | Tavily, Brave Search, arXiv API, MediaWiki API |
+| Content extraction | Tavily Extract, Firecrawl, pypdf, MediaWiki extracts |
+| Document parsing | pypdf, python-docx, built-in text parsing |
+| Chunking | Chonkie RecursiveChunker |
+| Semantic retrieval | Hugging Face embeddings, LangChain InMemoryVectorStore |
+| Lexical retrieval | BM25 via rank-bm25 |
+| Rank fusion | LangChain EnsembleRetriever with weighted Reciprocal Rank Fusion |
+| Persistence | SQLite with aiosqlite and WAL mode |
+| Live updates | Server-Sent Events |
+| Frontend | Framework-free HTML, CSS, and JavaScript |
+| Testing | pytest with fake providers and offline dependencies |
+| Observability | Structured JSON logging and optional LangSmith tracing |
 
 ## Architecture
 
-```text
-Browser (HTML / CSS / JavaScript)
-    |
-    | Create job, fetch status, subscribe to SSE
-    v
-FastAPI routes
-    |
-    v
-ResearchService ------------------------------+
-    |                                          |
-    | One LangGraph execution per job          | Job status + report
-    v                                          v
-Compiled LangGraph                     SQLite ResearchJobStore
-    |                                          ^
-    | Node execution events                    |
-    v                                          |
-PipelineRecorder -----------------------------+
-    |
-    +--> Saved event history --> SSE --> Live workflow UI
+### System Overview
+
+```mermaid
+flowchart LR
+    User[Browser or API client]
+    API[FastAPI routes]
+    Service[ResearchService]
+    Graph[Compiled LangGraph]
+    Providers[Search, extraction, and LLM providers]
+    Retrieval[Shared retrieval components]
+    Store[(SQLite job and event store)]
+    Uploads[(Local uploaded files)]
+    UI[Replayable SSE timeline]
+
+    User -->|Create job or upload file| API
+    API --> Service
+    Service -->|One graph execution per job| Graph
+    Graph --> Providers
+    Graph --> Retrieval
+    Graph --> Uploads
+    Service --> Store
+    Graph -->|Sanitized lifecycle events| Store
+    Store -->|Status and final result| API
+    Store -->|Event replay and live stream| UI
+    UI --> User
 ```
 
-**Separation of responsibilities:**
+### Composition and Dependency Flow
 
-| Component | Responsibility |
+`src/server.py` is the application composition root. It creates expensive or shared dependencies once and injects them into the graph:
+
+1. Load typed settings.
+2. Configure structured logging.
+3. Create the composite public search provider.
+4. Create the provider-aware source extractor and deterministic cleaner.
+5. Create the SQLite job store.
+6. Create one shared embedding service and local tokenizer.
+7. Create the retrieval-session factory.
+8. Create the application-scoped document service.
+9. Create the role-based LLM service.
+10. Build and compile the LangGraph workflow.
+11. Create `ResearchService`, register routes, and mount the frontend.
+
+This keeps provider construction out of graph nodes. Nodes depend on small application-owned interfaces, which makes them easier to test with fakes.
+
+### Code Request Flow
+
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant R as FastAPI route
+    participant S as ResearchService
+    participant DB as SQLite
+    participant G as LangGraph
+    participant P as PipelineRecorder
+
+    B->>R: POST /api/research/jobs
+    R->>S: start_job(question, source_selection)
+    S->>DB: Insert queued job
+    S-->>B: 202 + job_id
+    S->>G: Start background graph execution
+    G->>P: Node lifecycle events
+    P->>DB: Persist sanitized event
+    B->>R: GET /events (SSE)
+    R->>DB: Replay events after cursor
+    DB-->>B: stage_started / completed / failed
+    G-->>S: Final WorkflowState
+    S->>DB: Atomically store result + terminal event
+    B->>R: GET /status/{job_id}
+    R->>DB: Read terminal job
+    DB-->>B: Final structured report
+```
+
+## Research Pipeline
+
+### LangGraph Node Interconnection
+
+```mermaid
+flowchart TD
+    Start([START]) --> Guardrail[input_guardrail]
+    Guardrail -->|valid| Planner[research_planner]
+    Guardrail -->|terminal error| End([END])
+    Planner -->|plan created| Query[research_query_generator]
+    Planner -->|terminal error| End
+    Query --> Select[research_source_selection]
+
+    Select -->|web or hybrid| Search[research_web_search]
+    Select -->|documents only| Retrieve[research_retrieval]
+    Select -->|terminal error| End
+
+    Search --> Process[research_source_processor]
+    Process --> Retrieve
+    Retrieve --> Evidence[research_evidence_extractor]
+    Evidence --> Coverage[research_coverage_evaluator]
+    Coverage --> Router[research_routing]
+
+    Router -->|actionable gaps and budget remains| Query
+    Router -->|coverage sufficient or stop limit| Prepare[writer_prepare_evidence]
+    Router -->|terminal error| End
+
+    Prepare --> Synthesis[writer_synthesis]
+    Synthesis -->|draft created| Citations[writer_citation_checker]
+    Synthesis -->|terminal error| End
+    Citations -->|validated report| Finalize[finalize_report]
+    Citations -->|terminal error| End
+    Finalize --> End
+```
+
+Hybrid mode follows the public-search branch, but `research_source_selection` also prepares a private-document retrieval session. The retrieval node queries both sessions and preserves their results separately until the evidence boundary.
+
+### Node Responsibilities
+
+| Node | Problem solved | Implementation |
+|---|---|---|
+| `input_guardrail` | Invalid questions or incomplete source selections should fail before provider calls. | Validates question length, allowed sources, owner identity, and document selection. |
+| `research_planner` | A broad question needs a research plan. | Uses structured LLM output to create bounded subquestions and objectives. |
+| `research_query_generator` | Each objective needs searchable wording. | Creates initial queries or gap-focused follow-up queries and applies job query limits. |
+| `research_source_selection` | Source modes need different runtime resources. | Authorizes selected documents, builds one job-scoped document retrieval session, and routes web/hybrid versus document-only work. |
+| `research_web_search` | One public search source is incomplete and may fail. | Runs current-round queries through the parallel composite provider and retains normalized results and diagnostics. |
+| `research_source_processor` | Search results are not evidence-ready documents. | Loads provider-native or webpage content, cleans it, deduplicates it, and creates normalized `Source` objects. |
+| `research_retrieval` | Entire sources are too large and noisy for an LLM. | Builds the public retrieval corpus, queries public and/or private sessions, and returns bounded passage contexts. |
+| `research_evidence_extractor` | Retrieved text must become explicit claims with provenance. | Produces schema-validated evidence linked to chunks, sources, and research objectives; normalizes duplicates. |
+| `research_coverage_evaluator` | The system must know what remains unanswered. | Rates each subquestion, validates referenced evidence IDs, and emits actionable coverage gaps. |
+| `research_routing` | An LLM should not control an unbounded loop. | Deterministically checks coverage, iteration count, query usage, extraction attempts, elapsed time, and evidence gain. |
+| `writer_prepare_evidence` | The writer needs a controlled evidence set. | Selects evidence within item and character limits and stores only selected evidence IDs in writer state. |
+| `writer_synthesis` | Evidence must become a readable report without inventing claims. | Produces a structured draft from selected evidence and records unresolved gaps as limitations. |
+| `writer_citation_checker` | Draft citations may be missing or unsupported. | Performs deterministic reference checks and semantic evidence-to-claim validation; unsupported findings are removed. |
+| `finalize_report` | Output formatting should not change validated meaning. | Deterministically renders the validated `ResearchReport` into Markdown. |
+
+### Bounded Research Loop
+
+The research loop continues only when coverage contains actionable gaps and all configured budgets still allow another round.
+
+```mermaid
+stateDiagram-v2
+    [*] --> ResearchRound
+    ResearchRound --> CoverageEvaluation
+    CoverageEvaluation --> WriteReport: coverage sufficient
+    CoverageEvaluation --> WriteReport: no actionable gaps
+    CoverageEvaluation --> WriteReport: iteration/query/extraction/time budget reached
+    CoverageEvaluation --> WriteReport: no evidence improvement
+    CoverageEvaluation --> GapTargetedQueries: unresolved gaps + budget available
+    GapTargetedQueries --> ResearchRound
+    WriteReport --> [*]
+```
+
+Supported stop reasons include:
+
+- **`coverage_sufficient`:** Evidence adequately supports the planned objectives.
+- **`max_iterations`:** The bounded round limit was reached.
+- **`query_budget_exhausted`:** The job used its permitted query count.
+- **`extraction_budget_exhausted`:** The job reached its page-processing limit.
+- **`time_budget_exhausted`:** Research exceeded its elapsed-time budget.
+- **`no_evidence_improvement`:** Additional rounds stopped contributing newly referenced evidence.
+- **`no_actionable_gaps`:** Coverage is incomplete, but no useful follow-up gap remains.
+
+## Public-Source Pipeline
+
+### Search, Deduplication, Extraction, and Cleaning
+
+```mermaid
+flowchart LR
+    Query[Generated SearchQuery]
+
+    subgraph Parallel Search
+        General[General web branch]
+        Arxiv[arXiv API]
+        Wiki[Wikipedia API]
+    end
+
+    Query --> General
+    Query --> Arxiv
+    Query --> Wiki
+    General --> Tavily[Tavily search]
+    Tavily -->|eligible failure| Brave[Brave fallback]
+
+    Tavily --> Merge[Canonical deduplication]
+    Brave --> Merge
+    Arxiv --> Merge
+    Wiki --> Merge
+
+    Merge --> Route{Provider-aware extraction}
+    Route -->|Tavily or Brave result| TavilyExtract[Tavily Extract]
+    TavilyExtract -->|eligible failure| Firecrawl[Firecrawl fallback]
+    Route -->|arXiv result| ArxivLoad[Bounded PDF or abstract]
+    Route -->|Wikipedia result| WikiLoad[Canonical MediaWiki article]
+
+    TavilyExtract --> Cleaner[Deterministic SourceCleaner]
+    Firecrawl --> Cleaner
+    ArxivLoad --> Cleaner
+    WikiLoad --> Cleaner
+    Cleaner --> Source[Normalized Source]
+```
+
+#### Search Behavior
+
+- **Parallel branches:** General web, arXiv, and Wikipedia searches run concurrently under a shared semaphore.
+- **Per-provider limits:** Each branch keeps its own result cap instead of comparing incompatible provider scores.
+- **Partial success:** A failed branch does not discard useful results from healthy branches. The query fails only when every branch fails.
+- **General-search fallback:** Tavily retries first. Brave activates only for failures classified as eligible for fallback and only when `BRAVE_API_KEY` is configured.
+- **Canonical merging:** Duplicate identities are detected from canonical IDs, normalized URLs, DOI values, arXiv IDs without version suffixes, Wikipedia page IDs, and Wikipedia titles.
+- **Discovery provenance:** When multiple providers discover the same source, the representative result retains all discovery metadata.
+
+#### Extraction Behavior
+
+- **General webpages:** Tavily Extract is primary; Firecrawl is the optional fallback.
+- **arXiv:** The native adapter downloads a bounded PDF and reuses the existing PDF parser. If full text is disabled or unusable, it falls back to the abstract.
+- **Wikipedia:** The native adapter requests canonical plain text, redirects, page ID, and revision metadata from MediaWiki.
+- **Circuit breaking:** Repeated eligible failures temporarily open a provider circuit so every URL or query does not repeatedly call an unhealthy service.
+
+#### Deterministic Cleaning
+
+`SourceCleaner` runs after extraction and before retrieval. It:
+
+- normalizes Unicode and line endings;
+- removes control characters;
+- converts useful HTML structure into readable text;
+- drops script, style, navigation, footer, and other boilerplate elements;
+- joins PDF-style line-break hyphenation;
+- collapses whitespace and duplicate adjacent lines;
+- enforces minimum and maximum content lengths; and
+- records cleaner version and size metadata for traceability.
+
+The cleaner does not call an LLM.
+
+## Private-Document Pipeline
+
+### Upload and Research-Time Processing
+
+```mermaid
+flowchart TD
+    Pick[User selects PDF, DOCX, TXT, or Markdown]
+    Upload[POST /documents]
+    Store[Stream file to local storage]
+    Registry[Store owner-scoped metadata in memory]
+    Job[Start document or hybrid research job]
+    Authorize[Authorize owner + document IDs]
+    Parse[Parse into provenance-aware blocks]
+    Adapt[Convert blocks to RetrievalDocument]
+    Shared[Shared RetrievalSession]
+    Chunk[RetrievalChunker]
+    Index[Dense + BM25 indexes]
+    Search[Retrieve for every subquestion]
+    Cleanup[Clear job-scoped chunks and indexes]
+
+    Pick --> Upload --> Store --> Registry
+    Registry --> Job --> Authorize --> Parse --> Adapt --> Shared
+    Shared --> Chunk --> Index --> Search --> Cleanup
+```
+
+Uploads and indexing are intentionally separate:
+
+1. **Upload time:** The service validates the extension, streams the file to disk, computes a SHA-256 hash, and stores metadata. It does not parse, chunk, embed, or index the file.
+2. **Job start:** `research_source_selection` verifies that every selected document belongs to the request owner.
+3. **Parsing:** PDF pages, DOCX paragraphs, or text content become normalized blocks with available page and character provenance.
+4. **Shared retrieval preparation:** Blocks become `RetrievalDocument` objects and enter the same `RetrievalSession` used by public content.
+5. **Reuse during the job:** One private-document session serves every subquestion and later coverage iteration.
+6. **Cleanup:** Job-scoped chunks and indexes are cleared when the workflow completes, fails, or is cancelled.
+
+The original uploaded file remains on local disk unless the optional deletion call in `DocumentService` is enabled. Document metadata is held by an application-scoped in-memory registry, so it does not survive a server restart.
+
+### Hybrid Source Isolation
+
+```mermaid
+flowchart LR
+    WebSources[Cleaned public Sources] --> WebSession[Public RetrievalSession]
+    PrivateFiles[Selected private documents] --> DocumentSession[Private RetrievalSession]
+    Questions[Subquestions and queries] --> WebSession
+    Questions --> DocumentSession
+    WebSession --> WebResults[web_retrieval_results]
+    DocumentSession --> DocumentResults[document_retrieval_results]
+    WebResults --> Evidence[Evidence extractor]
+    DocumentResults --> Evidence
+    Evidence --> Accepted[Normalized evidence with provenance]
+```
+
+Public and private chunks are not inserted into one long-lived shared vector database. Separate sessions reduce accidental cross-job or cross-source leakage, while the evidence extractor provides the single controlled merge point.
+
+## Retrieval Pipeline
+
+```mermaid
+flowchart TD
+    Docs[RetrievalDocument corpus]
+    Chunker[Chonkie RecursiveChunker]
+    Chunks[Provenance-aware RetrievalChunks]
+    Dense[Semantic vector retrieval]
+    BM25[Lexical BM25 retrieval]
+    RRF[Weighted Reciprocal Rank Fusion]
+    Diversity[Per-document diversity filter]
+    Budget[Token-bounded context builder]
+    Context[Evidence-extraction context]
+
+    Docs --> Chunker --> Chunks
+    Chunks --> Dense
+    Chunks --> BM25
+    Dense --> RRF
+    BM25 --> RRF
+    RRF --> Diversity --> Budget --> Context
+```
+
+### Why Hybrid Retrieval
+
+- **Semantic retrieval** finds conceptually related passages even when wording differs from the query.
+- **BM25 retrieval** preserves exact terms, names, identifiers, and domain-specific keywords.
+- **Reciprocal Rank Fusion** combines both ranked lists without requiring their raw scores to be comparable.
+- **Diversity limits** prevent one long source from occupying the entire context.
+- **Token accounting** stops context growth before the evidence LLM call.
+
+`src/retrieval/chunking/retrieval_chunker.py` is the only chunking implementation. Public sources and private documents both pass through it, ensuring consistent chunk boundaries and provenance behavior.
+
+### Data Transformation
+
+```text
+SearchResult
+    -> Source
+    -> RetrievalDocument
+    -> RetrievalChunk
+    -> RetrievedChunk
+    -> RetrievalResult
+    -> Evidence
+    -> ReportFinding
+    -> ResearchReport
+```
+
+Each transformation narrows the data while retaining identifiers needed to trace a final finding back to its source and chunk.
+
+## Evidence, Coverage, and Writing
+
+### Evidence Boundary
+
+The evidence extractor receives only retrieved contexts—not complete source corpora. It returns schema-validated evidence containing:
+
+- the supported claim or relevant content;
+- the associated subquestion;
+- the source and chunk identifiers;
+- relevance and provenance metadata; and
+- private-document locations when applicable.
+
+Evidence from web and document results is normalized into one evidence collection. Matching claims can be deduplicated without losing their source lineage.
+
+### Coverage Evaluation
+
+The coverage evaluator checks every planned subquestion and classifies its support. It can identify:
+
+- supported objectives;
+- partially supported objectives;
+- missing evidence;
+- conflicting evidence; and
+- actionable follow-up gaps.
+
+The deterministic router—not the LLM—decides whether those gaps justify another iteration.
+
+### Writer and Citation Pipeline
+
+```mermaid
+flowchart LR
+    Evidence[Accepted evidence]
+    Select[Bounded evidence selection]
+    Draft[Structured draft report]
+    References[Deterministic ID checks]
+    Semantic[Semantic citation verification]
+    Filter[Remove unsupported findings]
+    Render[Deterministic Markdown rendering]
+
+    Evidence --> Select --> Draft --> References --> Semantic --> Filter --> Render
+```
+
+The writer cannot cite evidence it did not receive. The citation checker verifies that referenced evidence and sources exist, then checks whether the cited evidence actually supports each finding. Findings that fail validation do not reach the final report.
+
+## LLM and Provider Fallbacks
+
+### Role-Based LLM Selection
+
+Nodes request logical roles rather than concrete provider SDKs:
+
+- `planner`
+- `query_generator`
+- `evidence_extractor`
+- `coverage_evaluator`
+- `writer`
+- `citation_checker`
+
+Each role can define its own ordered provider/model chain.
+
+```mermaid
+flowchart LR
+    Role[Logical LLM role]
+    Policy{Private data?}
+    OpenAI[OpenAI model]
+    Gemini[Gemini model]
+    Groq[Groq model]
+    Result[Schema-validated output]
+
+    Role --> Policy
+    Policy -->|Filter by allowlist| OpenAI
+    OpenAI -->|eligible failure| Gemini
+    Gemini -->|eligible failure| Groq
+    OpenAI --> Result
+    Gemini --> Result
+    Groq --> Result
+```
+
+The service:
+
+- preserves configured provider order;
+- filters providers through `LLM_PRIVATE_DATA_PROVIDERS` for document and hybrid jobs;
+- retries malformed structured output a bounded number of times;
+- fails over on classified availability, authentication, rate-limit, timeout, server, and provider-specific structured-output failures;
+- keeps invalid prompts, policy failures, oversized requests, and context-length failures terminal when another provider is unlikely to help;
+- prefers the first healthy provider for later roles in the same job; and
+- releases job-specific provider state at job completion.
+
+### Search and Extraction Resilience
+
+| Capability | Primary | Fallback | Activation |
+|---|---|---|---|
+| General web search | Tavily | Brave | Eligible primary failure and configured Brave key |
+| General webpage extraction | Tavily Extract | Firecrawl | Eligible primary failure or unusable extraction and configured Firecrawl key |
+| arXiv content | Bounded PDF | arXiv abstract | PDF disabled, unavailable, invalid, oversized, or unparsable |
+| Wikipedia content | MediaWiki API | None | Branch remains recoverable when other public branches succeed |
+| Structured LLM role | First configured eligible provider | Next configured provider | Classified call failure and private-data policy eligibility |
+
+## Jobs, Events, and UI Updates
+
+### Persistence and Streaming
+
+SQLite stores:
+
+- **`research_jobs`:** IDs, question, allowed sources, lifecycle status, final result, error message, and timestamps.
+- **`research_events`:** Ordered, per-job progress events keyed by `(job_id, sequence)`.
+
+The terminal job update and terminal event are committed in one transaction so the UI cannot observe a terminal event without a matching result.
+
+Representative event types:
+
+| Event | Meaning |
 |---|---|
-| `src/graph/` | Workflow state, graph construction, and routing decisions |
-| `src/agents/research/` | Planning, query generation, searching, extraction, retrieval, and coverage evaluation |
-| `src/agents/writer/` | Evidence preparation, report writing, and citation checking |
-| `src/retrieval/` | Chunking, embeddings, hybrid ranking, and LLM-facing context selection |
-| `src/tools/` | Search and webpage extraction provider interfaces |
-| `src/guardrails/` | Question and URL safety/validation checks |
-| `src/llm/` | Shared structured-output interface and model creation |
-| `src/rendering/` | Validated report-to-Markdown rendering |
-| `src/services/research_service.py` | Job creation, graph execution, and result conversion |
-| `src/services/research_pipeline_stream.py` | LangGraph event capture and SSE serialization |
-| `src/persistence/research_job_store.py` | Persistent job records and replayable events |
-| `src/routes/` | HTTP API and page endpoints |
-| `src/static/` | Research workspace and final-report UI |
+| `workflow_started` | Graph execution began. |
+| `stage_started` | A named pipeline node started. |
+| `stage_completed` | A node completed successfully. |
+| `stage_failed` | A node returned or raised a terminal failure. |
+| `research_retry` | The router scheduled a gap-targeted round. |
+| `research_stopped` | Research ended and writing can begin. |
+| `workflow_completed` | A final report was persisted. |
+| `workflow_failed` | A terminal error was persisted. |
 
-### Repository structure
+### SSE-First Browser Behavior
 
-Key files and folders (the actual repository contains additional models, prompts, and helpers):
+```mermaid
+flowchart TD
+    Open[Open or restore job]
+    Status[Fetch status once]
+    SSE[Connect EventSource]
+    Replay[Replay persisted events after cursor]
+    Live[Receive live events]
+    Terminal{Terminal event?}
+    Final[Fetch final status and report]
+    Failed{SSE unavailable?}
+    Poll[Backoff status polling]
 
-```text
-.
-├── src/
-│   ├── agents/
-│   │   ├── research/
-│   │   └── writer/
-│   ├── config/
-│   ├── graph/
-│   │   ├── graph_builder.py
-│   │   ├── graph_routing.py
-│   │   └── graph_state.py
-│   ├── guardrails/
-│   ├── llm/
-│   │   ├── factory.py
-│   │   ├── roles.py
-│   │   └── service.py
-│   ├── models/
-│   │   ├── pipeline_event.py
-│   │   ├── report_model.py
-│   │   └── ...
-│   ├── persistence/
-│   │   ├── __init__.py
-│   │   └── research_job_store.py
-│   ├── prompts/
-│   ├── rendering/
-│   ├── retrieval/
-│   ├── routes/
-│   │   └── research_route.py
-│   ├── services/
-│   │   ├── research_pipeline_stream.py
-│   │   └── research_service.py
-│   ├── static/
-│   │   ├── index.html
-│   │   ├── css/styles.css
-│   │   └── js/app.js
-│   ├── tools/
-│   │   ├── extraction/
-│   │   └── search/
-│   └── server.py
-├── data/                         # SQLite database (created automatically)
-├── tests/
-├── requirements.txt
-└── .env                          # Local configuration; never commit secrets
+    Open --> Status --> SSE --> Replay --> Live --> Terminal
+    Terminal -->|yes| Final
+    Terminal -->|no| Live
+    SSE --> Failed
+    Failed -->|yes| Poll
+    Poll -->|SSE reconnects| Live
+    Poll -->|job terminal| Final
 ```
 
-## Getting started
+Progress events expose counts, stage names, provider names, fallback activation, coverage status, and sanitized error summaries. They do not persist prompts, source bodies, evidence text, private document IDs, credentials, or final report contents.
+
+## State and Resource Lifetimes
+
+Understanding resource scope is important because the project intentionally avoids one global mixed-source vector database.
+
+| Scope | Resources | Lifetime |
+|---|---|---|
+| Application process | Settings, provider clients, embedding service, tokenizer, retrieval factory, document service, in-memory document registry | Server process |
+| Research job | LangGraph state, private-document retrieval session, LLM provider preference/failure state | One job |
+| Public retrieval invocation | Public chunks, dense index, BM25 index, retrieval contexts | Built and cleared by the research retrieval flow |
+| Persistent local storage | SQLite jobs/events, uploaded source files | Until manually removed |
+| Browser | Temporary owner ID and last job ID | Browser local storage |
+
+### Workflow State Ownership
+
+| State section | Owns |
+|---|---|
+| Root | Job/session IDs, question, owner ID, selected source mode, selected document IDs, structured errors |
+| `research` | Plan, queries, search results, normalized sources, separate web/document retrieval results, evidence, coverage, iteration count, stop reason |
+| `research_control` | Budgets, usage, pending gaps, routing decision, and round history |
+| `writer` | Selected evidence IDs, draft report, citation result, and final report |
+
+Non-serializable retrieval indexes stay in `ResearchJobResources`, outside graph state.
+
+## Getting Started
 
 ### Prerequisites
 
-- Python environment compatible with the versions pinned in `requirements.txt`.
-- A Tavily API key for the current web-search and extraction implementation.
-- An API key for the chosen LLM provider (Groq by default in the original configuration).
-- Internet access for web research and any first-run local model/tokenizer downloads.
+- **Python:** 3.13 or newer, matching `pyproject.toml`.
+- **Package tooling:** `pip` and `venv`.
+- **Tavily:** A Tavily API key is currently required by application settings for general search and extraction.
+- **LLM access:** At least one supported provider key and model ID: OpenAI, Google Gemini, or Groq.
+- **Network access:** Required for public research and the first download of the local embedding model and tokenizer.
 
-### 1. Install dependencies
+Brave and Firecrawl credentials are optional. arXiv and Wikipedia use public APIs and do not require API keys.
 
-From the repository root:
+### Installation
+
+Clone the repository and create a virtual environment:
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate       # Windows: .venv\Scripts\activate
+git clone https://github.com/Ishwaridutt/deep-research-agent.git
+cd deep-research-agent
+python3.13 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-The Phase 2 job store needs `aiosqlite`. If it is not yet listed in your requirements, add:
+On Windows PowerShell, activate the environment with:
 
-```text
-aiosqlite>=0.20,<1
+```powershell
+.venv\Scripts\Activate.ps1
 ```
 
-The provider-switching version of the LLM factory additionally requires the corresponding LangChain integrations, such as `langchain-groq` and/or `langchain-google-genai`.
+### Environment Configuration
 
-### 2. Configure `.env`
-
-The following example assumes the current Groq research setup:
-
-```dotenv
-TAVILY_API_KEY=your_tavily_api_key
-GROQ_API_KEY=your_groq_api_key
-
-PLANNER_MODEL=openai/gpt-oss-120b
-QUERY_GENERATOR_MODEL=openai/gpt-oss-120b
-EVIDENCE_MODEL=openai/gpt-oss-120b
-COVERAGE_MODEL=openai/gpt-oss-120b
-WRITER_MODEL=openai/gpt-oss-120b
-CITATION_MODEL=openai/gpt-oss-120b
-
-SEARCH_PROVIDER=tavily
-WEB_EXTRACTOR_PROVIDER=tavily
-
-RETRIEVAL_MAX_CONTEXT_TOKENS=3000
-MAX_WRITER_EVIDENCE_ITEMS=40
-MAX_WRITER_EVIDENCE_CHARS=30000
-MAX_ITERATIONS=3
-MAX_TOTAL_QUERIES_PER_JOB=10
-
-LLM_TIMEOUT_SECONDS=60
-LLM_MAX_RETRIES=2
-
-# Optional: override the default SQLite file location.
-# RESEARCH_DB_PATH=data/research.sqlite3
-```
-
-The Pydantic settings classes read these values from `.env`. Do not commit real API keys; provide a sanitized `.env.example` in the repository if you want to share configuration defaults.
-
-### 3. Run the application
+Copy the provided template:
 
 ```bash
-uvicorn src.server:app --reload
+cp .env.example .env
 ```
 
-Open **http://127.0.0.1:8000/** and submit a research question.
-
-For production-like testing, use a **single server process**. The current background-job registry is in memory and is not designed to coordinate execution across multiple Uvicorn workers.
-
-## Configuration
-
-### Retrieval and evidence context
-
-| Environment variable | Default | Purpose |
-|---|---:|---|
-| `RETRIEVAL_EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | Local embedding model |
-| `RETRIEVAL_CHUNK_SIZE` | `400` | Retrieval chunk sizing |
-| `RETRIEVAL_CANDIDATE_K` | `10` | Candidates considered during retrieval |
-| `RETRIEVAL_TOP_K` | `5` | Top retrieved passages |
-| `RETRIEVAL_MAX_CONTEXT_TOKENS` | `3000` | Retrieval-context token budget |
-| `RETRIEVAL_MAX_CHUNKS_PER_DOCUMENT` | `3` | Diversity cap per source document |
-| `RETRIEVAL_CONTEXT_TOKENIZER_MODEL` | `openai/gpt-oss-120b` | Local tokenizer used for context accounting |
-| `MAX_WRITER_EVIDENCE_ITEMS` | `40` | Max evidence items prepared for writing |
-| `MAX_WRITER_EVIDENCE_CHARS` | `30000` | Writer evidence-text cap, in **characters** |
-
-**Token accounting caveat:** `RETRIEVAL_MAX_CONTEXT_TOKENS` limits the selected retrieval context, **not the complete LLM request**. System prompts, schemas, instructions, and generated responses add tokens. The writer limit is currently character-based. A global per-call output-token cap and per-job token quota have **not** been implemented.
-
-When switching from Groq to Gemini, the local `RETRIEVAL_CONTEXT_TOKENIZER_MODEL` does not automatically change. Its estimates may differ from the selected provider's actual token counts.
-
-### Research limits
-
-| Environment variable | Default | Purpose |
-|---|---:|---|
-| `MAX_SUBQUESTIONS` | `4` | Planning scope |
-| `MAX_QUERIES_PER_SUBQUESTION` | `2` | Initial/follow-up query generation limit per subquestion call |
-| `MAX_TOTAL_QUERIES_PER_JOB` | `10` | Total query limit |
-| `MAX_SEARCH_RESULTS_PER_QUERY` | `5` | Search result cap |
-| `MAX_EVIDENCE_ITEMS` | `100` | Maximum accumulated evidence items |
-| `MIN_EVIDENCE_RELEVANCE` | `0.60` | Minimum relevance threshold |
-| `MAX_ITERATIONS` | `3` | Research round cap |
-
-The Phase 2 `ResearchBudget` / `ResearchControlState` also provides controls for extraction attempts, elapsed research time, and consecutive no-gain rounds. The router uses conservative limits, while search and extraction nodes enforce applicable budgets **before** provider calls. Some Phase 2 budget defaults still live in the research-quality models; they are not all configurable through `.env` yet.
-
-### LLM providers (latest integration step)
-
-The original factory explicitly used Groq. The **recently proposed** factory update makes the provider configurable without changing research nodes:
+Configure at least Tavily and one LLM provider. This single-provider example uses Groq:
 
 ```dotenv
+TAVILY_API_KEY=replace-with-your-tavily-key
+GROQ_API_KEY=replace-with-your-groq-key
+
 LLM_PROVIDER=groq
-PLANNER_MODEL=openai/gpt-oss-120b
-WRITER_MODEL=openai/gpt-oss-120b
+LLM_PROVIDER_ORDER=groq
+LLM_PRIVATE_DATA_PROVIDERS=groq
+
+PLANNER_MODEL=groq:replace-with-supported-model-id
+QUERY_GENERATOR_MODEL=groq:replace-with-supported-model-id
+EVIDENCE_MODEL=groq:replace-with-supported-model-id
+COVERAGE_MODEL=groq:replace-with-supported-model-id
+WRITER_MODEL=groq:replace-with-supported-model-id
+CITATION_MODEL=groq:replace-with-supported-model-id
+
+LANGSMITH_TRACING=false
 ```
 
-For Gemini, after applying the provider-selectable factory, settings, and LLM-service changes:
+To enable the full LLM fallback chain, configure all provider keys and give each role a comma-separated chain:
 
 ```dotenv
-LLM_PROVIDER=google_genai
-GOOGLE_API_KEY=your_google_api_key
+OPENAI_API_KEY=replace-with-your-openai-key
+GOOGLE_API_KEY=replace-with-your-google-key
+GROQ_API_KEY=replace-with-your-groq-key
 
-# Use model IDs available to your Google API account.
-PLANNER_MODEL=YOUR_GEMINI_MODEL_ID
-QUERY_GENERATOR_MODEL=YOUR_GEMINI_MODEL_ID
-EVIDENCE_MODEL=YOUR_GEMINI_MODEL_ID
-COVERAGE_MODEL=YOUR_GEMINI_MODEL_ID
-WRITER_MODEL=YOUR_GEMINI_MODEL_ID
-CITATION_MODEL=YOUR_GEMINI_MODEL_ID
+LLM_PROVIDER_ORDER=openai,google_genai,groq
+LLM_PRIVATE_DATA_PROVIDERS=openai,google_genai,groq
 
-LLM_STRUCTURED_OUTPUT_METHOD=json_schema
-LLM_STRUCTURED_OUTPUT_ATTEMPTS=2
+PLANNER_MODEL=openai:OPENAI_MODEL_ID,google_genai:GEMINI_MODEL_ID,groq:GROQ_MODEL_ID
 ```
 
-With the updated factory, individual role settings may also use a `groq:` or `google_genai:` prefix to override the default provider. Verify the configured model's structured-output capabilities before running a full research job. **The Gemini provider switch and malformed-JSON retry improvements have been proposed in code but have not been confirmed by the passing SQLite/SSE tests.**
+Apply the same chain format to the other five role settings. Never commit `.env` or real credentials.
 
-### Other important settings
+### Running Locally
 
-| Variable | Purpose |
-|---|---|
-| `SEARCH_PROVIDER` | Search backend (currently `tavily`) |
-| `WEB_EXTRACTOR_PROVIDER` | Page extraction backend (currently `tavily`) |
-| `SEARCH_TIMEOUT_SECONDS` | Search timeout |
-| `EXTRACTION_TIMEOUT_SECONDS` | Extraction timeout |
-| `MIN_PROVIDER_SCORE` | Provider search-score threshold |
-| `APP_ENV` | `development`, `test`, or `production` |
-| `GRAPH_RECURSION_LIMIT` | LangGraph recursion safety limit |
-| `LOG_LEVEL` | Application logging level |
-| `RESEARCH_DB_PATH` | SQLite file path; default `data/research.sqlite3` |
+```bash
+source .venv/bin/activate
+python -m uvicorn src.server:app --reload
+```
 
-## API
+Open:
 
-The backend exposes a legacy synchronous endpoint and a job-based workflow for the interactive UI.
+- **Application:** http://127.0.0.1:8000/
+- **API documentation:** http://127.0.0.1:8000/docs
+- **Health check:** http://127.0.0.1:8000/health
 
-| Method | Endpoint | Description |
+Use one Uvicorn worker. Background tasks, document metadata, and job-owned resources are currently process-local and are not coordinated across workers.
+
+## Usage and API Examples
+
+### Browser Workflow
+
+1. Enter a research question.
+2. Select **Web**, **Documents**, or **Hybrid**.
+3. For document or hybrid research, choose one or more `.pdf`, `.docx`, `.txt`, or `.md` files, or select existing uploads from the current process.
+4. Select **Start research**. Pending files upload automatically before the research job starts.
+5. Follow the live pipeline, provider progress, coverage rounds, and final report.
+
+### API Endpoints
+
+| Method | Endpoint | Purpose |
 |---|---|---|
-| `POST` | `/api/research` | Run a complete research workflow and return the result in one response |
-| `POST` | `/api/research/jobs` | Create a persistent job; returns `202 Accepted` |
-| `GET` | `/api/research/jobs/status/{job_id}` | Get job status and the final result, when available |
-| `GET` | `/api/research/jobs/{job_id}/events` | Replay and stream SSE events |
+| `GET` | `/` | Serve the browser workspace. |
+| `GET` | `/health` | Return application health. |
+| `POST` | `/documents` | Upload one owner-scoped private document. |
+| `GET` | `/documents` | List documents for an owner. |
+| `POST` | `/api/research` | Run a synchronous research workflow. |
+| `POST` | `/api/research/jobs` | Queue an asynchronous persisted job. |
+| `GET` | `/api/research/jobs/status/{job_id}` | Read lifecycle state and terminal result. |
+| `GET` | `/api/research/jobs/{job_id}/events` | Replay and stream SSE events. |
 
-### Create an asynchronous research job
+### Start a Web Research Job
 
 ```bash
 curl -X POST http://127.0.0.1:8000/api/research/jobs \
   -H 'Content-Type: application/json' \
   -d '{
-    "question": "How do AI coding assistants affect developer productivity?",
-    "sources": ["web"]
+    "question": "How are agentic AI systems changing software engineering?",
+    "source_selection": {
+      "mode": "web",
+      "document_ids": []
+    }
   }'
 ```
 
-Example response (`202 Accepted`):
+Example response:
 
 ```json
 {
@@ -351,140 +714,265 @@ Example response (`202 Accepted`):
 }
 ```
 
-### Check status or retrieve the report
+### Upload and Use a Private Document
+
+Use the same owner ID for upload, listing, and research:
+
+```bash
+OWNER_ID="local-example-owner"
+
+curl -X POST http://127.0.0.1:8000/documents \
+  -H "X-Owner-Id: ${OWNER_ID}" \
+  -F "file=@./example.pdf"
+```
+
+Copy the returned `document_id`, then create a hybrid job:
+
+```bash
+DOCUMENT_ID="returned-document-id"
+
+curl -X POST http://127.0.0.1:8000/api/research/jobs \
+  -H 'Content-Type: application/json' \
+  -H "X-Owner-Id: ${OWNER_ID}" \
+  -d "{
+    \"question\": \"Compare this document with current public research.\",
+    \"source_selection\": {
+      \"mode\": \"hybrid\",
+      \"document_ids\": [\"${DOCUMENT_ID}\"]
+    }
+  }"
+```
+
+Use `"mode": "documents"` for private-document-only research.
+
+### Check Job Status
 
 ```bash
 curl http://127.0.0.1:8000/api/research/jobs/status/JOB-example
 ```
 
-Job status is `queued`, `running`, `completed`, or `failed`. The `result` field contains the application's `ResearchExecutionResult` after the job reaches a terminal state. Successful results include report summary, findings, limitations, sources, and generated Markdown.
+Status is one of `queued`, `running`, `completed`, or `failed`. A terminal response includes the structured execution result and either the validated report or structured errors.
 
-### Watch pipeline events
+### Stream Pipeline Events
 
 ```bash
 curl -N http://127.0.0.1:8000/api/research/jobs/JOB-example/events
 ```
 
-To replay only events after sequence 20:
+Replay only events after sequence 20:
 
 ```bash
 curl -N 'http://127.0.0.1:8000/api/research/jobs/JOB-example/events?after=20'
 ```
 
-The endpoint also accepts the SSE `Last-Event-ID` header for reconnects.
+The endpoint also honors the `Last-Event-ID` header used by browser `EventSource` reconnections.
 
-## Live pipeline events
+### Run Synchronously
 
-The application observes **one LangGraph execution per asynchronous job** using LangGraph's event stream. It persists a small subset of information to SQLite and sends it to the browser as SSE.
+```bash
+curl -X POST http://127.0.0.1:8000/api/research \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "question": "What are the major approaches to evaluating AI agents?",
+    "source_selection": {"mode": "web", "document_ids": []}
+  }'
+```
 
-Representative event types:
+The connection remains open until the workflow completes. Prefer the job API for the interactive UI and long-running research.
 
-| Event | Meaning |
+## Configuration
+
+Use `.env.example` as the complete configuration reference.
+
+### LLM Settings
+
+| Variable | Purpose |
 |---|---|
-| `workflow_started` | Job execution began |
-| `stage_started` | A workflow node started |
-| `stage_completed` | A workflow node completed |
-| `stage_failed` | A node emitted an execution failure |
-| `research_retry` | Router scheduled another research iteration |
-| `research_stopped` | Research ended and the writer may begin |
-| `workflow_completed` | The final report is available via the status endpoint |
-| `workflow_failed` | The job ended unsuccessfully |
+| `OPENAI_API_KEY`, `GOOGLE_API_KEY`, `GROQ_API_KEY` | Provider credentials. |
+| `LLM_PROVIDER` | Default provider for unqualified model names. |
+| `LLM_PROVIDER_ORDER` | Global provider preference order. |
+| `LLM_PRIVATE_DATA_PROVIDERS` | Providers allowed to receive private-document content. |
+| `*_MODEL` | Provider-qualified model chain for each logical role. |
+| `LLM_TIMEOUT_SECONDS` | Per-provider timeout. |
+| `LLM_MAX_RETRIES` | Provider SDK retry count. |
+| `LLM_STRUCTURED_OUTPUT_METHOD` | LangChain structured-output method. |
+| `LLM_STRUCTURED_OUTPUT_ATTEMPTS` | Bounded parsing/schema attempts. |
 
-An example SSE message:
+### Search and Extraction Settings
+
+| Variable | Purpose |
+|---|---|
+| `TAVILY_API_KEY` | Required general search and extraction credential. |
+| `BRAVE_API_KEY` | Optional general-search fallback credential. |
+| `FIRECRAWL_API_KEY` | Optional webpage-extraction fallback credential. |
+| `ARXIV_ENABLED`, `WIKIPEDIA_ENABLED` | Enable native public search branches. |
+| `ARXIV_FULL_TEXT_ENABLED` | Attempt bounded arXiv PDF extraction before abstract fallback. |
+| `SEARCH_MAX_CONCURRENCY` | Maximum concurrent provider branches. |
+| `*_RESULTS_PER_QUERY` | Per-provider result caps. |
+| `PROVIDER_MAX_RETRIES` | Application-level provider retries. |
+| `PROVIDER_CIRCUIT_*` | Circuit-breaker threshold and recovery window. |
+
+### Retrieval Settings
+
+All retrieval variables use the `RETRIEVAL_` prefix.
+
+| Variable | Default | Purpose |
+|---|---:|---|
+| `RETRIEVAL_EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | Local semantic embedding model. |
+| `RETRIEVAL_EMBEDDING_DEVICE` | `cpu` | Embedding execution device. |
+| `RETRIEVAL_CHUNK_SIZE` | `400` | Chonkie chunk size. |
+| `RETRIEVAL_CANDIDATE_K` | `10` | Candidates requested from each retrieval path. |
+| `RETRIEVAL_TOP_K` | `5` | Fused passages considered for context. |
+| `RETRIEVAL_SEMANTIC_WEIGHT` | `0.5` | Dense-ranking contribution. |
+| `RETRIEVAL_LEXICAL_WEIGHT` | `0.5` | BM25-ranking contribution. |
+| `RETRIEVAL_RRF_C` | `60` | Reciprocal Rank Fusion constant. |
+| `RETRIEVAL_MAX_CONTEXT_TOKENS` | `3000` | Maximum selected retrieval context. |
+| `RETRIEVAL_MAX_CHUNKS_PER_DOCUMENT` | `3` | Per-document diversity cap. |
+
+### Research and Document Limits
+
+| Variable | Purpose |
+|---|---|
+| `MAX_SUBQUESTIONS` | Maximum planning breadth. |
+| `MAX_QUERIES_PER_SUBQUESTION` | Query-generation limit per objective. |
+| `MAX_TOTAL_QUERIES_PER_JOB` | Job-wide query budget. |
+| `MAX_SOURCE_DOWNLOAD_BYTES` | Bounded source/PDF download size. |
+| `MIN_SOURCE_CONTENT_CHARS`, `MAX_SOURCE_CONTENT_CHARS` | Cleaner acceptance limits. |
+| `MIN_EVIDENCE_RELEVANCE` | Minimum accepted evidence relevance. |
+| `MAX_EVIDENCE_ITEMS` | Maximum accumulated evidence. |
+| `MAX_ITERATIONS` | Maximum research rounds. |
+| `MAX_WRITER_EVIDENCE_ITEMS`, `MAX_WRITER_EVIDENCE_CHARS` | Writer context bounds. |
+| `DOCUMENT_MAX_TOTAL_SIZE_BYTES` | Per-owner upload quota in the in-memory registry. |
+| `DOCUMENT_UPLOAD_DIRECTORY` | Local uploaded-file directory. |
+
+## Project Structure
 
 ```text
-id: 12
-event: research_retry
-data: {"job_id":"JOB-example","sequence":12,"event_type":"research_retry","stage":"research_routing","status":"retrying","iteration":1,"details":{"next_iteration":2,"gap_count":2,"reason":"Unresolved gaps remain."},"timestamp":"2026-10-10T00:00:00Z"}
+.
+├── src/
+│   ├── agents/
+│   │   ├── research/                 # Planning, search, retrieval, evidence, coverage nodes
+│   │   └── writer/                   # Evidence selection, synthesis, citation checking
+│   ├── config/
+│   │   ├── settings.py               # Typed environment configuration
+│   │   └── logging.py                # Structured JSON logging
+│   ├── documents/
+│   │   ├── document_parser.py        # PDF, DOCX, text, and Markdown parsing
+│   │   ├── document_registry.py      # Process-local owner-scoped metadata
+│   │   └── local_document_file_store.py
+│   ├── graph/
+│   │   ├── graph_builder.py          # LangGraph nodes and edges
+│   │   ├── graph_routing.py          # Deterministic conditional routing
+│   │   └── graph_state.py            # Workflow state ownership
+│   ├── guardrails/                   # Input and URL validation
+│   ├── llm/
+│   │   ├── factory.py                # Provider/model-chain construction
+│   │   ├── roles.py                  # Logical LLM responsibilities
+│   │   └── service.py                # Structured output, policy, and fallback
+│   ├── models/                       # Pydantic domain and API contracts
+│   ├── persistence/
+│   │   └── research_job_store.py     # SQLite jobs and ordered events
+│   ├── prompts/                      # Role-specific prompt builders
+│   ├── rendering/                    # Deterministic report rendering
+│   ├── retrieval/
+│   │   ├── chunking/                 # Single shared RetrievalChunker
+│   │   ├── context/                  # Token-bounded context selection
+│   │   ├── embeddings/               # Shared embedding service
+│   │   └── retrievers/               # BM25, dense retrieval, and RRF
+│   ├── routes/                       # Research, document, health, and UI routes
+│   ├── services/
+│   │   ├── document_service.py       # Upload and research-time document adaptation
+│   │   ├── research_service.py       # Job lifecycle and graph execution
+│   │   └── research_pipeline_stream_service.py
+│   ├── static/                       # Browser workspace
+│   ├── tests/                        # Offline focused and integration-style tests
+│   ├── tools/
+│   │   ├── cleaning/                 # Deterministic SourceCleaner
+│   │   ├── extraction/               # Native, web, and fallback extractors
+│   │   └── search/                   # Parallel search and provider adapters
+│   └── server.py                     # FastAPI composition root
+├── docs/                             # Phase plans and implementation handoffs
+├── data/                             # Runtime SQLite database
+├── uploaded/                         # Runtime private uploads; gitignored
+├── .env.example                      # Safe configuration template
+├── requirements.txt
+├── pyproject.toml
+└── readme.md
 ```
 
-Progress events **do not include full LLM prompts, webpage contents, evidence bodies, or final reports**. The UI uses event metadata (such as stage, round number, coverage status, gap count, and router action). It fetches the final report separately from the status endpoint.
+### Important Entry Points
 
-The frontend supports refreshing the page during execution, loading a job from a `?job=...` link, reconnecting to events, and reconstructing previous research rounds.
-
-## Persistence and job lifecycle
-
-SQLite stores two primary tables:
-
-- `research_jobs`: job ID, session ID, question, allowed sources, lifecycle status, final result, timestamps, and error information.
-- `research_events`: ordered, per-job pipeline events with `(job_id, sequence)` as the primary key.
-
-The database is initialized at application startup and uses WAL mode. By default, it is stored at `data/research.sqlite3`.
-
-Asynchronous jobs run as application-owned asyncio tasks and **continue if an SSE client disconnects**. The current service defaults to **two concurrently executing jobs** and **20 in-process outstanding jobs** (including running and queued jobs). These values are constructor defaults, not `.env` settings yet.
-
-The **legacy synchronous** `POST /api/research` endpoint still works but does not use this persistent-job flow.
-
-**Important distinction:** Persisted *jobs and events* do not mean LangGraph *execution checkpointing*. If the process restarts before a job finishes, the job is marked `failed`; it is **not resumed from the last completed graph node**. Full recovery would require a checkpointer and idempotent handling of external calls.
-
-To avoid committing personal research contents and API credentials, add these patterns to `.gitignore`:
-
-```gitignore
-.env
-.venv/
-data/*.sqlite3
-data/*.sqlite3-wal
-data/*.sqlite3-shm
-```
+| File | Start here when changing |
+|---|---|
+| `src/server.py` | Application wiring, resource creation, startup, and shutdown |
+| `src/graph/graph_builder.py` | Node order or conditional graph edges |
+| `src/graph/graph_routing.py` | Research-loop and terminal routing rules |
+| `src/graph/graph_state.py` | Data shared between nodes |
+| `src/services/research_service.py` | Synchronous/asynchronous job execution |
+| `src/services/research_pipeline_stream_service.py` | SSE lifecycle event capture and sanitization |
+| `src/retrieval/retrieval_session.py` | Shared indexing and retrieval boundary |
+| `src/tools/search/factory.py` | Search-provider composition |
+| `src/tools/extraction/factory.py` | Extraction-provider composition |
+| `src/static/js/app.js` | UI submissions, SSE connection, recovery, and rendering |
 
 ## Testing
 
-Run unit tests from the repository root:
+Tests must not call real LLM, search, extraction, or embedding providers. The suite uses fake dependencies and disables dotenv loading:
 
 ```bash
-python -m pytest tests/test_research_job_store.py -v
-python -m pytest tests/test_research_pipeline_stream.py -v
+PYTHON_DOTENV_DISABLED=1 .venv/bin/python -m pytest -q src/tests
 ```
 
-Both of these test files were reported **passing locally** after fixing an obsolete import in `src/graph/__init__.py`.
-
-They cover SQLite job lifecycle, ordered event replay, restart handling, SSE serialization, research retry events, and capturing a graph's final result without a second execution. The fake-graph test does **not** call Groq, Gemini, Tavily, or the real research graph.
-
-For broader checks:
+Additional checks:
 
 ```bash
-python -m pytest tests/ -v
+PYTHON_DOTENV_DISABLED=1 .venv/bin/python -m compileall -q src
+node --check src/static/js/app.js
+git diff --check
 ```
 
-If you added the latest LLM-service tests, you can also run:
+Focused examples:
 
 ```bash
-python -m pytest tests/test_llm_service.py -v
+PYTHON_DOTENV_DISABLED=1 .venv/bin/python -m pytest -q src/tests/test_retrieval_pipeline.py
+PYTHON_DOTENV_DISABLED=1 .venv/bin/python -m pytest -q src/tests/test_parallel_search.py
+PYTHON_DOTENV_DISABLED=1 .venv/bin/python -m pytest -q src/tests/test_provider_fallbacks.py
+PYTHON_DOTENV_DISABLED=1 .venv/bin/python -m pytest -q src/tests/test_llm_fallback.py
+PYTHON_DOTENV_DISABLED=1 .venv/bin/python -m pytest -q src/tests/test_hybrid_evidence_flow.py
 ```
 
-The redesigned frontend has been smoke-tested with **mocked API responses** in desktop and mobile browsers. A complete live integration test against the FastAPI server, database, external search tools, and LLM providers is still needed.
+The current offline suite contains 58 passing tests.
 
-Suggested manual end-to-end checks:
+## Current Limitations
 
-1. Start a job and confirm `queued` → `running` → `completed` or `failed`.
-2. Confirm node events appear in the UI and repeat research stages when coverage triggers another round.
-3. Refresh the page during research and confirm event replay reconstructs the timeline.
-4. Confirm the status API returns the same final report shown in the browser.
-5. Verify failed writer or provider calls end in a visible failed job, not a permanently running state.
+- **Temporary owner identity:** `X-Owner-Id` is not authentication. Do not expose private-document routes publicly without real identity and authorization.
+- **Process-local document metadata:** Uploaded files remain on disk, but the in-memory document registry is lost on restart. Previously uploaded files cannot be selected again without rebuilding metadata.
+- **No workflow checkpoint resume:** SQLite preserves jobs and events, not LangGraph execution checkpoints. Queued or running jobs are marked failed after a restart.
+- **Single-process execution:** Background tasks, admission control, and runtime resources are not coordinated across Uvicorn workers or machines.
+- **In-memory retrieval indexes:** Dense and BM25 indexes are job/session resources and are intentionally cleared; there is no persistent vector database.
+- **No durable task queue:** Jobs run as application-owned asyncio tasks.
+- **No global cost or token quota:** Retrieval and writer contexts are bounded, but provider billing, total generated tokens, and account-level quotas are not centrally enforced.
+- **Development runtime prints:** Learning-oriented prints currently expose intermediate diagnostics and should be removed or sanitized before production deployment.
+- **Local file storage:** Upload lifecycle, retention, encryption, malware scanning, and secure deletion require production policies.
+- **No public deployment controls:** Rate limiting, CSRF strategy, access control, secret management, retention, migrations, metrics, and operational alerting remain future work.
 
-## Current limitations
+## Contributing
 
-- **Web sources only in the active pipeline.** `DOCUMENTS` and `MCP` are represented in the source models but private-document retrieval and connected-app research are not yet implemented.
-- **No authentication or per-user authorization.** Anyone who can access the API and knows a job ID may be able to read stored questions, reports, and event history. Do not expose this deployment publicly without access controls.
-- **SQLite targets a single API process.** In-memory task ownership is not coordinated across multiple workers or machines.
-- **No LangGraph checkpoint resume.** Jobs interrupted by a server restart are marked failed.
-- **No global LLM token budget.** Retrieval context is capped, but complete request/output token limits, total job quotas, and provider-level TPM management are not yet implemented.
-- **Provider reliability still needs tuning.** Structured-output failures can occur during long report synthesis. The Groq/Gemini schema-mode and bounded-retry changes require live provider verification.
-- **Quality is an ongoing focus.** Better relevance scoring, source-quality assessment, gap resolution, and citation grounding remain areas for iteration.
-- **UI coverage details are summarized.** Current SSE metadata includes coverage status and counts, not full assessment text or evidence documents.
-- **Not production-hardened yet.** Persistent event retention, migrations, request authentication, queue durability, rate limiting, multi-instance scheduling, and operational monitoring need further work.
+Contributions should keep the architecture's existing boundaries intact.
 
-## Implementation progress
+1. Fork the repository and create a focused branch.
+2. Inspect existing utilities before adding a parallel implementation.
+3. Keep `RetrievalChunker` as the single chunking implementation.
+4. Add focused offline tests for changed behavior.
+5. Run the full test suite and static checks.
+6. Update relevant documentation and submit a pull request describing the problem, design decision, and verification results.
 
-| Stage | Scope | Status |
-|---|---|---|
-| **Phase 1** | Research planning, search, webpage extraction, hybrid retrieval, evidence extraction, writing, citation checks, report rendering, initial UI | Implemented; quality tuning ongoing |
-| **Phase 2.1–2.3** | Evidence-quality contracts, coverage evaluator, gap-targeted research, bounded loops | Implemented; broader integration tests pending |
-| **Phase 2.4** | Job/event SQLite persistence, single-run LangGraph event recording, SSE/status endpoints | Implemented; persistence/streaming unit tests passed |
-| **Phase 2.5** | Redesigned live pipeline UI, per-round history, reconnect/replay, report display | Implemented; mocked browser checks passed |
-| **LLM reliability extension** | Configurable Groq/Gemini providers, JSON Schema output, selective retries | Proposed code supplied; live verification pending |
-| **Future work** | Private document support, richer observability/token accounting, checkpoint recovery, security, full end-to-end testing | Not implemented |
+Do not include credentials, `.env`, generated databases, uploaded research files, or provider response payloads in commits or bug reports.
+
+## License
+
+This repository does not currently include a license file. Until a license is added, no open-source reuse rights are granted by default. Add a recognized license such as MIT, Apache-2.0, or GPL-3.0 before distributing the project as open source.
 
 ---
 
-**Design principle:** Spend LLM tokens on relevant evidence and synthesis—not entire webpages or repeated broad searches—and make every decision to continue, stop, or retry research explainable to the user.
+**Design principle:** Spend model context on selected evidence and synthesis—not entire webpages or repeated broad searches—and make every decision to continue, stop, retry, or reject a claim observable and bounded.

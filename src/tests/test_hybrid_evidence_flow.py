@@ -23,6 +23,7 @@ from src.models import (
     SearchQuery,
     SearchResult,
     Source,
+    SourceProvider,
     SourceType,
     SubQuestion,
 )
@@ -116,8 +117,10 @@ class FakeSessionFactory:
 class FakeEvidenceLLM:
     def __init__(self, outputs) -> None:
         self.outputs = list(outputs)
+        self.calls = []
 
     async def invoke_structured(self, **kwargs):
+        self.calls.append(kwargs)
         return self.outputs.pop(0)
 
 
@@ -147,6 +150,8 @@ def create_hybrid_state():
         SearchResult(
             id="result-1",
             query_id="query-1",
+            provider=SourceProvider.TAVILY,
+            canonical_id="web:https://example.com/report",
             title="Web report",
             url="https://example.com/report",
         )
@@ -155,6 +160,8 @@ def create_hybrid_state():
         Source(
             id="web-1",
             source_type=SourceType.WEB,
+            provider=SourceProvider.TAVILY,
+            canonical_id="web:https://example.com/report",
             search_result_ids=["result-1"],
             title="Web report",
             uri="https://example.com/report",
@@ -183,6 +190,10 @@ def test_hybrid_retrieval_keeps_results_separate_and_preserves_sources():
         assert len(research["document_retrieval_results"]) == 1
         assert factory.sessions[0].clear_calls == 1
         assert document_session.clear_calls == 0
+        assert factory.sessions[0].documents[0].metadata["provider"] == "tavily"
+        assert factory.sessions[0].documents[0].metadata["canonical_id"] == (
+            "web:https://example.com/report"
+        )
 
         document_source = next(
             source for source in research["sources"]
@@ -248,6 +259,7 @@ def test_evidence_boundary_merges_web_and_document_provenance():
         assert {item.source_id for item in evidence}.issubset(
             {source.id for source in state["research"]["sources"]}
         )
+        assert all(call["metadata"].contains_private_data for call in llm.calls)
 
     asyncio.run(run())
 
@@ -337,6 +349,8 @@ def test_document_report_source_exposes_safe_locations():
     source = Source(
         id="doc-1",
         source_type=SourceType.DOCUMENT,
+        provider=SourceProvider.PRIVATE_DOCUMENT,
+        canonical_id="document:doc-1",
         title="report.pdf",
         uri="document://doc-1",
         content="Retrieved passage",

@@ -33,7 +33,8 @@ from src.graph.graph_state import WorkflowState
 from src.llm import LLMService
 from src.retrieval import RetrievalSessionFactory
 from src.services.document_service import DocumentService
-from src.tools.extraction import WebExtractor
+from src.tools.cleaning import SourceCleaner
+from src.tools.extraction import SourceContentExtractor
 from src.tools.search import SearchProvider
 
 
@@ -58,7 +59,8 @@ def build_research_graph(
     settings: Settings,
     llm_service: LLMService,
     search_provider: SearchProvider,
-    web_extractor: WebExtractor,
+    source_extractor: SourceContentExtractor,
+    source_cleaner: SourceCleaner,
     retrieval_session_factory: RetrievalSessionFactory,
     document_service: DocumentService,
 ) -> CompiledStateGraph:
@@ -123,8 +125,8 @@ def build_research_graph(
         RESEARCH_SOURCE_PROCESSOR,
         partial(
             research_source_processor_node,
-            web_extractor=web_extractor,
-            settings=settings,
+            source_extractor=source_extractor,
+            source_cleaner=source_cleaner,
         ),
     )
 

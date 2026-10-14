@@ -2,6 +2,7 @@
 
 from datetime import datetime
 from enum import Enum
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -19,6 +20,16 @@ class SourceType(str, Enum):
     IMAGE = "image"
 
 
+class SourceProvider(str, Enum):
+    """Identifies the adapter that supplied normalized source content."""
+
+    TAVILY = "tavily"
+    BRAVE = "brave"
+    ARXIV = "arxiv"
+    WIKIPEDIA = "wikipedia"
+    PRIVATE_DOCUMENT = "private_document"
+
+
 class SearchResult(BaseModel):
     """Normalized search result returned by a search provider."""
 
@@ -29,6 +40,12 @@ class SearchResult(BaseModel):
     query_id: str = Field(
         min_length=1,
     )
+
+    # Identifies which adapter discovered the result for provenance and fallback tracking.
+    provider: SourceProvider
+
+    # Stable source identity used to merge the same result returned by multiple providers.
+    canonical_id: str = Field(min_length=1)
 
     title: str = Field(
         min_length=1,
@@ -46,6 +63,8 @@ class SearchResult(BaseModel):
         le=1.0,
     )
 
+    provider_metadata: dict[str, Any] = Field(default_factory=dict)
+
 
 class Source(BaseModel):
     """Normalized source content used by evidence extraction."""
@@ -55,6 +74,12 @@ class Source(BaseModel):
     )
 
     source_type: SourceType
+
+    # Identifies which adapter supplied the normalized content.
+    provider: SourceProvider
+
+    # Represents the underlying source independently of application-generated IDs.
+    canonical_id: str = Field(min_length=1)
 
     search_result_ids: list[str] = Field(
         default_factory=list,
@@ -73,5 +98,7 @@ class Source(BaseModel):
     )
 
     retrieved_at: datetime
+
+    provider_metadata: dict[str, Any] = Field(default_factory=dict)
 
 

@@ -47,8 +47,8 @@ const STAGES = {
     research_planner: "Research planning",
     research_query_generator: "Generate search queries",
     research_source_selection: "Prepare selected sources",
-    research_web_search: "Web search",
-    research_source_processor: "Extract web pages",
+    research_web_search: "Search public sources",
+    research_source_processor: "Prepare public sources",
     research_retrieval: "Find relevant passages",
     research_evidence_extractor: "Extract evidence",
     research_coverage_evaluator: "Evaluate coverage",
@@ -73,6 +73,9 @@ const EVENT_TYPES = [
 const TERMINAL = new Set(["completed", "failed"]);
 const STORAGE_KEY = "deep-research:last-job";
 const OWNER_KEY = "deep-research:owner-id";
+const DOCUMENT_SELECTION_ISSUE = "document-selection";
+const FALLBACK_POLL_INITIAL_MS = 5000;
+const FALLBACK_POLL_MAX_MS = 30000;
 
 let jobId = null;
 let jobStartedAt = null;
@@ -87,6 +90,8 @@ let runToken = 0;
 let statusLoading = false;
 let resultShown = false;
 let terminalEventSeen = false;
+let streamAvailable = false;
+let pollDelay = FALLBACK_POLL_INITIAL_MS;
 let collapsedRounds = new Set();
 let previousLatestRound = null;
 let documents = [];
@@ -124,6 +129,26 @@ function sourceMode() {
     return document.querySelector('input[name="source-mode"]:checked')?.value || "web";
 }
 function usesDocuments(mode = sourceMode()) { return mode !== "web"; }
+function setDocumentStatus(message, type = "neutral", issue = "") {
+    ui.documentStatus.textContent = message;
+    ui.documentStatus.dataset.type = type;
+    if (issue) ui.documentStatus.dataset.issue = issue;
+    else delete ui.documentStatus.dataset.issue;
+}
+function clearDocumentSelectionError() {
+    if (ui.documentStatus.dataset.issue === DOCUMENT_SELECTION_ISSUE) {
+        setDocumentStatus(`${documents.length} document${documents.length === 1 ? "" : "s"} available.`);
+    }
+    if (ui.status.dataset.issue === DOCUMENT_SELECTION_ISSUE) {
+        hide(ui.status);
+        delete ui.status.dataset.issue;
+    }
+}
+function replayAttention(element) {
+    element.classList.remove("attention-pulse");
+    void element.offsetWidth; // Restart the animation on repeated invalid submissions.
+    element.classList.add("attention-pulse");
+}
 function formatBytes(value) {
     if (!Number.isFinite(value)) return "Unknown size";
     return value < 1024 * 1024
@@ -147,6 +172,7 @@ function renderDocuments() {
             input.checked
                 ? selectedDocumentIds.add(item.document_id)
                 : selectedDocumentIds.delete(item.document_id);
+            if (selectedDocumentIds.size) clearDocumentSelectionError();
         });
         row.append(
             input,
@@ -157,7 +183,7 @@ function renderDocuments() {
     }
 }
 async function loadDocuments() {
-    ui.documentStatus.textContent = "Loading documents…";
+    setDocumentStatus("Loading documents…");
     try {
         const response = await fetch("/documents", {
             headers: { "X-Owner-Id": ownerId },
@@ -169,16 +195,16 @@ async function loadDocuments() {
             [...selectedDocumentIds].filter(id => availableIds.has(id))
         );
         renderDocuments();
-        ui.documentStatus.textContent = `${documents.length} document${documents.length === 1 ? "" : "s"} available.`;
+        setDocumentStatus(`${documents.length} document${documents.length === 1 ? "" : "s"} available.`);
     } catch (error) {
-        ui.documentStatus.textContent = error instanceof Error ? error.message : "Unable to load documents.";
+        setDocumentStatus(error instanceof Error ? error.message : "Unable to load documents.", "error");
     }
 }
 async function uploadPendingDocuments() {
     const files = [...ui.documentUpload.files];
     if (!files.length) return true;
 
-    ui.documentStatus.textContent = `Uploading ${files.length} document${files.length === 1 ? "" : "s"}…`;
+    setDocumentStatus(`Uploading ${files.length} document${files.length === 1 ? "" : "s"}…`);
     try {
         for (const file of files) {
             const body = new FormData();
@@ -196,7 +222,7 @@ async function uploadPendingDocuments() {
         return true;
     } catch (error) {
         const message = error instanceof Error ? error.message : "Document upload failed.";
-        ui.documentStatus.textContent = message;
+        setDocumentStatus(message, "error");
         showStatus("Document upload failed", message, "error");
         return false;
     }
@@ -204,6 +230,7 @@ async function uploadPendingDocuments() {
 function updateSourceControls() {
     const mode = sourceMode();
     ui.sourceIndicator.textContent = ({ web: "Web research", documents: "Document research", hybrid: "Hybrid research" })[mode];
+    if (!usesDocuments(mode)) clearDocumentSelectionError();
     usesDocuments(mode) ? show(ui.documentPanel) : hide(ui.documentPanel);
     if (usesDocuments(mode) && !documents.length) void loadDocuments();
 }
@@ -218,10 +245,14 @@ function setBusy(busy) {
     busy ? show(ui.spinner) : hide(ui.spinner);
     busy ? hide(ui.statusIcon) : show(ui.statusIcon);
 }
-function showStatus(title, message, type = "neutral") {
+function showStatus(title, message, type = "neutral", issue = "") {
     ui.statusTitle.textContent = title;
     ui.statusMessage.textContent = message;
     ui.status.dataset.type = type;
+    ui.status.setAttribute("role", type === "error" ? "alert" : "status");
+    ui.status.setAttribute("aria-live", type === "error" ? "assertive" : "polite");
+    if (issue) ui.status.dataset.issue = issue;
+    else delete ui.status.dataset.issue;
     show(ui.status);
 }
 function setConnection(text = "") {
@@ -255,9 +286,11 @@ function resetPipeline() {
 }
 function stopNetwork() {
     if (stream) { stream.close(); stream = null; }
-    clearInterval(pollTimer); pollTimer = null;
+    clearTimeout(pollTimer); pollTimer = null;
     clearInterval(elapsedTimer); elapsedTimer = null;
     clearTimeout(streamCloseTimer); streamCloseTimer = null;
+    streamAvailable = false;
+    pollDelay = FALLBACK_POLL_INITIAL_MS;
 }
 function setJobUrl(id) {
     const url = new URL(window.location.href);
@@ -430,11 +463,26 @@ function activityDescription(event) {
         `${event.details?.gap_count ?? "Some"} unresolved research gaps`,
     ];
     if (event.event_type === "research_stopped") return ["Research concluded", event.details?.reason || "Moving to report synthesis"];
-    if (event.event_type === "stage_failed") return [`${stage} failed`, "Stage error"];
+    if (event.event_type === "stage_failed") return [`${stage} failed`, event.details?.reason || "Stage error"];
     if (event.event_type === "stage_started") return [`${stage} started`, event.iteration ? `Round ${event.iteration}` : "Workflow"];
     if (event.event_type === "stage_completed" && event.stage === "research_source_selection") {
         const count = event.details?.document_count || 0;
         return ["Sources prepared", count ? `${count} private document${count === 1 ? "" : "s"} ready` : "Web sources selected"];
+    }
+    if (event.event_type === "stage_completed" && event.stage === "research_web_search") {
+        const count = event.details?.result_count || 0;
+        const providers = Object.entries(event.details?.provider_counts || {})
+            .map(([provider, total]) => `${label(provider)} ${total}`).join(" · ");
+        const notes = [`${count} result${count === 1 ? "" : "s"}`, providers];
+        if (event.details?.web_fallback_activated) notes.push("Brave fallback used");
+        const failures = event.details?.partial_failure_count || 0;
+        if (failures) notes.push(`${failures} provider branch${failures === 1 ? "" : "es"} unavailable`);
+        return ["Public search completed", notes.filter(Boolean).join(" · ")];
+    }
+    if (event.event_type === "stage_completed" && event.stage === "research_source_processor") {
+        const count = event.details?.source_count || 0;
+        const fallback = event.details?.extraction_fallback_count || 0;
+        return ["Public sources prepared", `${count} source${count === 1 ? "" : "s"}${fallback ? ` · Firecrawl fallback ${fallback}` : ""}`];
     }
     if (event.event_type === "stage_completed" && event.stage === "research_retrieval") {
         const web = event.details?.web_chunk_count || 0;
@@ -471,6 +519,8 @@ function ingestEvent(event) {
         showStatus("Writing the report", "Research has concluded. Evidence synthesis and citation checking are next.", "loading");
     } else if (event.event_type === "workflow_completed" || event.event_type === "workflow_failed") {
         terminalEventSeen = true;
+        stopFallbackPolling();
+        streamAvailable = false;
         if (stream) { stream.close(); stream = null; }
         void refreshJobStatus();
     }
@@ -481,7 +531,12 @@ function connectEvents(token) {
     // Start at zero on each page load to reconstruct the full timeline.
     // EventSource handles Last-Event-ID automatically during reconnects.
     stream = new EventSource(`/api/research/jobs/${encodeURIComponent(jobId)}/events?after=0`);
-    stream.addEventListener("open", () => { if (token === runToken) setConnection("● Live events"); });
+    stream.addEventListener("open", () => {
+        if (token !== runToken) return;
+        streamAvailable = true;
+        stopFallbackPolling();
+        setConnection("● Live events");
+    });
     for (const type of EVENT_TYPES) {
         stream.addEventListener(type, message => {
             if (token !== runToken) return;
@@ -492,10 +547,13 @@ function connectEvents(token) {
     stream.addEventListener("error", () => {
         if (token !== runToken) return;
         if (resultShown || terminalEventSeen) {
+            streamAvailable = false;
             if (stream) { stream.close(); stream = null; }
             setConnection("");
         } else {
+            streamAvailable = false;
             setConnection("Reconnecting…");
+            void checkStatusAfterStreamFailure(token);
         }
     });
 }
@@ -514,12 +572,12 @@ async function getStatus(id) {
     return readJson(response);
 }
 async function refreshJobStatus() {
-    if (!jobId || statusLoading) return;
+    if (!jobId || statusLoading) return null;
     const id = jobId;
     statusLoading = true;
     try {
         const snapshot = await getStatus(id);
-        if (id !== jobId) return;
+        if (id !== jobId) return null;
         if (snapshot.created_at) jobStartedAt = parseTimestamp(snapshot.created_at) || jobStartedAt;
         if (snapshot.question && !ui.question.value.trim()) ui.question.value = snapshot.question;
         if (TERMINAL.has(snapshot.status)) {
@@ -528,19 +586,40 @@ async function refreshJobStatus() {
             showStatus(snapshot.status === "queued" ? "Job queued" : "Research in progress",
                 snapshot.status === "queued" ? "Waiting for an available research slot." : "The agent is working through its research pipeline.", "loading");
         }
+        return snapshot;
     } catch (error) {
         if (id === jobId) {
             console.error("Unable to refresh research job:", error);
             setConnection("Status temporarily unavailable");
         }
+        return null;
     } finally { statusLoading = false; }
 }
-function startPolling(token) {
-    clearInterval(pollTimer);
-    pollTimer = setInterval(() => {
-        if (token !== runToken || resultShown) return;
-        void refreshJobStatus();
-    }, 3000);
+function stopFallbackPolling() {
+    clearTimeout(pollTimer);
+    pollTimer = null;
+    pollDelay = FALLBACK_POLL_INITIAL_MS;
+}
+// Status checks are a bounded fallback only while the replayable SSE stream is down.
+function scheduleFallbackPolling(token) {
+    if (pollTimer || streamAvailable || resultShown || terminalEventSeen) return;
+    pollTimer = setTimeout(async () => {
+        pollTimer = null;
+        if (token !== runToken || streamAvailable || resultShown || terminalEventSeen) return;
+        await refreshJobStatus();
+        if (!streamAvailable && !resultShown && !terminalEventSeen) {
+            pollDelay = Math.min(pollDelay * 2, FALLBACK_POLL_MAX_MS);
+            scheduleFallbackPolling(token);
+        }
+    }, pollDelay);
+}
+async function checkStatusAfterStreamFailure(token) {
+    await refreshJobStatus();
+    if (token === runToken && !streamAvailable && !resultShown && !terminalEventSeen) {
+        scheduleFallbackPolling(token);
+    }
+}
+function startElapsedTimer() {
     clearInterval(elapsedTimer);
     elapsedTimer = setInterval(updateElapsed, 1000);
 }
@@ -552,7 +631,7 @@ function showJob(id, token) {
     setBusy(true);
     setConnection("Connecting…");
     showStatus("Connecting to research", "Subscribing to the live workflow timeline.", "loading");
-    startPolling(token);
+    startElapsedTimer();
     connectEvents(token);
 }
 function appendTextItem(parent, text, tag = "li") {
@@ -648,7 +727,7 @@ function renderTerminalJob(job) {
     if (resultShown) return;
     resultShown = true;
     jobEndedAt = parseTimestamp(job.completed_at) || Date.now();
-    clearInterval(pollTimer); pollTimer = null;
+    stopFallbackPolling();
     clearInterval(elapsedTimer); elapsedTimer = null;
     updateElapsed();
     setBusy(false);
@@ -669,11 +748,13 @@ function renderTerminalJob(job) {
     // Keep the stream briefly so a fast terminal status poll cannot drop the
     // last persisted progress events. Restart-recovered jobs may have no terminal event.
     if (terminalEventSeen) {
+        streamAvailable = false;
         if (stream) { stream.close(); stream = null; }
         setConnection("");
     } else {
         clearTimeout(streamCloseTimer);
         streamCloseTimer = setTimeout(() => {
+            streamAvailable = false;
             if (stream) { stream.close(); stream = null; }
             setConnection("");
         }, 3500);
@@ -731,7 +812,6 @@ async function restoreJob(id) {
         ui.question.value = snapshot.question || "";
         updateElapsed();
         if (TERMINAL.has(snapshot.status)) renderTerminalJob(snapshot);
-        else void refreshJobStatus();
     } catch (error) {
         console.warn("Could not restore research job:", error);
         clearSavedJob();
@@ -759,13 +839,20 @@ ui.form.addEventListener("submit", async event => {
     const documentIds = usesDocuments(mode) ? [...selectedDocumentIds] : [];
     if (usesDocuments(mode) && !documentIds.length) {
         setBusy(false);
-        showStatus("Select a document", "Document and hybrid research require at least one uploaded document.", "error");
+        const message = "Select at least one document before starting document or hybrid research.";
+        setDocumentStatus(message, "error", DOCUMENT_SELECTION_ISSUE);
+        showStatus("Select a document", message, "error", DOCUMENT_SELECTION_ISSUE);
+        replayAttention(ui.documentPanel);
+        replayAttention(ui.status);
         return;
     }
     void startResearch(question, mode, documentIds);
 });
 document.querySelectorAll('input[name="source-mode"]').forEach(input => {
     input.addEventListener("change", updateSourceControls);
+});
+ui.documentUpload.addEventListener("change", () => {
+    if (ui.documentUpload.files.length) clearDocumentSelectionError();
 });
 ui.refreshDocuments.addEventListener("click", () => void loadDocuments());
 document.querySelectorAll(".example-chip").forEach(button => {

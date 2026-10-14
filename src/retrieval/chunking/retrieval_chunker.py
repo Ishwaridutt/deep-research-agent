@@ -28,7 +28,7 @@ class RetrievalChunker:
         for document in documents:
             chunks.extend(self.chunk_document(document))
 
-        print('Chunking completed. Total chunks:', len(chunks))
+        print("Chunking completed. Total chunks:", len(chunks))
         if chunks:
             print(
                 "Maximum chunk token count:",

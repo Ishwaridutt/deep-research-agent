@@ -15,6 +15,7 @@ from src.models import (
     ErrorType,
     Evidence,
     ResearchError,
+    ResearchSource,
     ResearchStopReason,
 )
 from src.prompts.writer_prompt import build_writer_messages
@@ -180,6 +181,7 @@ async def writer_synthesis_node(
         research_session_id=state["research_session_id"],
         node="writer_synthesis",
         iteration=state["research"]["iteration_count"],
+        contains_private_data=ResearchSource.DOCUMENTS in state["allowed_sources"],
     )
 
     try:

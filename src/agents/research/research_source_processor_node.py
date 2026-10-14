@@ -6,12 +6,12 @@ import logging
 from datetime import UTC, datetime
 from pprint import pprint
 
-from src.config import Settings
 from src.graph.graph_state import WorkflowState
 from src.guardrails import URLValidationError, url_dedup_key, validate_public_http_url
 from src.models import ErrorType, ResearchError, SearchResult, Source, SourceType
 from src.services import generate_source_id
-from src.tools.extraction import WebExtractionError, WebExtractor
+from src.tools.cleaning import SourceCleaner, SourceCleaningError
+from src.tools.extraction import SourceContentExtractor, SourceExtractionError
 
 
 logger = logging.getLogger(__name__)
@@ -45,6 +45,10 @@ def _merge_search_result_ids(*, source: Source, search_result_ids: list[str]) ->
     return source.model_copy(update={"search_result_ids": merged})
 
 
+def _canonical_key(canonical_id: str) -> str:
+    return f"canonical:{canonical_id.casefold()}"
+
+
 def _seconds_remaining(state: WorkflowState) -> float:
     control = state["research_control"]
     elapsed = (datetime.now(UTC) - control.usage.started_at).total_seconds()
@@ -54,8 +58,8 @@ def _seconds_remaining(state: WorkflowState) -> float:
 async def research_source_processor_node(
     state: WorkflowState,
     *,
-    web_extractor: WebExtractor,
-    settings: Settings,
+    source_extractor: SourceContentExtractor,
+    source_cleaner: SourceCleaner,
 ) -> dict:
     """Validate URLs, extract unique pages, and retain source provenance."""
     print("\nsource processor state:", state)
@@ -72,6 +76,10 @@ async def research_source_processor_node(
     existing_source_indexes = {
         url_dedup_key(source.uri): index for index, source in enumerate(sources)
     }
+    existing_source_indexes.update({
+        _canonical_key(source.canonical_id): index
+        for index, source in enumerate(sources)
+    })
     # Index original discovery URLs too, so redirects remain reusable across rounds.
     results_by_id = {result.id: result for result in research["search_results"]}
     for index, source in enumerate(sources):
@@ -93,22 +101,30 @@ async def research_source_processor_node(
             "iteration": target_iteration,
         },
     )
-    print("\nsource processor iteration result:")
-    print(json.dumps([result.model_dump() for result in iteration_results], indent=2))
-    print("\nsource processor grouped_results:")
+    print("\nsource processor iteration results:")
+    print(json.dumps(
+        [result.model_dump(mode="json") for result in iteration_results],
+        indent=2,
+    ))
+    print("\nsource processor grouped results:")
     for url, results in grouped_results.items():
-        print(f"\n{'=' * 80}")
-        print(f"URL: {url}")
-        print("=" * 80)
-        pprint([result.model_dump() for result in results], width=120, sort_dicts=False)
-    print("\nsource processor existing_source_indexes result:", existing_source_indexes)
+        print(f"\n{'=' * 80}\nURL: {url}\n{'=' * 80}")
+        pprint(
+            [result.model_dump(mode="json") for result in results],
+            width=120,
+            sort_dicts=False,
+        )
+    print("\nsource processor existing source indexes:", existing_source_indexes)
 
     for url_key, search_results in grouped_results.items():
         representative_result = search_results[0]
         search_result_ids = [result.id for result in search_results]
+        canonical_key = _canonical_key(representative_result.canonical_id)
 
         # Reuse previously extracted pages without spending extraction budget.
-        existing_index = existing_source_indexes.get(url_key)
+        existing_index = existing_source_indexes.get(canonical_key)
+        if existing_index is None:
+            existing_index = existing_source_indexes.get(url_key)
         if existing_index is not None:
             sources[existing_index] = _merge_search_result_ids(
                 source=sources[existing_index], search_result_ids=search_result_ids
@@ -149,8 +165,10 @@ async def research_source_processor_node(
         # Count failed and timed-out extraction calls against the page budget.
         page_attempts += 1
         try:
-            extracted_page = await asyncio.wait_for(
-                web_extractor.extract(url=validated_url),
+            extracted_source = await asyncio.wait_for(
+                source_extractor.extract(search_result=representative_result.model_copy(
+                    update={"url": validated_url},
+                )),
                 timeout=seconds_remaining,
             )
         except TimeoutError:
@@ -162,8 +180,8 @@ async def research_source_processor_node(
                 recoverable=True,
             ))
             break
-        except WebExtractionError as exc:
-            print("source_extraction_failed", exc)
+        except SourceExtractionError as exc:
+            print("source extraction failed:", exc)
             logger.warning(
                 "Webpage extraction failed.",
                 extra={
@@ -184,7 +202,7 @@ async def research_source_processor_node(
             continue
 
         try:
-            extracted_url = validate_public_http_url(extracted_page.url)
+            extracted_url = validate_public_http_url(extracted_source.url)
         except URLValidationError as exc:
             errors.append(ResearchError(
                 error_type=ErrorType.VALIDATION,
@@ -197,31 +215,62 @@ async def research_source_processor_node(
         extracted_key = url_dedup_key(extracted_url)
 
         # Redirects may resolve to a source already extracted in this or an earlier round.
-        redirected_index = existing_source_indexes.get(extracted_key)
+        redirected_index = existing_source_indexes.get(canonical_key)
+        if redirected_index is None:
+            redirected_index = existing_source_indexes.get(extracted_key)
         if redirected_index is not None:
             sources[redirected_index] = _merge_search_result_ids(
                 source=sources[redirected_index], search_result_ids=search_result_ids
             )
             existing_source_indexes[url_key] = redirected_index
+            existing_source_indexes[canonical_key] = redirected_index
             continue
 
-        # Preserve full page content; retrieval will select relevant passages.
-        extracted_content = extracted_page.content.strip()
-        if not extracted_content:
+        try:
+            cleaned = source_cleaner.clean(
+                extracted_source.content,
+                content_format=extracted_source.content_format,
+            )
+        except SourceCleaningError as exc:
+            print("source cleaning failed:", exc)
+            errors.append(ResearchError(
+                error_type=ErrorType.EXTRACTION,
+                component="source_cleaner",
+                message=str(exc),
+                recoverable=True,
+            ))
             continue
+
+        print("Cleaned source:", {
+            "version": cleaned.version,
+            "original_chars": cleaned.original_chars,
+            "cleaned_chars": cleaned.cleaned_chars,
+            "truncated": cleaned.truncated,
+        })
 
         source = Source(
             id=generate_source_id(),
             source_type=SourceType.WEB,
+            provider=representative_result.provider,
+            canonical_id=representative_result.canonical_id,
             search_result_ids=search_result_ids,
             title=representative_result.title,
             uri=extracted_url,
-            content=extracted_content,
+            content=cleaned.content,
             retrieved_at=datetime.now(UTC),
+            provider_metadata={
+                **representative_result.provider_metadata,
+                **extracted_source.provider_metadata,
+                "cleaner_version": cleaned.version,
+                "original_char_count": cleaned.original_chars,
+                "cleaned_char_count": cleaned.cleaned_chars,
+                "content_truncated": cleaned.truncated,
+            },
         )
         sources.append(source)
         existing_source_indexes[extracted_key] = len(sources) - 1
         existing_source_indexes[url_key] = len(sources) - 1
+        existing_source_indexes[canonical_key] = len(sources) - 1
 
     updated_usage = control.usage.model_copy(update={"page_extraction_attempts": page_attempts})
     updated_control = control.model_copy(update={"usage": updated_usage})
