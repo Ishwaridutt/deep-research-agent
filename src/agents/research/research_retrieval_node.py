@@ -1,6 +1,7 @@
 """Retrieve web and private-document context for the current research round."""
 
 import asyncio
+import json
 import logging
 from datetime import UTC, datetime
 
@@ -142,6 +143,18 @@ async def research_retrieval_node(
 ) -> dict:
     """Retrieve selected source types while keeping their results separate."""
 
+    logger.info(
+        "Research retrieval started.",
+        extra={
+            "event": "research_retrieval_started",
+            "job_id": state["job_id"],
+            "research_session_id": state["research_session_id"],
+            "node": "research_retrieval",
+            "iteration": state["research"]["iteration_count"] + 1,
+            "allowed_sources": state["allowed_sources"]
+        },
+    )
+
     iteration_queries = _iteration_queries(state)
     requests = _retrieval_requests(state, iteration_queries)
     allowed_sources = state["allowed_sources"]
@@ -156,7 +169,8 @@ async def research_retrieval_node(
                 await asyncio.to_thread(web_session.build, documents)
                 web_results = await _retrieve(web_session, requests)
             finally:
-                web_session.clear()
+                # web_session.clear()
+                pass
 
     if ResearchSource.DOCUMENTS in allowed_sources:
         resources = config.get("configurable", {}).get("job_resources")
@@ -182,9 +196,42 @@ async def research_retrieval_node(
             "node": "research_retrieval",
             "iteration": state["research"]["iteration_count"] + 1,
             "web_result_count": len(web_results),
-            "document_result_count": len(document_results),
+            "document_count": len(document_results),
         },
     )
+
+    print("\nretrieval doc source result: ", len(sources))
+    # print(
+    #     json.dumps(
+    #         {
+    #             "sources": [
+    #                 {
+    #                     **source.model_dump(
+    #                         mode="json",
+    #                         include={
+    #                             "id",
+    #                             "source_type",
+    #                             "provider",
+    #                             "canonical_id",
+    #                             "search_result_ids",
+    #                             "title",
+    #                             "uri",
+    #                             "retrieved_at",
+    #                             "provider_metadata",
+    #                         },
+    #                     ),
+    #                     "content_length": len(source.content),
+    #                 }
+    #                 for source in sources
+    #             ],
+    #             "total_content_length": sum(
+    #                 len(source.content) for source in sources
+    #             ),
+    #         },
+    #         indent=2,
+    #         ensure_ascii=False,
+    #     )
+    # )
 
     return {
         "research": {

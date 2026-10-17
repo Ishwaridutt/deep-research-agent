@@ -48,6 +48,7 @@ class RetrievalHybridRetriever:
         if not chunks:
             return
 
+        print('Hybrid retriever building in-memory vector store started...')
         # Convert domain chunks once so both lexical and semantic retrieval operate over the exact same corpus.
         documents = [self._to_langchain_document(chunk) for chunk in chunks]
         self.chunk_lookup = {chunk.chunk_id: chunk for chunk in chunks}
@@ -68,6 +69,7 @@ class RetrievalHybridRetriever:
             c=self.rrf_c,
             id_key="chunk_id",
         )
+        print('Hybrid retriever building in-memory vector store completed...')
 
     def search(self, query: str, top_k: int | None = None) -> list[RetrievedChunk]:
         """Returns hybrid-ranked chunks for a query."""
@@ -102,6 +104,7 @@ class RetrievalHybridRetriever:
         self.retriever = None
         self.vector_store = None
         self.chunk_lookup = {}
+        print('Hybrid retriever in-memory vector store cleared...')
 
     def _to_langchain_document(self, chunk: RetrievalChunk) -> Document:
         """Converts a retrieval chunk into the searchable LangChain representation."""

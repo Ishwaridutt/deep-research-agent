@@ -10,6 +10,13 @@ from src.tools.search.base import SearchProvider, SearchProviderError
 
 
 _ARXIV_VERSION = re.compile(r"v\d+$", re.IGNORECASE)
+_TOKEN = re.compile(r"[a-z0-9]{2,}")
+_YEAR = re.compile(r"\b(?:19|20)\d{2}\b")
+_SEARCH_STOPWORDS = {
+    "about", "after", "and", "before", "for", "from", "how", "into",
+    "latest", "of", "on", "or", "the", "to", "what", "when", "which",
+    "who", "why", "with",
+}
 
 
 class ParallelSearchProvider(SearchProvider):
@@ -58,6 +65,11 @@ class ParallelSearchProvider(SearchProvider):
             )
 
         deduplicated = deduplicate_search_results(results)
+        selected = sorted(
+            deduplicated,
+            key=lambda result: _result_rank(result, search_query.query),
+            reverse=True,
+        )[:max_results]
         successful_branches = [
             name for name, _, error in outcomes if error is None
         ]
@@ -70,22 +82,22 @@ class ParallelSearchProvider(SearchProvider):
         }
         # Attach only safe branch-level diagnostics so the graph can report
         # partial progress without retaining errors or provider responses.
-        deduplicated = [
+        selected = [
             result.model_copy(update={
                 "provider_metadata": {
                     **result.provider_metadata,
                     "search_diagnostics": diagnostics,
                 },
             })
-            for result in deduplicated
+            for result in selected
         ]
         print(
-            "Parallel search completed:",
+            "\nParallel search completed:",
             f"query={search_query.id}",
-            f"results={len(deduplicated)}",
+            f"results={len(selected)}",
             f"failed_branches={failures}",
         )
-        return deduplicated
+        return selected
 
     async def _search_branch(
         self,
@@ -140,6 +152,48 @@ def deduplicate_search_results(
             groups.remove(duplicate)
 
     return [_merge_group(group_results) for _, group_results in groups]
+
+
+def _result_rank(result: SearchResult, query: str) -> tuple[float, float, int]:
+    """Rank provider-neutral results by query fit, score, and corroboration."""
+    query_tokens = _search_tokens(query)
+    title_overlap = _overlap(query_tokens, _search_tokens(result.title))
+    snippet_overlap = _overlap(query_tokens, _search_tokens(result.snippet or ""))
+    provenance = result.provider_metadata.get("discovery_provenance", [])
+    provider_scores = [result.provider_score, *(
+        item.get("provider_score") for item in provenance if isinstance(item, dict)
+    )]
+    provider_score = max(
+        (score for score in provider_scores if isinstance(score, (int, float))),
+        default=0.0,
+    )
+    provenance_count = len(provenance)
+    query_years = set(_YEAR.findall(query))
+    source_dates = " ".join(str(result.provider_metadata.get(key) or "") for key in (
+        "published_at", "updated_at", "last_edited_at",
+    ))
+    temporal_match = 0.3 if query_years & set(_YEAR.findall(source_dates)) else 0.0
+    combined = (
+        (3.0 * title_overlap)
+        + (1.5 * snippet_overlap)
+        + (1.5 * provider_score)
+        + (0.25 * min(max(provenance_count - 1, 0), 2))
+        + temporal_match
+    )
+    return combined, provider_score, provenance_count
+
+
+def _search_tokens(value: str) -> set[str]:
+    return {
+        token for token in _TOKEN.findall(value.casefold())
+        if token not in _SEARCH_STOPWORDS
+    }
+
+
+def _overlap(expected: set[str], actual: set[str]) -> float:
+    if not expected:
+        return 0.0
+    return len(expected & actual) / len(expected)
 
 
 def _merge_group(results: list[SearchResult]) -> SearchResult:

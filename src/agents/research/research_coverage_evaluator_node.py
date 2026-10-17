@@ -1,6 +1,7 @@
 """Research coverage and evidence quality evaluation node."""
 
 import logging
+from datetime import UTC, datetime
 
 from src.graph.graph_state import WorkflowState
 from src.llm import (
@@ -387,15 +388,14 @@ async def research_coverage_evaluator_node(
 
     # Skip the LLM only when no subquestion has any evidence.
     if not any(grouped_evidence.values()):
-        coverage = _build_missing_evidence_coverage(
-            subquestions
-        )
-
+        coverage = _build_missing_evidence_coverage(subquestions)
     else:
         messages = build_coverage_evaluator_messages(
             original_question=state["question"],
             subquestions=subquestions,
             evidence_by_subquestion=grouped_evidence,
+            current_date=datetime.now(UTC).date().isoformat(),
+            previous_coverage=state["research"]["coverage"],
         )
 
         metadata = LLMCallMetadata(
@@ -406,6 +406,9 @@ async def research_coverage_evaluator_node(
             contains_private_data=ResearchSource.DOCUMENTS in state["allowed_sources"],
         )
 
+        print('\ncoverage eval prompt--------->')
+        print(messages)
+
         try:
             raw_coverage = await llm_service.invoke_structured(
                 role=LLMRole.COVERAGE_EVALUATOR,
@@ -415,6 +418,7 @@ async def research_coverage_evaluator_node(
             )
 
         except LLMServiceError as exc:
+            print("Error in coverage eval: ", exc)
             logger.exception(
                 "Research coverage evaluation failed."
             )
@@ -424,12 +428,17 @@ async def research_coverage_evaluator_node(
                 iteration=iteration,
                 message=str(exc),
             )
+        print('\n raw coverage eval response: ')
+        print(raw_coverage)
 
         coverage = _normalize_coverage_result(
             coverage=raw_coverage,
             subquestions=subquestions,
             evidence_by_subquestion=grouped_evidence,
         )
+
+        print('\n coverage eval response: ')
+        print(coverage)
 
     logger.info(
         "Research coverage evaluation completed.",

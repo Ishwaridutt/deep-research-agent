@@ -12,11 +12,17 @@ def finalize_research_report(
     report: Any,
     evidence_by_id: dict[str, Any],
     sources_by_id: dict[str, Any],
+    research_question: str | None = None,
+    stop_reason: Any = None,
 ) -> str:
     """Render the final validated report into Markdown."""
 
     try:
-        rendered = render_markdown_report(report)
+        rendered = render_markdown_report(
+            report,
+            research_question=research_question,
+            stop_reason=stop_reason,
+        )
     except Exception as exc:
         raise ReportRenderingError(
             f"Failed to render final report: {exc}"
@@ -30,7 +36,12 @@ def finalize_research_report(
     return rendered
 
 
-def render_markdown_report(report: Any) -> str:
+def render_markdown_report(
+    report: Any,
+    *,
+    research_question: str | None = None,
+    stop_reason: Any = None,
+) -> str:
     """Convert the final report payload into Markdown."""
 
     if report is None:
@@ -43,21 +54,73 @@ def render_markdown_report(report: Any) -> str:
         report = report.model_dump()
 
     if isinstance(report, dict):
-        return _render_dict_report(report)
+        return _render_dict_report(
+            report,
+            research_question=research_question,
+            stop_reason=stop_reason,
+        )
 
     return str(report).strip()
 
 
 def _render_dict_report(
     report: dict[str, Any],
+    *,
+    research_question: str | None = None,
+    stop_reason: Any = None,
 ) -> str:
     """Render a dictionary-based report as Markdown."""
 
-    sections: list[str] = []
+    title = report.get("title") or "Deep Research Report"
+    sections: list[str] = [f"# {title}"]
 
-    title = report.get("title")
-    if title:
-        sections.append(f"# {title}")
+    if research_question:
+        sections.append(
+            "## Research Question\n\n"
+            + research_question.strip()
+        )
+
+    executive_summary = report.get("executive_summary")
+    if executive_summary:
+        sections.append(
+            "## Executive Summary\n\n"
+            + str(executive_summary).strip()
+        )
+
+    findings = report.get("findings")
+    if findings:
+        rendered_findings = []
+        for finding in findings:
+            if hasattr(finding, "model_dump"):
+                finding = finding.model_dump()
+            if not isinstance(finding, dict):
+                continue
+            rendered_findings.append(
+                f"### {finding.get('title', 'Finding')}\n\n"
+                f"{str(finding.get('content', '')).strip()}"
+            )
+        if rendered_findings:
+            sections.append(
+                "## Detailed Analysis\n\n"
+                + "\n\n".join(rendered_findings)
+            )
+
+    limitations = report.get("limitations")
+    if limitations:
+        sections.append(
+            "## Evidence Gaps and Limitations\n\n"
+            + "\n".join(f"- {item}" for item in limitations)
+        )
+
+    approach = _render_research_approach(
+        finding_count=len(findings or []),
+        source_count=len(report.get("sources") or []),
+        stop_reason=stop_reason,
+    )
+    sections.insert(
+        3 if research_question else 2,
+        "## Research Approach\n\n" + approach,
+    )
 
     summary = report.get("summary")
     if summary:
@@ -76,9 +139,7 @@ def _render_dict_report(
     sources = report.get("sources")
 
     if sources:
-        sources_markdown = _render_sources(
-            sources
-        )
+        sources_markdown = _render_sources(sources)
 
         if sources_markdown:
             sections.append(
@@ -90,6 +151,51 @@ def _render_dict_report(
         return "\n\n".join(sections).strip()
 
     return str(report).strip()
+
+
+def _render_research_approach(
+    *,
+    finding_count: int,
+    source_count: int,
+    stop_reason: Any,
+) -> str:
+    """Summarize report scope and the reason the research loop stopped."""
+
+    finding_label = "finding" if finding_count == 1 else "findings"
+    source_label = "source" if source_count == 1 else "sources"
+    text = (
+        f"This report synthesizes {finding_count} citation-validated {finding_label} "
+        f"from {source_count} referenced {source_label}."
+    )
+    reason = getattr(stop_reason, "value", stop_reason)
+    status_messages = {
+        "coverage_sufficient": "The planned evidence coverage was satisfied.",
+        "max_iterations": (
+            "The configured research-round limit was reached; unresolved evidence "
+            "gaps are disclosed below."
+        ),
+        "query_budget_exhausted": (
+            "The search-query budget was reached; unresolved evidence gaps are "
+            "disclosed below."
+        ),
+        "extraction_budget_exhausted": (
+            "The source-extraction budget was reached; unresolved evidence gaps "
+            "are disclosed below."
+        ),
+        "time_budget_exhausted": (
+            "The research time budget was reached; unresolved evidence gaps are "
+            "disclosed below."
+        ),
+        "no_evidence_improvement": (
+            "Research stopped after an additional round produced no meaningful "
+            "evidence improvement."
+        ),
+        "no_actionable_gaps": (
+            "Research stopped because no unresolved gap had an actionable search target."
+        ),
+    }
+    status = status_messages.get(reason)
+    return f"{text} {status}" if status else text
 
 
 def _render_sources(
@@ -108,10 +214,10 @@ def _render_sources(
 
     rendered_sources: list[str] = []
 
-    for source in sources:
+    for index, source in enumerate(sources, start=1):
         if isinstance(source, str):
             rendered_sources.append(
-                f"- {source}"
+                f"{index}. {source}"
             )
             continue
 
@@ -122,25 +228,26 @@ def _render_sources(
             title = (
                 source.get("title")
                 or source.get("name")
+                or source.get("uri")
                 or source.get("url")
                 or "Source"
             )
 
-            url = source.get("url")
+            url = source.get("uri") or source.get("url")
 
-            if url:
+            if isinstance(url, str) and url.startswith(("http://", "https://")):
                 rendered_sources.append(
-                    f"- [{title}]({url})"
+                    f"{index}. [{title}]({url})"
                 )
             else:
                 rendered_sources.append(
-                    f"- {title}"
+                    f"{index}. {title}"
                 )
 
             continue
 
         rendered_sources.append(
-            f"- {source}"
+            f"{index}. {source}"
         )
 
     return "\n".join(rendered_sources)

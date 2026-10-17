@@ -43,6 +43,7 @@ class BraveSearchProvider(SearchProvider):
         if self._api_version:
             headers["Api-Version"] = self._api_version
         try:
+            print('Starting Brave search for query: ', search_query.query)
             response = await self._client.get(
                 self._api_url,
                 params={

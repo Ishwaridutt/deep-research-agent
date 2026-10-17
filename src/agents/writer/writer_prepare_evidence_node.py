@@ -52,10 +52,11 @@ def _evidence_fits_budget(
 ) -> bool:
     """Returns whether an Evidence item fits within the Writer context budget."""
 
-    return (
-        selected_count < max_items
-        and used_chars + len(evidence.content) <= max_chars
-    )
+    return True
+    # return (
+    #     selected_count < max_items
+    #     and used_chars + len(evidence.content) <= max_chars
+    # )
 
 
 def _select_writer_evidence(

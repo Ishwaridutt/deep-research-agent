@@ -41,6 +41,7 @@ class ArxivSearchProvider(SearchProvider):
         max_results: int,
     ) -> list[SearchResult]:
         try:
+            print('Starting Arxiv search for query: ', search_query.query)
             response = await self._client.get(
                 self._api_url,
                 params={
@@ -66,7 +67,7 @@ class ArxivSearchProvider(SearchProvider):
         ][:max_results]
 
         print(
-            "arXiv search completed:",
+            "\narXiv search completed:",
             f"query={search_query.id}",
             f"results={len(results)}",
         )

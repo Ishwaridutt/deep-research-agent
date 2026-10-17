@@ -9,6 +9,8 @@ from types import SimpleNamespace
 import pytest
 
 from src.config.settings import DocumentSettings
+from src.documents import document_parser as document_parser_module
+from src.documents.document_parser import DocumentParser
 from src.documents.document_registry import DocumentRegistry
 from src.models.document_models import (
     DocumentFormat,
@@ -174,6 +176,32 @@ def create_service(
     )
 
 
+def test_pdf_parser_skips_whitespace_only_pages(monkeypatch):
+    """Do not construct invalid empty blocks after PDF text normalization."""
+
+    class Page:
+        def __init__(self, text):
+            self.text = text
+
+        def extract_text(self):
+            return self.text
+
+    class Reader:
+        pages = [Page(" \n\t "), Page(None), Page("  useful text  ")]
+
+    monkeypatch.setattr(document_parser_module, "PdfReader", lambda path: Reader())
+
+    parsed = DocumentParser().parse(
+        document_id="document-1",
+        path=Path("document.pdf"),
+        document_format=DocumentFormat.PDF,
+    )
+
+    assert [block.text for block in parsed.blocks] == ["useful text"]
+    assert parsed.blocks[0].location.page_start == 3
+    assert parsed.blocks[0].location.page_end == 3
+
+
 def test_upload_only_saves_file_and_metadata():
     """Defer parsing and retrieval work until a research job selects the file."""
 
@@ -227,6 +255,47 @@ def test_document_service_lists_only_owner_documents_newest_first():
             "newer",
             "older",
         ]
+
+    asyncio.run(run())
+
+
+def test_document_service_rejects_stale_document_selection_before_processing():
+    """Detect missing metadata or source files without parsing or indexing."""
+
+    async def run() -> None:
+        registry = DocumentRegistry()
+        document = create_document_record()
+        await registry.save_document(document)
+        parser = FakeParser()
+        service = create_service(registry=registry, parser=parser)
+
+        await service.validate_documents_available(
+            document.owner_id,
+            [document.document_id],
+        )
+
+        with pytest.raises(ValueError, match="no longer available"):
+            await service.validate_documents_available(
+                document.owner_id,
+                ["missing-document"],
+            )
+
+        class MissingFileStore(FakeFileStore):
+            def get_path(self, *, storage_key: str) -> None:
+                return None
+
+        missing_file_service = create_service(
+            registry=registry,
+            parser=parser,
+            file_store=MissingFileStore(),
+        )
+        with pytest.raises(ValueError, match="no longer available"):
+            await missing_file_service.validate_documents_available(
+                document.owner_id,
+                [document.document_id],
+            )
+
+        assert parser.parse_calls == []
 
     asyncio.run(run())
 

@@ -127,6 +127,7 @@ def _create_research_service(
         settings=settings,
         job_store=job_store,
         llm_service=llm_service,
+        document_service=document_service,
     )
 
 

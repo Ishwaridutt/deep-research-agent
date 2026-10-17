@@ -16,17 +16,22 @@ class ResearchBudget(BaseModel):
     )
 
     max_search_queries: int = Field(
-        default=12,
+        default=30,
         ge=1,
     )
 
     max_extracted_pages: int = Field(
-        default=25,
+        default=60,
+        ge=1,
+    )
+
+    max_extracted_pages_per_round: int = Field(
+        default=20,
         ge=1,
     )
 
     max_research_seconds: float = Field(
-        default=180.0,
+        default=600.0,
         gt=0,
     )
 

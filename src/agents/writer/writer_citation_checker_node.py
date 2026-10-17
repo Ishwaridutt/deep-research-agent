@@ -1,6 +1,7 @@
 """Writer Citation Checker node."""
 
 import logging
+import re
 
 from src.graph.graph_state import WorkflowState
 from src.llm import (
@@ -15,6 +16,7 @@ from src.models import (
     DraftReport,
     ErrorType,
     Evidence,
+    FinalReportFinding,
     ReportFinding,
     ReportSource,
     ResearchError,
@@ -29,6 +31,9 @@ from src.prompts.citation_checker_prompt import (
 
 
 logger = logging.getLogger(__name__)
+
+_EVIDENCE_CITATION_PATTERN = re.compile(r"\[([^\[\]]+)\]")
+_SOURCE_CITATION_GROUP_PATTERN = re.compile(r"(?:\[\d+\])+")
 
 
 def _validate_finding_references(
@@ -178,13 +183,21 @@ def _build_report_sources(
     findings: list[ReportFinding],
     evidence_by_id: dict[str, Evidence],
     sources_by_id: dict[str, Source],
+    additional_evidence_ids: list[str] | None = None,
 ) -> list[ReportSource]:
-    """Builds source metadata used by the final supported findings."""
+    """Builds source metadata used by the final report."""
 
+    referenced_evidence_ids = dict.fromkeys([
+        *(
+            evidence_id
+            for finding in findings
+            for evidence_id in finding.evidence_ids
+        ),
+        *(additional_evidence_ids or []),
+    ])
     referenced_evidence = [
         evidence_by_id[evidence_id]
-        for finding in findings
-        for evidence_id in finding.evidence_ids
+        for evidence_id in referenced_evidence_ids
         if evidence_id in evidence_by_id
     ]
     source_ids = list(dict.fromkeys(
@@ -232,6 +245,80 @@ def _build_report_sources(
     return report_sources
 
 
+def _extract_evidence_ids(texts: list[str]) -> list[str]:
+    """Returns known-looking inline evidence references in first-use order."""
+
+    return list(dict.fromkeys(
+        match.group(1)
+        for text in texts
+        for match in _EVIDENCE_CITATION_PATTERN.finditer(text)
+        if match.group(1).startswith("EV-")
+    ))
+
+
+def _render_source_citations(
+    text: str,
+    *,
+    evidence_by_id: dict[str, Evidence],
+    source_number_by_id: dict[str, int],
+) -> str:
+    """Converts internal evidence citations into final source-list numbers."""
+
+    def replace_evidence_id(match: re.Match[str]) -> str:
+        evidence_id = match.group(1)
+        evidence = evidence_by_id.get(evidence_id)
+
+        if evidence is None:
+            return "" if evidence_id.startswith("EV-") else match.group(0)
+
+        source_number = source_number_by_id.get(evidence.source_id)
+        return f"[{source_number}]" if source_number is not None else ""
+
+    rendered = _EVIDENCE_CITATION_PATTERN.sub(replace_evidence_id, text)
+
+    # Several evidence items can point to the same source; show it only once.
+    def deduplicate_group(match: re.Match[str]) -> str:
+        numbers = dict.fromkeys(re.findall(r"\d+", match.group(0)))
+        return "".join(f"[{number}]" for number in numbers)
+
+    return _SOURCE_CITATION_GROUP_PATTERN.sub(deduplicate_group, rendered).strip()
+
+
+def _build_user_facing_report_content(
+    *,
+    findings: list[ReportFinding],
+    limitations: list[str],
+    sources: list[ReportSource],
+    evidence_by_id: dict[str, Evidence],
+) -> tuple[list[FinalReportFinding], list[str]]:
+    """Hides internal IDs and links claims to the ordered source list."""
+
+    source_number_by_id = {
+        source.source_id: index
+        for index, source in enumerate(sources, start=1)
+    }
+    final_findings = [
+        FinalReportFinding(
+            title=finding.title,
+            content=_render_source_citations(
+                finding.content,
+                evidence_by_id=evidence_by_id,
+                source_number_by_id=source_number_by_id,
+            ),
+        )
+        for finding in findings
+    ]
+    final_limitations = [
+        _render_source_citations(
+            limitation,
+            evidence_by_id=evidence_by_id,
+            source_number_by_id=source_number_by_id,
+        )
+        for limitation in limitations
+    ]
+    return final_findings, final_limitations
+
+
 def _with_citation_limitation(
     limitations: list[str],
     *,
@@ -259,8 +346,14 @@ def _build_no_supported_findings_report(
     *,
     draft_report: DraftReport,
     issues: list[CitationIssue],
+    evidence_by_id: dict[str, Evidence],
 ) -> ResearchReport:
     """Builds a fail-closed report when no finding survives citation validation."""
+
+    limitations = _with_citation_limitation(
+        draft_report.limitations,
+        issues=issues,
+    )
 
     return ResearchReport(
         executive_summary=(
@@ -268,10 +361,14 @@ def _build_no_supported_findings_report(
             "could be included in the final report after citation validation."
         ),
         findings=[],
-        limitations=_with_citation_limitation(
-            draft_report.limitations,
-            issues=issues,
-        ),
+        limitations=[
+            _render_source_citations(
+                limitation,
+                evidence_by_id=evidence_by_id,
+                source_number_by_id={},
+            )
+            for limitation in limitations
+        ],
         sources=[],
     )
 
@@ -345,6 +442,7 @@ async def writer_citation_checker_node(
         final_report = _build_no_supported_findings_report(
             draft_report=draft_report,
             issues=deterministic_issues,
+            evidence_by_id=evidence_by_id,
         )
 
         return {
@@ -428,21 +526,31 @@ async def writer_citation_checker_node(
         final_report = _build_no_supported_findings_report(
             draft_report=draft_report,
             issues=all_issues,
+            evidence_by_id=evidence_by_id,
         )
 
     else:
+        limitations = _with_citation_limitation(
+            draft_report.limitations,
+            issues=all_issues,
+        )
+        report_sources = _build_report_sources(
+            findings=supported_findings,
+            evidence_by_id=evidence_by_id,
+            sources_by_id=sources_by_id,
+            additional_evidence_ids=_extract_evidence_ids(limitations),
+        )
+        final_findings, final_limitations = _build_user_facing_report_content(
+            findings=supported_findings,
+            limitations=limitations,
+            sources=report_sources,
+            evidence_by_id=evidence_by_id,
+        )
         final_report = ResearchReport(
             executive_summary=semantic_output.revised_executive_summary.strip(),
-            findings=supported_findings,
-            limitations=_with_citation_limitation(
-                draft_report.limitations,
-                issues=all_issues,
-            ),
-            sources=_build_report_sources(
-                findings=supported_findings,
-                evidence_by_id=evidence_by_id,
-                sources_by_id=sources_by_id,
-            ),
+            findings=final_findings,
+            limitations=final_limitations,
+            sources=report_sources,
         )
 
     logger.info(

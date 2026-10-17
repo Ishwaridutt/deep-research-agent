@@ -80,35 +80,43 @@ The project addresses a common failure mode in research assistants: sending larg
 | Live updates | Server-Sent Events |
 | Frontend | Framework-free HTML, CSS, and JavaScript |
 | Testing | pytest with fake providers and offline dependencies |
-| Observability | Structured JSON logging and optional LangSmith tracing |
+| Observability | Structured JSON logging with job, session, node, iteration, role, and provider metadata |
 
 ## Architecture
+
+The architecture below reflects the registered graph, state schema, service composition, and runtime resource lifetimes in the current source.
 
 ### System Overview
 
 ```mermaid
 flowchart LR
+    Entry[src.server:app = create_app]
     User[Browser or API client]
     API[FastAPI routes]
-    Service[ResearchService]
-    Graph[Compiled LangGraph]
+    Service[ResearchService preflight and job lifecycle]
+    Invoke{Execution mode}
+    Graph[14-node compiled LangGraph]
     Providers[Search, extraction, and LLM providers]
-    Retrieval[Shared retrieval components]
-    Store[(SQLite job and event store)]
+    Retrieval[Shared retrieval implementation]
+    JobResources[Job-owned private retrieval session]
+    Store[(SQLite jobs and events)]
     Uploads[(Local uploaded files)]
-    UI[Replayable SSE timeline]
+    UI[SSE timeline with status fallback]
 
+    Entry --> API
     User -->|Create job or upload file| API
     API --> Service
-    Service -->|One graph execution per job| Graph
+    Service -->|Validate selected documents before LLM work| Invoke
+    Invoke -->|Synchronous graph.ainvoke| Graph
+    Invoke -->|Persisted graph.astream_events| Graph
     Graph --> Providers
     Graph --> Retrieval
+    Graph --> JobResources
     Graph --> Uploads
     Service --> Store
     Graph -->|Sanitized lifecycle events| Store
-    Store -->|Status and final result| API
-    Store -->|Event replay and live stream| UI
-    UI --> User
+    Store -->|Status, replay, and final result| API
+    API --> UI --> User
 ```
 
 ### Composition and Dependency Flow
@@ -129,6 +137,8 @@ flowchart LR
 
 This keeps provider construction out of graph nodes. Nodes depend on small application-owned interfaces, which makes them easier to test with fakes.
 
+Only the upload-facing `DocumentService` is stored in `app.state`. Retrieval sessions are created per job or per public retrieval round and reach graph nodes through injected dependencies and `RunnableConfig`, not global application state.
+
 ### Code Request Flow
 
 ```mermaid
@@ -142,9 +152,10 @@ sequenceDiagram
 
     B->>R: POST /api/research/jobs
     R->>S: start_job(question, source_selection)
+    S->>S: Validate selected document availability
     S->>DB: Insert queued job
     S-->>B: 202 + job_id
-    S->>G: Start background graph execution
+    S->>G: run_graph_with_events(state, job_resources)
     G->>P: Node lifecycle events
     P->>DB: Persist sanitized event
     B->>R: GET /events (SSE)
@@ -152,6 +163,7 @@ sequenceDiagram
     DB-->>B: stage_started / completed / failed
     G-->>S: Final WorkflowState
     S->>DB: Atomically store result + terminal event
+    S->>S: Clear job resources and LLM provider state
     B->>R: GET /status/{job_id}
     R->>DB: Read terminal job
     DB-->>B: Final structured report
@@ -201,14 +213,14 @@ Hybrid mode follows the public-search branch, but `research_source_selection` al
 | `input_guardrail` | Invalid questions or incomplete source selections should fail before provider calls. | Validates question length, allowed sources, owner identity, and document selection. |
 | `research_planner` | A broad question needs a research plan. | Uses structured LLM output to create bounded subquestions and objectives. |
 | `research_query_generator` | Each objective needs searchable wording. | Creates initial queries or gap-focused follow-up queries and applies job query limits. |
-| `research_source_selection` | Source modes need different runtime resources. | Authorizes selected documents, builds one job-scoped document retrieval session, and routes web/hybrid versus document-only work. |
+| `research_source_selection` | Source modes need different runtime resources. | Authorizes selected documents and builds one job-scoped document retrieval session. `route_after_source_selection` chooses the public-search or document-only edge. |
 | `research_web_search` | One public search source is incomplete and may fail. | Runs current-round queries through the parallel composite provider and retains normalized results and diagnostics. |
 | `research_source_processor` | Search results are not evidence-ready documents. | Loads provider-native or webpage content, cleans it, deduplicates it, and creates normalized `Source` objects. |
-| `research_retrieval` | Entire sources are too large and noisy for an LLM. | Builds the public retrieval corpus, queries public and/or private sessions, and returns bounded passage contexts. |
+| `research_retrieval` | Entire sources are too large and noisy for an LLM. | Builds a current-round public retrieval session, reuses the job-owned private session, and returns separate bounded web/document contexts. |
 | `research_evidence_extractor` | Retrieved text must become explicit claims with provenance. | Produces schema-validated evidence linked to chunks, sources, and research objectives; normalizes duplicates. |
 | `research_coverage_evaluator` | The system must know what remains unanswered. | Rates each subquestion, validates referenced evidence IDs, and emits actionable coverage gaps. |
 | `research_routing` | An LLM should not control an unbounded loop. | Deterministically checks coverage, iteration count, query usage, extraction attempts, elapsed time, and evidence gain. |
-| `writer_prepare_evidence` | The writer needs a controlled evidence set. | Selects evidence within item and character limits and stores only selected evidence IDs in writer state. |
+| `writer_prepare_evidence` | The writer needs a relevant, balanced evidence set. | Ranks evidence by relevance, gives each subquestion an opportunity to contribute, and stores only selected evidence IDs in writer state. |
 | `writer_synthesis` | Evidence must become a readable report without inventing claims. | Produces a structured draft from selected evidence and records unresolved gaps as limitations. |
 | `writer_citation_checker` | Draft citations may be missing or unsupported. | Performs deterministic reference checks and semantic evidence-to-claim validation; unsupported findings are removed. |
 | `finalize_report` | Output formatting should not change validated meaning. | Deterministically renders the validated `ResearchReport` into Markdown. |
@@ -339,7 +351,7 @@ Uploads and indexing are intentionally separate:
 1. **Upload time:** The service validates the extension, streams the file to disk, computes a SHA-256 hash, and stores metadata. It does not parse, chunk, embed, or index the file.
 2. **Job start:** `research_source_selection` verifies that every selected document belongs to the request owner.
 3. **Parsing:** PDF pages, DOCX paragraphs, or text content become normalized blocks with available page and character provenance.
-4. **Shared retrieval preparation:** Blocks become `RetrievalDocument` objects and enter the same `RetrievalSession` used by public content.
+4. **Shared retrieval preparation:** Blocks become `RetrievalDocument` objects and enter the same `RetrievalSession` implementation used for public content, but in a separate job-owned session.
 5. **Reuse during the job:** One private-document session serves every subquestion and later coverage iteration.
 6. **Cleanup:** Job-scoped chunks and indexes are cleared when the workflow completes, fails, or is cancelled.
 
@@ -422,7 +434,7 @@ The evidence extractor receives only retrieved contexts—not complete source co
 - relevance and provenance metadata; and
 - private-document locations when applicable.
 
-Evidence from web and document results is normalized into one evidence collection. Matching claims can be deduplicated without losing their source lineage.
+Evidence from web and document results is normalized into one evidence collection. Exact normalized duplicates within the same subquestion are not added twice; every retained item keeps the provenance of its supporting chunk and source.
 
 ### Coverage Evaluation
 
@@ -441,7 +453,7 @@ The deterministic router—not the LLM—decides whether those gaps justify anot
 ```mermaid
 flowchart LR
     Evidence[Accepted evidence]
-    Select[Bounded evidence selection]
+    Select[Relevance-ranked evidence selection]
     Draft[Structured draft report]
     References[Deterministic ID checks]
     Semantic[Semantic citation verification]
@@ -468,6 +480,8 @@ Nodes request logical roles rather than concrete provider SDKs:
 
 Each role can define its own ordered provider/model chain.
 
+These are structured LLM calls, not autonomous agent executors. The graph contains no ReAct loop, LLM tool-selection loop, nested LangGraph, human interrupt, or checkpoint-backed resume path. Search, extraction, parsing, retrieval, persistence, and rendering are invoked directly by application code.
+
 ```mermaid
 flowchart LR
     Role[Logical LLM role]
@@ -493,7 +507,7 @@ The service:
 - retries malformed structured output a bounded number of times;
 - fails over on classified availability, authentication, rate-limit, timeout, server, and provider-specific structured-output failures;
 - keeps invalid prompts, policy failures, oversized requests, and context-length failures terminal when another provider is unlikely to help;
-- prefers the first healthy provider for later roles in the same job; and
+- remembers the successful provider independently for later calls to the same role in the same job; and
 - releases job-specific provider state at job completion.
 
 ### Search and Extraction Resilience
@@ -563,7 +577,7 @@ Understanding resource scope is important because the project intentionally avoi
 |---|---|---|
 | Application process | Settings, provider clients, embedding service, tokenizer, retrieval factory, document service, in-memory document registry | Server process |
 | Research job | LangGraph state, private-document retrieval session, LLM provider preference/failure state | One job |
-| Public retrieval invocation | Public chunks, dense index, BM25 index, retrieval contexts | Built and cleared by the research retrieval flow |
+| Public retrieval invocation | Current-round public chunks, dense index, BM25 index, retrieval contexts | Built for one retrieval-node invocation; the current explicit `clear()` call is disabled |
 | Persistent local storage | SQLite jobs/events, uploaded source files | Until manually removed |
 | Browser | Temporary owner ID and last job ID | Browser local storage |
 
@@ -577,6 +591,8 @@ Understanding resource scope is important because the project intentionally avoi
 | `writer` | Selected evidence IDs, draft report, citation result, and final report |
 
 Non-serializable retrieval indexes stay in `ResearchJobResources`, outside graph state.
+
+`WorkflowState` is a `TypedDict` without `Annotated` reducers. A returned top-level key replaces that key; nodes preserve nested `research` and `writer` fields with explicit dictionary spreads, append or deduplicate lists themselves, and update `ResearchControlState` through Pydantic `model_copy()`. The private retrieval session and per-job LLM provider health remain runtime resources rather than serializable graph state.
 
 ## Getting Started
 
@@ -821,8 +837,8 @@ All retrieval variables use the `RETRIEVAL_` prefix.
 | `RETRIEVAL_EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | Local semantic embedding model. |
 | `RETRIEVAL_EMBEDDING_DEVICE` | `cpu` | Embedding execution device. |
 | `RETRIEVAL_CHUNK_SIZE` | `400` | Chonkie chunk size. |
-| `RETRIEVAL_CANDIDATE_K` | `10` | Candidates requested from each retrieval path. |
-| `RETRIEVAL_TOP_K` | `5` | Fused passages considered for context. |
+| `RETRIEVAL_CANDIDATE_K` | `20` | Candidates requested from each retrieval path. |
+| `RETRIEVAL_TOP_K` | `8` | Fused passages considered for context. |
 | `RETRIEVAL_SEMANTIC_WEIGHT` | `0.5` | Dense-ranking contribution. |
 | `RETRIEVAL_LEXICAL_WEIGHT` | `0.5` | BM25-ranking contribution. |
 | `RETRIEVAL_RRF_C` | `60` | Reciprocal Rank Fusion constant. |
@@ -891,7 +907,7 @@ All retrieval variables use the `RETRIEVAL_` prefix.
 │   │   ├── extraction/               # Native, web, and fallback extractors
 │   │   └── search/                   # Parallel search and provider adapters
 │   └── server.py                     # FastAPI composition root
-├── docs/                             # Phase plans and implementation handoffs
+├── docs/                             # Architecture, phase plans, and implementation handoffs
 ├── data/                             # Runtime SQLite database
 ├── uploaded/                         # Runtime private uploads; gitignored
 ├── .env.example                      # Safe configuration template
@@ -941,7 +957,7 @@ PYTHON_DOTENV_DISABLED=1 .venv/bin/python -m pytest -q src/tests/test_llm_fallba
 PYTHON_DOTENV_DISABLED=1 .venv/bin/python -m pytest -q src/tests/test_hybrid_evidence_flow.py
 ```
 
-The current offline suite contains 58 passing tests.
+The suite changes with the implementation; run the command above for the current result instead of relying on a fixed test count.
 
 ## Current Limitations
 
@@ -949,7 +965,8 @@ The current offline suite contains 58 passing tests.
 - **Process-local document metadata:** Uploaded files remain on disk, but the in-memory document registry is lost on restart. Previously uploaded files cannot be selected again without rebuilding metadata.
 - **No workflow checkpoint resume:** SQLite preserves jobs and events, not LangGraph execution checkpoints. Queued or running jobs are marked failed after a restart.
 - **Single-process execution:** Background tasks, admission control, and runtime resources are not coordinated across Uvicorn workers or machines.
-- **In-memory retrieval indexes:** Dense and BM25 indexes are job/session resources and are intentionally cleared; there is no persistent vector database.
+- **In-memory retrieval indexes:** Dense and BM25 indexes are not persisted. The private session is cleared on terminal job paths; explicit public-session cleanup is currently disabled in `research_retrieval_node` and should be restored before production hardening.
+- **Writer budget enforcement:** Evidence selection stops after observed item or character totals reach their limits, but `_evidence_fits_budget()` currently returns `True`, so the item that crosses the remaining character budget can still be accepted.
 - **No durable task queue:** Jobs run as application-owned asyncio tasks.
 - **No global cost or token quota:** Retrieval and writer contexts are bounded, but provider billing, total generated tokens, and account-level quotas are not centrally enforced.
 - **Development runtime prints:** Learning-oriented prints currently expose intermediate diagnostics and should be removed or sanitized before production deployment.

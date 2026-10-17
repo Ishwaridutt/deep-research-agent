@@ -175,12 +175,12 @@ class RetrievalSettings(EnvironmentSettings):
     # Each retriever can consider more candidates than are ultimately
     # passed to the context builder.
     candidate_k: int = Field(
-        default=10,
+        default=20,
         ge=1,
     )
 
     top_k: int = Field(
-        default=5,
+        default=8,
         ge=1,
     )
 
@@ -225,7 +225,7 @@ class ResearchLimitSettings(EnvironmentSettings):
     )
 
     max_subquestions: int = Field(
-        default=4,
+        default=5,
         ge=1,
     )
 
@@ -240,7 +240,7 @@ class ResearchLimitSettings(EnvironmentSettings):
     )
 
     max_total_queries_per_job: int = Field(
-        default=10,
+        default=30,
         ge=1,
     )
 
@@ -262,7 +262,7 @@ class ResearchLimitSettings(EnvironmentSettings):
     )
 
     max_source_content_chars: int = Field(
-        default=50_000,
+        default=500_000,
         ge=1,
     )
 

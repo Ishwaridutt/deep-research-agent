@@ -34,14 +34,17 @@ class RetrievalSession:
         # Chunk the corpus once and build both lexical and semantic retrieval indexes.
         self.chunks = self.chunker.chunk_documents(documents)
         self.hybrid_retriever.build(self.chunks)
+        print('\nRetrieval session chunking and loading completed...')
 
     def retrieve(self, request: RetrievalRequest) -> RetrievalResult:
         """Retrieves and builds bounded context for one research subquestion."""
 
         retrieval_query = self._build_retrieval_query(request)
+        print(f"\nstarting retrieval for retrieval_query: ", retrieval_query)
 
         # Search the shared session corpus using BM25 + semantic retrieval + RRF.
         retrieved_chunks = self.hybrid_retriever.search(retrieval_query, top_k=self.top_k)
+        print(f"\ncompleted retrieval for retrieval_query: ", retrieval_query, ' retrieved_chunks: ',len(retrieved_chunks))
 
         # Convert the ranked results into token-bounded context for the evidence extractor.
         return self.context_builder.build(

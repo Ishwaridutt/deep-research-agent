@@ -90,6 +90,7 @@ let runToken = 0;
 let statusLoading = false;
 let resultShown = false;
 let terminalEventSeen = false;
+let pipelineFailed = false;
 let streamAvailable = false;
 let pollDelay = FALLBACK_POLL_INITIAL_MS;
 let collapsedRounds = new Set();
@@ -196,8 +197,10 @@ async function loadDocuments() {
         );
         renderDocuments();
         setDocumentStatus(`${documents.length} document${documents.length === 1 ? "" : "s"} available.`);
+        return true;
     } catch (error) {
         setDocumentStatus(error instanceof Error ? error.message : "Unable to load documents.", "error");
+        return false;
     }
 }
 async function uploadPendingDocuments() {
@@ -218,7 +221,6 @@ async function uploadPendingDocuments() {
             selectedDocumentIds.add(uploaded.document_id);
         }
         ui.documentUpload.value = "";
-        await loadDocuments();
         return true;
     } catch (error) {
         const message = error instanceof Error ? error.message : "Document upload failed.";
@@ -226,6 +228,34 @@ async function uploadPendingDocuments() {
         showStatus("Document upload failed", message, "error");
         return false;
     }
+}
+function showDocumentIssue(title, message) {
+    setDocumentStatus(message, "error", DOCUMENT_SELECTION_ISSUE);
+    showStatus(title, message, "error", DOCUMENT_SELECTION_ISSUE);
+    replayAttention(ui.documentPanel);
+    replayAttention(ui.status);
+}
+async function validateSelectedDocuments() {
+    const selectedBeforeRefresh = [...selectedDocumentIds];
+    if (!await loadDocuments()) {
+        showDocumentIssue(
+            "Unable to verify documents",
+            "The selected documents could not be verified. Refresh the list and try again.",
+        );
+        return false;
+    }
+
+    const missingSelection = selectedBeforeRefresh.some(
+        documentId => !selectedDocumentIds.has(documentId)
+    );
+    if (missingSelection) {
+        showDocumentIssue(
+            "Documents unavailable",
+            "One or more selected documents are no longer available. Select or upload them again.",
+        );
+        return false;
+    }
+    return true;
 }
 function updateSourceControls() {
     const mode = sourceMode();
@@ -272,6 +302,7 @@ function resetPipeline() {
     highestSequence = 0;
     resultShown = false;
     terminalEventSeen = false;
+    pipelineFailed = false;
     collapsedRounds = new Set();
     previousLatestRound = null;
     jobStartedAt = Date.now();
@@ -326,7 +357,7 @@ function getStageState(stage, round = null) {
         if (event.event_type === "stage_completed") state = "completed";
         if (event.event_type === "stage_failed") state = "failed";
     }
-    return state;
+    return state === "running" && pipelineFailed ? "failed" : state;
 }
 function renderStages(stages, round = null) {
     const list = create("ol", "stage-list");
@@ -335,7 +366,7 @@ function renderStages(stages, round = null) {
         const row = create("li", "stage-row");
         row.dataset.state = state;
         row.append(
-            create("span", "stage-node", ({ completed: "✓", failed: "!", running: "◆", pending: "·" })[state]),
+            create("span", "stage-node", ({ completed: "✓", failed: "×", running: "◆", pending: "·" })[state]),
             create("span", "stage-name", STAGES[stage]),
             create("span", "stage-caption", ({ completed: "Done", failed: "Failed", running: "Running", pending: "Waiting" })[state]),
         );
@@ -508,6 +539,7 @@ function renderActivity() {
 function ingestEvent(event) {
     if (!event || event.job_id !== jobId || !Number.isInteger(event.sequence) || event.sequence <= highestSequence) return;
     highestSequence = event.sequence;
+    if (event.event_type === "workflow_failed") pipelineFailed = true;
     events.push(event);
     renderPipeline();
 
@@ -563,7 +595,9 @@ async function readJson(response) {
     const data = await response.json();
     if (!response.ok) {
         const detail = data.detail || `Request failed (${response.status}).`;
-        throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+        const error = new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+        error.status = response.status;
+        throw error;
     }
     return data;
 }
@@ -739,6 +773,8 @@ function renderTerminalJob(job) {
         report: null,
         errors: job.error_message ? [{ component: "research_service", message: job.error_message }] : [],
     };
+    pipelineFailed = final.status !== "completed" || !final.report;
+    renderPipeline();
     renderResult(final);
     if (final.status === "completed" && final.report) {
         showStatus("Research completed", "Your report is ready. You can review the research steps above.", "success");
@@ -789,7 +825,12 @@ async function startResearch(question, mode, documentIds) {
     } catch (error) {
         if (token !== runToken) return;
         console.error("Research submission failed:", error);
-        showStatus("Unable to start research", error instanceof Error ? error.message : "Unexpected error.", "error");
+        const message = error instanceof Error ? error.message : "Unexpected error.";
+        if (usesDocuments(mode) && error?.status === 422) {
+            showDocumentIssue("Documents unavailable", message);
+        } else {
+            showStatus("Unable to start research", message, "error");
+        }
         setBusy(false);
     }
 }
@@ -828,10 +869,14 @@ ui.form.addEventListener("submit", async event => {
         return;
     }
     const mode = sourceMode();
-    if (usesDocuments(mode) && ui.documentUpload.files.length) {
+    if (usesDocuments(mode)) {
         setBusy(true);
-        showStatus("Uploading documents", "Saving the selected files before research starts.", "loading");
-        if (!await uploadPendingDocuments()) {
+        if (ui.documentUpload.files.length) {
+            showStatus("Uploading documents", "Saving the selected files before research starts.", "loading");
+        } else {
+            showStatus("Checking documents", "Verifying the selected files before research starts.", "loading");
+        }
+        if (!await uploadPendingDocuments() || !await validateSelectedDocuments()) {
             setBusy(false);
             return;
         }
@@ -840,10 +885,7 @@ ui.form.addEventListener("submit", async event => {
     if (usesDocuments(mode) && !documentIds.length) {
         setBusy(false);
         const message = "Select at least one document before starting document or hybrid research.";
-        setDocumentStatus(message, "error", DOCUMENT_SELECTION_ISSUE);
-        showStatus("Select a document", message, "error", DOCUMENT_SELECTION_ISSUE);
-        replayAttention(ui.documentPanel);
-        replayAttention(ui.status);
+        showDocumentIssue("Select a document", message);
         return;
     }
     void startResearch(question, mode, documentIds);

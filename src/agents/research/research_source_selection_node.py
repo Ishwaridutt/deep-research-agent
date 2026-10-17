@@ -40,11 +40,23 @@ async def research_source_selection_node(
     retrieval_session_factory: RetrievalSessionFactory,
 ) -> dict:
     """Build one reusable private-document retrieval session when selected."""
+    logger.info(
+        "source selection node started.",
+        extra={
+            "event": "source_selection_node_started",
+            "job_id": state["job_id"],
+            "research_session_id": state["research_session_id"],
+            "node": "research_source_selection",
+            "document_count": len(state["selected_document_ids"]),
+        },
+    )
 
+    # when allowed_sources is WEB, route to next node
     if ResearchSource.DOCUMENTS not in state["allowed_sources"]:
         return _selection_output(state)
 
     resources = _get_job_resources(config)
+    # Avoid rebuilding documents on later research rounds
     if resources.document_retrieval_session is not None:
         return _selection_output(state)
 
@@ -64,7 +76,7 @@ async def research_source_selection_node(
         logger.warning(
             "Private-document source selection was rejected.",
             extra={
-                "event": "document_source_selection_rejected",
+                "event": "private_document_source_selection_rejected",
                 "job_id": state["job_id"],
                 "research_session_id": state["research_session_id"],
                 "node": "research_source_selection",
@@ -76,7 +88,7 @@ async def research_source_selection_node(
         logger.exception(
             "Private-document source preparation failed.",
             extra={
-                "event": "document_source_preparation_failed",
+                "event": "private_document_source_preparation_failed",
                 "job_id": state["job_id"],
                 "research_session_id": state["research_session_id"],
                 "node": "research_source_selection",
@@ -89,7 +101,7 @@ async def research_source_selection_node(
         logger.info(
             "Private-document source preparation completed.",
             extra={
-                "event": "document_source_preparation_completed",
+                "event": "private_document_source_preparation_completed",
                 "job_id": state["job_id"],
                 "research_session_id": state["research_session_id"],
                 "node": "research_source_selection",

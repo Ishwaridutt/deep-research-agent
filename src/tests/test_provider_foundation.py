@@ -1,11 +1,15 @@
 """Focused offline tests for normalized provider provenance."""
 
 import asyncio
+import json
+import logging
 
 import pytest
 from langchain_core.exceptions import OutputParserException
 
+from src.config.logging import JsonFormatter
 from src.llm import LLMCallMetadata, LLMRole, LLMService, LLMServiceError
+from src.llm.service import _safe_provider_error_details
 from src.models import EvidenceExtractionOutput, SearchQuery, SourceProvider
 from src.tools.search.tavily_search import TavilySearchProvider
 
@@ -64,3 +68,58 @@ def test_llm_errors_do_not_expose_provider_output():
 
     assert "private provider output" not in str(error.value)
     assert "invalid structured output" in str(error.value)
+
+
+def test_provider_diagnostics_exclude_generated_output():
+    class ProviderError(RuntimeError):
+        status_code = 400
+        body = {
+            "error": {
+                "code": "tool_use_failed",
+                "type": "invalid_request_error",
+                "failed_generation": "PRIVATE GENERATED CONTENT",
+            }
+        }
+
+    details = _safe_provider_error_details(ProviderError())
+
+    assert details == {
+        "provider_exception_type": "ProviderError",
+        "provider_status_code": 400,
+        "provider_error_code": "tool_use_failed",
+        "provider_error_category": "invalid_request_error",
+    }
+    assert "PRIVATE GENERATED CONTENT" not in str(details)
+
+
+def test_json_logs_include_safe_provider_failure_diagnostics():
+    record = logging.LogRecord(
+        name="src.llm.service",
+        level=logging.WARNING,
+        pathname=__file__,
+        lineno=1,
+        msg="LLM provider invocation failed.",
+        args=(),
+        exc_info=None,
+    )
+    record.event = "llm_provider_failed"
+    record.provider = "groq"
+    record.role = "evidence_extractor"
+    record.schema = "EvidenceExtractionOutput"
+    record.attempt = 1
+    record.max_attempts = 2
+    record.failure_type = "provider request failed"
+    record.provider_exception_type = "BadRequestError"
+    record.provider_status_code = 400
+    record.provider_error_code = "invalid_request_error"
+    record.document_count = 2
+    record.web_result_count = 3
+
+    output = json.loads(JsonFormatter().format(record))
+
+    assert output["provider_status_code"] == 400
+    assert output["provider_error_code"] == "invalid_request_error"
+    assert output["schema"] == "EvidenceExtractionOutput"
+    assert output["attempt"] == 1
+    assert output["document_count"] == 2
+    assert output["web_result_count"] == 3

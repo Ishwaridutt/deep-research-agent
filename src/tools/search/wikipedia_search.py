@@ -40,6 +40,7 @@ class WikipediaSearchProvider(SearchProvider):
         max_results: int,
     ) -> list[SearchResult]:
         try:
+            print('Starting Wikipedia search for query: ', search_query.query)
             response = await self._client.get(
                 self._api_url,
                 params={
@@ -70,7 +71,7 @@ class WikipediaSearchProvider(SearchProvider):
         ][:max_results]
 
         print(
-            "Wikipedia search completed:",
+            "\nWikipedia search completed:",
             f"query={search_query.id}",
             f"results={len(results)}",
         )

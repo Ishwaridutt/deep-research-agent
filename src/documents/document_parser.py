@@ -29,7 +29,7 @@ class DocumentParser:
 
             blocks = [
                 ParsedDocumentBlock(
-                    text=text.strip(),
+                    text=text,
                     location=DocumentSourceLocation(
                         page_start=i,
                         page_end=i,
@@ -39,7 +39,7 @@ class DocumentParser:
                     islice(pages, max_pages),
                     1,
                 )
-                if (text := page.extract_text())
+                if (text := (page.extract_text() or "").strip())
             ]
 
         elif document_format == DocumentFormat.DOCX:

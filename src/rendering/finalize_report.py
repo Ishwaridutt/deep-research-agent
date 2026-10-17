@@ -54,6 +54,8 @@ def finalize_report_node(
             report=final_report,
             evidence_by_id=evidence_by_id,
             sources_by_id=sources_by_id,
+            research_question=state["question"],
+            stop_reason=state["research"]["stop_reason"],
         )
 
     except ReportRenderingError as exc:

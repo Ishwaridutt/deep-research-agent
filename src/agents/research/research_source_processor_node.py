@@ -3,18 +3,25 @@
 import asyncio
 import json
 import logging
+import re
 from datetime import UTC, datetime
 from pprint import pprint
 
 from src.graph.graph_state import WorkflowState
 from src.guardrails import URLValidationError, url_dedup_key, validate_public_http_url
-from src.models import ErrorType, ResearchError, SearchResult, Source, SourceType
+from src.models import ErrorType, ResearchError, SearchQuery, SearchResult, Source, SourceType
 from src.services import generate_source_id
 from src.tools.cleaning import SourceCleaner, SourceCleaningError
 from src.tools.extraction import SourceContentExtractor, SourceExtractionError
 
 
 logger = logging.getLogger(__name__)
+
+_TOKEN = re.compile(r"[a-z0-9]{2,}")
+_STOPWORDS = {
+    "about", "and", "for", "from", "how", "of", "on", "or", "the", "to",
+    "what", "when", "which", "who", "why", "with",
+}
 
 
 def _get_iteration_search_results(state: WorkflowState, *, iteration: int) -> list[SearchResult]:
@@ -49,6 +56,61 @@ def _canonical_key(canonical_id: str) -> str:
     return f"canonical:{canonical_id.casefold()}"
 
 
+def _tokens(value: str) -> set[str]:
+    return {
+        token for token in _TOKEN.findall(value.casefold())
+        if token not in _STOPWORDS
+    }
+
+
+def _result_priority(result: SearchResult, query: SearchQuery) -> float:
+    query_tokens = _tokens(query.query)
+    overlap = len(query_tokens & _tokens(f"{result.title} {result.snippet or ''}"))
+    relevance = overlap / len(query_tokens) if query_tokens else 0.0
+    provenance = result.provider_metadata.get("discovery_provenance", [])
+    provider_scores = [result.provider_score, *(
+        item.get("provider_score") for item in provenance if isinstance(item, dict)
+    )]
+    provider_score = max(
+        (score for score in provider_scores if isinstance(score, (int, float))),
+        default=0.0,
+    )
+    return relevance + provider_score + (0.2 * min(len(provenance), 3))
+
+
+def _rank_grouped_results(
+    grouped_results: dict[str, list[SearchResult]],
+    *,
+    queries: list[SearchQuery],
+    subquestion_ids: list[str],
+) -> list[tuple[str, list[SearchResult]]]:
+    """Rank candidates within each subquestion, then interleave the buckets."""
+    queries_by_id = {query.id: query for query in queries}
+    buckets: dict[str, list[tuple[float, str, list[SearchResult]]]] = {}
+
+    for url_key, results in grouped_results.items():
+        ranked_matches = [
+            (_result_priority(result, query), query.subquestion_id)
+            for result in results
+            if (query := queries_by_id.get(result.query_id)) is not None
+        ]
+        priority, subquestion_id = max(ranked_matches, default=(0.0, "unassigned"))
+        buckets.setdefault(subquestion_id, []).append((priority, url_key, results))
+
+    for bucket in buckets.values():
+        bucket.sort(key=lambda item: item[0], reverse=True)
+
+    bucket_order = [item for item in subquestion_ids if item in buckets]
+    bucket_order.extend(item for item in buckets if item not in bucket_order)
+    ranked: list[tuple[str, list[SearchResult]]] = []
+    while any(buckets[item] for item in bucket_order):
+        for subquestion_id in bucket_order:
+            if buckets[subquestion_id]:
+                _, url_key, results = buckets[subquestion_id].pop(0)
+                ranked.append((url_key, results))
+    return ranked
+
+
 def _seconds_remaining(state: WorkflowState) -> float:
     control = state["research_control"]
     elapsed = (datetime.now(UTC) - control.usage.started_at).total_seconds()
@@ -61,17 +123,24 @@ async def research_source_processor_node(
     source_extractor: SourceContentExtractor,
     source_cleaner: SourceCleaner,
 ) -> dict:
-    """Validate URLs, extract unique pages, and retain source provenance."""
-    print("\nsource processor state:", state)
+    """Validate URLs, extract unique pages, extracts page content and retain source provenance."""
+    # print("\nsource processor state:", state)
 
     research = state["research"]
     control = state["research_control"]
     target_iteration = research["iteration_count"] + 1
     iteration_results = _get_iteration_search_results(state, iteration=target_iteration)
     grouped_results = _group_search_results_by_url(iteration_results)
+    ranked_results = _rank_grouped_results(
+        grouped_results,
+        queries=research["search_queries"],
+        subquestion_ids=[item.id for item in research["subquestions"]],
+    )
     sources = list(research["sources"])
     errors = list(state["errors"])
     page_attempts = control.usage.page_extraction_attempts
+    round_page_attempts = 0
+    skipped_for_budget = 0
 
     existing_source_indexes = {
         url_dedup_key(source.uri): index for index, source in enumerate(sources)
@@ -101,22 +170,25 @@ async def research_source_processor_node(
             "iteration": target_iteration,
         },
     )
-    print("\nsource processor iteration results:")
-    print(json.dumps(
-        [result.model_dump(mode="json") for result in iteration_results],
-        indent=2,
-    ))
-    print("\nsource processor grouped results:")
+    # print("\nsource processor iteration results:")
+    # print(json.dumps(
+    #     [result.model_dump(mode="json") for result in iteration_results],
+    #     indent=2,
+    # ))
+    print("\nsource processor grouped results: ")
+    print("total grouped result key: ", len(grouped_results))
+    total_results = sum(len(items) for items in grouped_results.values())
+    print("total grouped result items: ", total_results)
     for url, results in grouped_results.items():
-        print(f"\n{'=' * 80}\nURL: {url}\n{'=' * 80}")
-        pprint(
-            [result.model_dump(mode="json") for result in results],
-            width=120,
-            sort_dicts=False,
-        )
+        print(f"{'=' * 80}\nURL: {url}\n{'=' * 80}")
+        # pprint(
+        #     [result.model_dump(mode="json") for result in results],
+        #     width=120,
+        #     sort_dicts=False,
+        # )
     print("\nsource processor existing source indexes:", existing_source_indexes)
 
-    for url_key, search_results in grouped_results.items():
+    for url_key, search_results in ranked_results:
         representative_result = search_results[0]
         search_result_ids = [result.id for result in search_results]
         canonical_key = _canonical_key(representative_result.canonical_id)
@@ -153,8 +225,11 @@ async def research_source_processor_node(
             ))
             continue
 
-        if page_attempts >= control.budget.max_extracted_pages:
-            logger.warning("Page extraction budget exhausted; skipping new URLs.")
+        if (
+            page_attempts >= control.budget.max_extracted_pages
+            or round_page_attempts >= control.budget.max_extracted_pages_per_round
+        ):
+            skipped_for_budget += 1
             continue
 
         seconds_remaining = _seconds_remaining(state)
@@ -162,8 +237,9 @@ async def research_source_processor_node(
             logger.warning("Research time budget exhausted; skipping new URLs.")
             continue
 
-        # Count failed and timed-out extraction calls against the page budget.
+        # Count extraction calls against the page budget.
         page_attempts += 1
+        round_page_attempts += 1
         try:
             extracted_source = await asyncio.wait_for(
                 source_extractor.extract(search_result=representative_result.model_copy(
@@ -226,6 +302,7 @@ async def research_source_processor_node(
             existing_source_indexes[canonical_key] = redirected_index
             continue
 
+        # clean the extracted content
         try:
             cleaned = source_cleaner.clean(
                 extracted_source.content,
@@ -272,6 +349,20 @@ async def research_source_processor_node(
         existing_source_indexes[url_key] = len(sources) - 1
         existing_source_indexes[canonical_key] = len(sources) - 1
 
+    if skipped_for_budget:
+        logger.info(
+            "Source candidates were deferred after the round extraction limit.",
+            extra={
+                "event": "source_candidates_deferred",
+                "job_id": state["job_id"],
+                "research_session_id": state["research_session_id"],
+                "node": "research_source_processor",
+                "iteration": target_iteration,
+                "skipped_count": skipped_for_budget,
+                "round_page_attempts": round_page_attempts,
+            },
+        )
+
     updated_usage = control.usage.model_copy(update={"page_extraction_attempts": page_attempts})
     updated_control = control.model_copy(update={"usage": updated_usage})
 
@@ -284,6 +375,7 @@ async def research_source_processor_node(
             "node": "research_source_processor",
             "iteration": target_iteration,
             "page_extraction_attempts": page_attempts,
+            "round_page_attempts": round_page_attempts,
             "sources_count": len(sources),
         },
     )

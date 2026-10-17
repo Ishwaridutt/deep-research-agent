@@ -22,6 +22,7 @@ from src.models.report_model import (
     CitationCheckResult,
     CitationIssue,
     DraftReport,
+    FinalReportFinding,
     ReportFinding,
     ReportSource,
     ResearchReport,
@@ -75,6 +76,7 @@ __all__ = [
     "Evidence",
     "EvidenceCandidate",
     "EvidenceExtractionOutput",
+    "FinalReportFinding",
     "GeneratedSearchQuery",
     "GuardrailDecision",
     "GuardrailResult",
@@ -106,4 +108,3 @@ __all__ = [
     "RetrievalResult",
     "RetrievedChunk",
 ]
-

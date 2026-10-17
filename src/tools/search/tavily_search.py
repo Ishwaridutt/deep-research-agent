@@ -48,6 +48,7 @@ class TavilySearchProvider(SearchProvider):
         """
 
         try:
+            print('Starting Tavily search for query: ', search_query.query)
             response = await self._client.search(
                 query=search_query.query,
                 search_depth="advanced",
@@ -141,6 +142,12 @@ class TavilySearchProvider(SearchProvider):
                     provider_score=provider_score,
                 )
             )
+
+        print(
+            "\nTavily search completed:",
+            f"query={search_query.id}",
+            f"results={len(normalized_results)}",
+        )
 
         return normalized_results
 

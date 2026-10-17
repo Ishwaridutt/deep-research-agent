@@ -8,7 +8,11 @@ from fastapi.responses import StreamingResponse
 from src.models import ResearchExecutionResult, ResearchRequest
 from src.models.pipeline_event import ResearchJobCreated, ResearchJobStatusResponse
 from src.services.research_pipeline_stream_service import encode_sse
-from src.services.research_service import ResearchJobQueueFull, ResearchService
+from src.services.research_service import (
+    ResearchJobQueueFull,
+    ResearchRequestValidationError,
+    ResearchService,
+)
 
 
 TERMINAL_STATUSES = {"completed", "failed"}
@@ -30,11 +34,14 @@ def create_research_router(*, research_service: ResearchService) -> APIRouter:
     ) -> ResearchExecutionResult:
         """Existing endpoint: run research and return its final result."""
 
-        return await research_service.research(
-            question=request.question,
-            source_selection=request.source_selection,
-            owner_id=x_owner_id,
-        )
+        try:
+            return await research_service.research(
+                question=request.question,
+                source_selection=request.source_selection,
+                owner_id=x_owner_id,
+            )
+        except ResearchRequestValidationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @router.post(
         "/research/jobs",
@@ -55,6 +62,8 @@ def create_research_router(*, research_service: ResearchService) -> APIRouter:
             )
         except ResearchJobQueueFull as exc:
             raise HTTPException(status_code=429, detail=str(exc)) from exc
+        except ResearchRequestValidationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
     @router.get(

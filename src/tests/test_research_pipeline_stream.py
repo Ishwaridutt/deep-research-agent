@@ -110,6 +110,17 @@ def test_ui_polls_status_only_as_an_sse_fallback():
     assert "void checkStatusAfterStreamFailure(token);" in script
 
 
+def test_ui_marks_the_running_pipeline_stage_failed():
+    script = (
+        Path(__file__).parents[1] / "static" / "js" / "app.js"
+    ).read_text(encoding="utf-8")
+
+    assert 'if (event.event_type === "workflow_failed") pipelineFailed = true;' in script
+    assert 'return state === "running" && pipelineFailed ? "failed" : state;' in script
+    assert 'pipelineFailed = final.status !== "completed" || !final.report;' in script
+    assert 'failed: "×"' in script
+
+
 def test_ui_surfaces_missing_document_selection():
     script = (
         Path(__file__).parents[1] / "static" / "js" / "app.js"
@@ -124,6 +135,12 @@ def test_ui_surfaces_missing_document_selection():
     assert "if (!usesDocuments(mode)) clearDocumentSelectionError();" in script
     assert "replayAttention(ui.documentPanel);" in script
     assert "replayAttention(ui.status);" in script
+    assert "async function validateSelectedDocuments()" in script
+    assert "!await validateSelectedDocuments()" in script
+    assert "One or more selected documents are no longer available" in script
+    assert "error.status = response.status;" in script
+    assert "usesDocuments(mode) && error?.status === 422" in script
+    assert 'showDocumentIssue("Documents unavailable", message);' in script
     assert '.status-panel[data-issue="document-selection"] { position: fixed;' in styles
     assert "animation: validation-toast" in styles
 

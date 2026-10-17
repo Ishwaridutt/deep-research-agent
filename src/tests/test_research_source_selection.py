@@ -5,6 +5,8 @@ import logging
 from types import SimpleNamespace
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
 from src.agents.research.research_source_selection_node import (
     research_source_selection_node,
@@ -23,7 +25,11 @@ from src.models import (
 )
 from src.services.research_job_resources import ResearchJobResources
 from src.services.research_pipeline_stream_service import PipelineRecorder
-from src.services.research_service import ResearchService
+from src.services.research_service import (
+    ResearchRequestValidationError,
+    ResearchService,
+)
+from src.routes.research_route import create_research_router
 
 
 class FakeSession:
@@ -268,6 +274,88 @@ def test_input_guardrail_accepts_valid_document_selection():
 
     assert result["allowed_sources"] == [ResearchSource.DOCUMENTS]
     assert "errors" not in result
+
+
+def test_research_service_rejects_stale_documents_before_creating_job():
+    """Do not persist or execute jobs whose selected uploads disappeared."""
+
+    async def run() -> None:
+        class MissingDocumentService:
+            def __init__(self) -> None:
+                self.calls = []
+
+            async def validate_documents_available(self, owner_id, document_ids):
+                self.calls.append((owner_id, document_ids))
+                raise ValueError(
+                    "One or more selected documents are no longer available."
+                )
+
+        class CapturingJobStore:
+            def __init__(self) -> None:
+                self.create_calls = 0
+
+            async def create_job(self, **kwargs):
+                self.create_calls += 1
+
+        documents = MissingDocumentService()
+        store = CapturingJobStore()
+        service = ResearchService(
+            graph=SimpleNamespace(),
+            settings=SimpleNamespace(
+                app=SimpleNamespace(graph_recursion_limit=10)
+            ),
+            job_store=store,
+            document_service=documents,
+        )
+
+        with pytest.raises(ResearchRequestValidationError, match="no longer available"):
+            await service.start_job(
+                question="What changed?",
+                source_selection=ResearchSourceSelection(
+                    mode=ResearchSourceMode.HYBRID,
+                    document_ids=["stale-document"],
+                ),
+                owner_id="owner-1",
+            )
+
+        assert documents.calls == [("owner-1", ["stale-document"])]
+        assert store.create_calls == 0
+        assert service._tasks == {}
+
+    asyncio.run(run())
+
+
+def test_job_route_returns_validation_error_without_starting_research():
+    """Expose preflight failures as a client-actionable 422 response."""
+
+    class RejectingResearchService:
+        async def start_job(self, **kwargs):
+            raise ResearchRequestValidationError(
+                "One or more selected documents are no longer available."
+            )
+
+    app = FastAPI()
+    app.include_router(create_research_router(
+        research_service=RejectingResearchService(),
+    ))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/research/jobs",
+            headers={"X-Owner-Id": "owner-1"},
+            json={
+                "question": "What changed?",
+                "source_selection": {
+                    "mode": "hybrid",
+                    "document_ids": ["stale-document"],
+                },
+            },
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "detail": "One or more selected documents are no longer available."
+    }
 
 
 def test_research_service_clears_runtime_resources_when_graph_fails():

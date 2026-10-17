@@ -1,6 +1,8 @@
 """Research Evidence Extractor node."""
 
 import logging
+import json
+from dataclasses import asdict
 
 from src.config import Settings
 from src.graph.graph_state import WorkflowState
@@ -87,6 +89,16 @@ async def research_evidence_extractor_node(
         *state["research"]["document_retrieval_results"],
     ]
 
+    print('\nretrieval_results----->')
+    print(
+        json.dumps(
+            [asdict(result) for result in retrieval_results],
+            indent=2,
+            ensure_ascii=False,
+            default=str,
+        )
+    )
+
     for retrieval_result in retrieval_results:
         if remaining_evidence_capacity <= 0:
             break
@@ -119,6 +131,7 @@ async def research_evidence_extractor_node(
         )
 
         try:
+            print("\nevidence extraction llm prompt: ", evidence_extraction_prompt)
             extraction_output = await llm_service.invoke_structured(
                 role=LLMRole.EVIDENCE_EXTRACTOR,
                 messages=evidence_extraction_prompt,
@@ -126,7 +139,10 @@ async def research_evidence_extractor_node(
                 metadata=metadata,
             )
 
+            print("\nevidence extraction llm response: ", extraction_output)
+
         except LLMServiceError as exc:
+            print('Evidence extraction error: ', exec)
             logger.exception(
                 "Evidence extraction failed",
                 extra={

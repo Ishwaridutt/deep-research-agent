@@ -2,6 +2,7 @@
 
 import json
 import logging
+from datetime import UTC, datetime
 
 from src.config import Settings
 from src.graph.graph_state import WorkflowState
@@ -47,32 +48,18 @@ def _build_subquestions(
     """
 
     subquestions: list[SubQuestion] = []
-
     seen_questions: set[str] = set()
-
     for planned_subquestion in planner_output.subquestions:
-        question = (
-            planned_subquestion.question.strip()
-        )
-
-        objective = (
-            planned_subquestion.objective.strip()
-        )
-
+        question = planned_subquestion.question.strip()
+        objective = planned_subquestion.objective.strip()
         if not question or not objective:
             continue
 
-        normalized_question = (
-            _normalize_text(question)
-        )
-
+        normalized_question = _normalize_text(question)
         if normalized_question in seen_questions:
             continue
-
-        seen_questions.add(
-            normalized_question
-        )
-
+        # remove duplicate
+        seen_questions.add(normalized_question)
         subquestions.append(
             SubQuestion(
                 id=generate_subquestion_id(),
@@ -80,7 +67,7 @@ def _build_subquestions(
                 objective=objective,
             )
         )
-
+        # limit the total subquestions
         if len(subquestions) >= max_subquestions:
             break
 
@@ -110,6 +97,7 @@ async def research_planner_node(
     planner_prompt = build_planner_messages(
         question=state["question"],
         max_subquestions=settings.research_limits.max_subquestions,
+        current_date=datetime.now(UTC).date().isoformat(),
     )
 
     metadata = LLMCallMetadata(
@@ -202,7 +190,7 @@ async def research_planner_node(
             "subquestion_count": len(subquestions),
         },
     )
-    print("\nsubquestions:", json.dumps(
+    print("\ngenerated subquestions: ", json.dumps(
         [item.model_dump() for item in subquestions],
         indent=2,
     ))

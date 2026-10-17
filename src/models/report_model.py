@@ -15,6 +15,13 @@ class ReportFinding(BaseModel):
     evidence_ids: list[str] = Field(default_factory=list)
 
 
+class FinalReportFinding(BaseModel):
+    """A user-facing finding with internal evidence IDs removed."""
+
+    title: str = Field(min_length=1)
+    content: str = Field(min_length=1)
+
+
 class DraftReport(BaseModel):
     """Structured report created by the Writer Agent."""
 
@@ -67,14 +74,14 @@ class SemanticFindingCheck(BaseModel):
 
     finding_index: int = Field(ge=0)
     supported: bool
-    reason: str | None = None
+    reason: str | None
 
 
 class SemanticCitationCheckOutput(BaseModel):
     """Structured LLM output used during semantic citation checking."""
 
     revised_executive_summary: str = Field(min_length=1)
-    finding_results: list[SemanticFindingCheck] = Field(default_factory=list)
+    finding_results: list[SemanticFindingCheck]
 
 
 class ReportSource(BaseModel):
@@ -91,7 +98,7 @@ class ResearchReport(BaseModel):
     """Validated final report returned by the research application."""
 
     executive_summary: str = Field(min_length=1)
-    findings: list[ReportFinding] = Field(default_factory=list)
+    findings: list[FinalReportFinding] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
     sources: list[ReportSource] = Field(default_factory=list)
     markdown: str = ""

@@ -71,10 +71,27 @@ class _LLMInvocationFailure(Exception):
     provider_unavailable: bool = False
 
 
+def _provider_error_body(exc: Exception) -> dict:
+    """Return structured provider error metadata without generated content."""
+
+    body = getattr(exc, "body", None)
+    if not isinstance(body, dict):
+        return {}
+
+    provider_error = body.get("error", body)
+    return provider_error if isinstance(provider_error, dict) else {}
+
+
 def _is_retryable_output_error(exc: Exception) -> bool:
     """Retry malformed structured output, not provider or quota failures."""
 
     if isinstance(exc, (OutputParserException, ValidationError, json.JSONDecodeError)):
+        return True
+
+    if _provider_error_body(exc).get("code") in {
+        "json_validate_failed",
+        "tool_use_failed",
+    }:
         return True
 
     message = str(exc).lower()
@@ -96,11 +113,13 @@ def _is_retryable_output_error(exc: Exception) -> bool:
 
     retryable = (
         "failed to parse tool call arguments as json",
+        "failed to call a function",
         "generated json does not match the expected schema",
         "invalid json",
         "json decode",
         "could not parse",
         "output parsing",
+        "tool_use_failed",
         "unexpected structured output type",
     )
 
@@ -152,6 +171,30 @@ def _provider_fallback_allowed(exc: Exception) -> bool:
     return any(reason in message for reason in availability_reasons)
 
 
+def _safe_provider_error_details(exc: Exception) -> dict[str, str | int]:
+    """Expose provider diagnostics without logging prompts or generated output."""
+
+    details: dict[str, str | int] = {
+        "provider_exception_type": type(exc).__name__,
+    }
+    status = getattr(exc, "status_code", None)
+    try:
+        if status is not None:
+            details["provider_status_code"] = int(status)
+    except (TypeError, ValueError):
+        pass
+
+    provider_error = _provider_error_body(exc)
+    code = provider_error.get("code")
+    category = provider_error.get("type")
+    if isinstance(code, (str, int)):
+        details["provider_error_code"] = code
+    if isinstance(category, str):
+        details["provider_error_category"] = category
+
+    return details
+
+
 class LLMService:
     """Provider-independent interface used by all LLM-backed nodes."""
 
@@ -174,7 +217,9 @@ class LLMService:
         self._structured_output_method = structured_output_method
         self._structured_output_attempts = max(1, structured_output_attempts)
         self._private_data_providers = private_data_providers
-        self._job_provider: dict[str, str] = {}
+        # self._job_provider: dict[str, str] = {}
+        # one provider per job and role
+        self._job_provider: dict[str, dict[LLMRole, str]] = {}
         self._job_failed_providers: dict[str, set[str]] = {}
 
     def _get_models(
@@ -211,8 +256,9 @@ class LLMService:
         eligible = [
             model for model in policy_eligible if model.provider not in failed
         ]
-
-        preferred = self._job_provider.get(metadata.job_id)
+        # provider lookup
+        # preferred = self._job_provider.get(metadata.job_id)
+        preferred = self._job_provider.get(metadata.job_id, {}).get(role)
         if preferred:
             eligible.sort(key=lambda item: item.provider != preferred)
 
@@ -285,7 +331,8 @@ class LLMService:
                     )
                 continue
 
-            self._job_provider[metadata.job_id] = provider_model.provider
+            # self._job_provider[metadata.job_id] = provider_model.provider
+            self._job_provider.setdefault(metadata.job_id, {})[role] = (provider_model.provider)
             if unavailable_providers:
                 # Persist availability failures only after another provider succeeds.
                 # If every provider fails, the next role may retry them from scratch.
@@ -328,9 +375,22 @@ class LLMService:
         """Invoke one provider and classify whether the next provider may run."""
 
         try:
+            options = {}
+            if (
+                provider_model.provider == "groq"
+                and role in {
+                    LLMRole.EVIDENCE_EXTRACTOR,
+                    LLMRole.CITATION_CHECKER,
+                }
+                and self._structured_output_method == "json_schema"
+            ):
+                # GPT-OSS supports constrained decoding, avoiding best-effort
+                # JSON that can fail only after an otherwise successful call.
+                options["strict"] = True
             structured_model = provider_model.model.with_structured_output(
                 output_schema,
                 method=self._structured_output_method,
+                **options,
             )
         except Exception:
             raise _LLMInvocationFailure(
@@ -382,6 +442,20 @@ class LLMService:
                         else "provider request failed"
                     )
                     fallback_allowed = _provider_fallback_allowed(exc)
+                    logger.warning(
+                        "LLM provider invocation failed.",
+                        extra={
+                            "event": "llm_provider_failed",
+                            **metadata.as_dict(),
+                            "role": role.value,
+                            "schema": output_schema.__name__,
+                            "provider": provider_model.provider,
+                            "attempt": attempt,
+                            "max_attempts": self._structured_output_attempts,
+                            "failure_type": reason,
+                            **_safe_provider_error_details(exc),
+                        },
+                    )
                     raise _LLMInvocationFailure(
                         reason=f"{reason} after {attempt} attempt(s)",
                         fallback_allowed=fallback_allowed,

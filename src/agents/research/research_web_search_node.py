@@ -109,18 +109,19 @@ async def research_web_search_node(
             ))
             continue
 
-        print("\nsearch results:", json.dumps(
-            [item.model_dump(mode="json") for item in results],
-            indent=2,
-        ))
-        print("\nfor query:", search_query)
+        # print("\nsearch results:", json.dumps(
+        #     [item.model_dump(mode="json") for item in results],
+        #     indent=2,
+        # ))
+        print("\nweb search completed for query:", search_query)
+        print("\ntotal search results: ", len(results))
 
         # Retain unscored results for providers that do not expose relevance scores.
         filtered_results = [
             result for result in results
             if result.provider_score is None
             or result.provider_score >= settings.search.min_provider_score
-        ]
+        ][:settings.research_limits.max_search_results_per_query]
 
         # Keep one fallback result rather than dropping the entire source set.
         if not filtered_results and results:

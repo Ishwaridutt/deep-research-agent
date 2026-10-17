@@ -59,6 +59,7 @@ class RetrievalSessionFactory:
             max_chunks_per_document=self.max_chunks_per_document,
         )
 
+        print('Retrieval session created...')
         return RetrievalSession(
             chunker=chunker,
             hybrid_retriever=hybrid_retriever,
