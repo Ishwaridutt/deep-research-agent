@@ -61,6 +61,13 @@ def route_after_terminal_check(
     )
 
 
+def route_after_planning(state: WorkflowState) -> Literal["continue", "write_report", "terminal_error"]:
+    """A planner with no useful follow-up ends research without an empty round."""
+    if has_terminal_error(state):
+        return "terminal_error"
+    return "write_report" if state["research"]["stop_reason"] is not None else "continue"
+
+
 def route_after_source_selection(
     state: WorkflowState,
 ) -> SourceSelectionRouteName:

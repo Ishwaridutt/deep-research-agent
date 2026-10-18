@@ -35,7 +35,10 @@ class ResearchAgentState(TypedDict):
     coverage evaluation.
     """
 
+    # Original objectives stay stable; active tasks and history track refinement.
     subquestions: list[SubQuestion]
+    active_subquestions: list[SubQuestion]
+    planning_history: list[SubQuestion]
     search_queries: list[SearchQuery]
     search_results: list[SearchResult]
     sources: list[Source]
@@ -130,6 +133,8 @@ def create_initial_workflow_state(
         selected_document_ids=list(selected_document_ids or []),
         research=ResearchAgentState(
             subquestions=[],
+            active_subquestions=[],
+            planning_history=[],
             search_queries=[],
             search_results=[],
             sources=[],

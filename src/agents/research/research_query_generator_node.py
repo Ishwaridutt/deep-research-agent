@@ -9,22 +9,20 @@ from src.config import Settings
 from src.graph.graph_state import WorkflowState
 from src.llm import LLMCallMetadata, LLMRole, LLMService, LLMServiceError
 from src.models import (
-    CoverageGap,
     ErrorType,
     QueryGeneratorOutput,
     ResearchError,
     ResearchSource,
+    ResearchStopReason,
     SearchQuery,
     SubQuestion,
 )
+from src.models.research_quality import ResearchDecision
 from src.prompts.query_generator_prompt import build_query_generator_messages
 from src.services import generate_search_query_id
 
 
 logger = logging.getLogger(__name__)
-
-_MAX_FOLLOWUP_EVIDENCE_ITEMS = 6
-_MAX_FOLLOWUP_EVIDENCE_CHARS = 6_000
 
 
 def _normalize_query(value: str) -> str:
@@ -32,93 +30,9 @@ def _normalize_query(value: str) -> str:
     return " ".join(value.casefold().split())
 
 
-def _get_active_gaps(state: WorkflowState) -> list[CoverageGap]:
-    coverage = state["research"]["coverage"]
-    gaps = state["research_control"].pending_gaps
-    if not gaps and coverage is not None:
-        gaps = coverage.gaps
-    return gaps
-
-
 def _get_target_subquestions(state: WorkflowState) -> list[SubQuestion]:
-    """Research all subquestions initially; prioritize unresolved gaps later."""
-    subquestions = state["research"]["subquestions"]
-    if state["research"]["iteration_count"] == 0:
-        return subquestions
-
-    priorities = {
-        item.id: max(
-            (gap.priority for gap in _get_active_gaps(state) if gap.subquestion_id == item.id),
-            default=0,
-        )
-        for item in subquestions
-    }
-    return sorted(
-        (item for item in subquestions if priorities[item.id]),
-        key=lambda item: priorities[item.id],
-        reverse=True,
-    )
-
-
-def _get_coverage_gap(state: WorkflowState, subquestion_id: str) -> str | None:
-    """Combine unresolved gap descriptions for one target."""
-    descriptions = dict.fromkeys(
-        gap.description.strip() for gap in _get_active_gaps(state)
-        if gap.subquestion_id == subquestion_id and gap.description.strip()
-    )
-    return "; ".join(descriptions) or None
-
-
-def _get_suggested_queries(state: WorkflowState, subquestion_id: str) -> list[str]:
-    return list(dict.fromkeys(
-        query.strip()
-        for gap in _get_active_gaps(state)
-        if gap.subquestion_id == subquestion_id
-        for query in gap.suggested_queries
-        if query.strip()
-    ))
-
-
-def _get_previous_evidence(state: WorkflowState, subquestion_id: str) -> list[str]:
-    """Keep follow-up context useful without copying the whole evidence store."""
-    candidates = sorted(
-        (
-            item for item in state["research"]["evidence"]
-            if item.subquestion_id == subquestion_id
-        ),
-        key=lambda item: item.relevance_score,
-        reverse=True,
-    )[:_MAX_FOLLOWUP_EVIDENCE_ITEMS]
-
-    selected: list[str] = []
-    remaining = _MAX_FOLLOWUP_EVIDENCE_CHARS
-    for item in candidates:
-        title = str(item.provenance.get("title") or "Accepted evidence")
-        value = f"{title}: {item.content}"[:remaining].strip()
-        if not value:
-            break
-        selected.append(value)
-        remaining -= len(value)
-        if remaining == 0:
-            break
-    return selected
-
-
-def _allocate_query_slots(
-    subquestions: list[SubQuestion],
-    *,
-    remaining_budget: int,
-    max_per_subquestion: int,
-) -> dict[str, int]:
-    """Allocate one query per target before assigning a second query."""
-    allocations = {item.id: 0 for item in subquestions}
-    for _ in range(max_per_subquestion):
-        for item in subquestions:
-            if remaining_budget == 0:
-                return allocations
-            allocations[item.id] += 1
-            remaining_budget -= 1
-    return allocations
+    """The planner owns gap selection; this node only translates its tasks."""
+    return state["research"].get("active_subquestions") or state["research"]["subquestions"]
 
 
 def _seconds_remaining(state: WorkflowState) -> float:
@@ -144,7 +58,13 @@ async def research_query_generator_node(
         settings.research_limits.max_total_queries_per_job,
         control.budget.max_search_queries,
     )
-    remaining_query_budget = max(0, max_total_queries - len(current_queries))
+    remaining_query_budget = max(0, max_total_queries - max(
+        len(current_queries), control.usage.queries_executed,
+    ))
+    if research["iteration_count"] > 0:
+        remaining_query_budget = min(
+            remaining_query_budget, settings.research_limits.max_followup_queries_per_round,
+        )
 
     logger.info(
         "\nSearch query generation started.",
@@ -160,16 +80,11 @@ async def research_query_generator_node(
     # print("\nexisting search queries:", research["search_queries"])
     # print('LLM Service:', llm_service)
 
-    target_subquestions = _get_target_subquestions(state)
-    query_slots = _allocate_query_slots(
-        target_subquestions,
-        remaining_budget=remaining_query_budget,
-        max_per_subquestion=settings.research_limits.max_queries_per_subquestion,
-    )
+    target_subquestions = _get_target_subquestions(state)[:remaining_query_budget]
     generated_queries: list[SearchQuery] = []
     existing_queries = {_normalize_query(item.query) for item in current_queries}
     # for each subquestion generate queries
-    for subquestion in target_subquestions:
+    for index, subquestion in enumerate(target_subquestions):
         if remaining_query_budget == 0:
             logger.warning("Research query budget has been exhausted.")
             break
@@ -179,22 +94,21 @@ async def research_query_generator_node(
             logger.warning("Research time budget exhausted during query generation.")
             break
 
-        previous_queries = [
-            item.query for item in current_queries
-            if item.subquestion_id == subquestion.id
-        ]
-        max_queries = query_slots[subquestion.id]
+        previous_queries = [item.query for item in [*current_queries, *generated_queries]]
+        # Reserve one search for every remaining task; unused capacity carries forward.
+        reserved_queries = len(target_subquestions) - index - 1
+        max_queries = min(
+            settings.research_limits.max_queries_per_subquestion,
+            remaining_query_budget - reserved_queries,
+        )
         if max_queries == 0:
             continue
-        messages = build_query_generator_messages(
+        query_planner_prompt = build_query_generator_messages(
             original_question=state["question"],
             subquestion=subquestion,
             max_queries=max_queries,
             previous_queries=previous_queries,
             current_date=datetime.now(UTC).date().isoformat(),
-            coverage_gap=_get_coverage_gap(state, subquestion.id),
-            suggested_queries=_get_suggested_queries(state, subquestion.id),
-            previous_evidence=_get_previous_evidence(state, subquestion.id),
         )
         metadata = LLMCallMetadata(
             job_id=state["job_id"],
@@ -204,11 +118,14 @@ async def research_query_generator_node(
             contains_private_data=ResearchSource.DOCUMENTS in state["allowed_sources"],
         )
 
+        print('\query_planner_prompt: ')
+        print(query_planner_prompt)
+
         try:
             query_output = await asyncio.wait_for(
                 llm_service.invoke_structured(
                     role=LLMRole.QUERY_GENERATOR,
-                    messages=messages,
+                    messages=query_planner_prompt,
                     output_schema=QueryGeneratorOutput,
                     metadata=metadata,
                 ),
@@ -267,6 +184,21 @@ async def research_query_generator_node(
             accepted_for_subquestion += 1
             remaining_query_budget -= 1
 
+    if _seconds_remaining(state) <= 0:
+        return {
+            "research": {
+                **research, "search_queries": [*current_queries, *generated_queries],
+                "stop_reason": ResearchStopReason.TIME_BUDGET_EXHAUSTED,
+            },
+            "research_control": control.model_copy(update={
+                "last_decision": ResearchDecision(
+                    action="write_report", reason="Research time budget exhausted.",
+                    has_unresolved_gaps=bool(control.pending_gaps), budget_exhausted=True,
+                ),
+            }),
+            "errors": errors,
+        }
+
     if not generated_queries:
         logger.warning(
             "Query Generator produced no usable new queries.",
@@ -284,7 +216,16 @@ async def research_query_generator_node(
             message=f"No valid new search queries were generated for research iteration {next_iteration}.",
             recoverable=True,
         ))
-        return {"errors": errors}
+        return {
+            "research": {**research, "stop_reason": ResearchStopReason.NO_ACTIONABLE_GAPS},
+            "research_control": control.model_copy(update={
+                "last_decision": ResearchDecision(
+                    action="write_report", reason="No usable new queries remain.",
+                    has_unresolved_gaps=bool(control.pending_gaps),
+                ),
+            }),
+            "errors": errors,
+        }
 
     updated_queries = [*current_queries, *generated_queries]
     logger.info(

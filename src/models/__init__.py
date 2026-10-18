@@ -30,8 +30,10 @@ from src.models.report_model import (
     SemanticFindingCheck,
 )
 from src.models.research_model import (
+    FollowupPlannerOutput,
     GeneratedSearchQuery,
     PlannedSubQuestion,
+    PlannedFollowupSubQuestion,
     PlannerOutput,
     QueryGeneratorOutput,
     ResearchRequest,
@@ -66,6 +68,8 @@ from src.models.retrieval_model import (
 
 
 __all__ = [
+    "FollowupPlannerOutput",
+    "PlannedFollowupSubQuestion",
     "CitationCheckResult",
     "CitationIssue",
     "CoverageGap",

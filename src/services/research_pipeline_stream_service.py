@@ -35,6 +35,16 @@ def _safe_details(
     if not isinstance(output, dict):
         return {}
 
+    if node in {"research_planner", "research_query_generator"}:
+        research = output.get("research", {})
+        reason = _field(research, "stop_reason")
+        return {
+            "active_subquestion_count": len(_field(research, "active_subquestions", [])),
+            "stop_reason": getattr(reason, "value", reason),
+            "reason": str(getattr(reason, "value", reason) or "").replace("_", " "),
+            "gap_count": len(_field(output.get("research_control"), "pending_gaps", [])),
+        }
+
     if node == "research_source_selection":
         source_mode = output.get("source_mode")
         if source_mode is None:
@@ -301,6 +311,11 @@ async def run_graph_with_events(
             await recorder.emit(
                 "stage_completed", stage, "completed", iteration=iteration, details=details,
             )
+
+            if stage in {"research_planner", "research_query_generator"} and details.get("stop_reason"):
+                await recorder.emit(
+                    "research_stopped", stage, "completed", iteration=iteration, details=details,
+                )
 
             if stage == "research_routing":
                 action = details.get("action")

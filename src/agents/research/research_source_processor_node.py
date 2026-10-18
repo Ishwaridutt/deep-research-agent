@@ -134,7 +134,7 @@ async def research_source_processor_node(
     ranked_results = _rank_grouped_results(
         grouped_results,
         queries=research["search_queries"],
-        subquestion_ids=[item.id for item in research["subquestions"]],
+        subquestion_ids=[item.id for item in (research.get("active_subquestions") or research["subquestions"])],
     )
     sources = list(research["sources"])
     errors = list(state["errors"])

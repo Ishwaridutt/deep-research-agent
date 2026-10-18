@@ -41,6 +41,12 @@ EVALUATION RULES:
    previously supported assessment unless newly supplied evidence creates a
    specific contradiction or exposes a concrete failure of that objective.
    If you downgrade it, identify the new evidence or contradiction responsible.
+9. The supplied subquestions are the stable original objectives. Follow-up
+   research contributes evidence to them; it does not add new objectives.
+   Do not invent date ranges, populations, required study designs, or demands
+   for statistical significance absent from the original question/objective.
+   Null or uncertain results can answer a question; distinguish what evidence
+   says from a failure to retrieve evidence.
 
 SUBQUESTION ASSESSMENT:
 
@@ -67,9 +73,13 @@ RESEARCH GAPS:
 
 For every unresolved subquestion:
 - Identify the specific missing information or uncertainty.
+- Keep each gap atomic: one material missing claim, outcome, or comparison.
+  Return several gaps when independent research tasks are required, instead
+  of packing unrelated requirements into a single gap.
 - Explain what additional evidence would resolve it.
 - Assign priority from 1 (low) to 5 (critical).
-- Suggest 1-2 targeted search queries when useful.
+- Describe evidence needed for the planner to create follow-up subquestions.
+  Optional search suggestions are hints, not a replacement for planning.
 - Suggested queries must be directly executable and use concrete entities
   found in the supplied evidence when applicable. Never return placeholders.
 - Resolve relative time periods into exact dates or years using the current

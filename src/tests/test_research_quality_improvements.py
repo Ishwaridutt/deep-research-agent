@@ -1,6 +1,5 @@
 """Focused tests for generic multi-round research quality controls."""
 
-from src.agents.research.research_query_generator_node import _allocate_query_slots
 from src.models import (
     CoverageResult,
     CoverageStatus,
@@ -21,18 +20,6 @@ def _subquestion(identifier: str) -> SubQuestion:
     )
 
 
-def test_query_slots_are_allocated_fairly_before_second_queries():
-    subquestions = [_subquestion("sq-1"), _subquestion("sq-2"), _subquestion("sq-3")]
-
-    allocations = _allocate_query_slots(
-        subquestions,
-        remaining_budget=4,
-        max_per_subquestion=2,
-    )
-
-    assert allocations == {"sq-1": 2, "sq-2": 1, "sq-3": 1}
-
-
 def test_research_prompts_ground_dates_and_followup_context():
     current_date = "2026-10-16"
     planner = build_planner_messages(
@@ -46,9 +33,6 @@ def test_research_prompts_ground_dates_and_followup_context():
         max_queries=2,
         previous_queries=["previous query"],
         current_date=current_date,
-        coverage_gap="A direct comparison is missing.",
-        suggested_queries=["Entity A Entity B comparison 2025 2026"],
-        previous_evidence=["Entity A reported measurable growth."],
     )
 
     assert current_date in planner[0].content
@@ -58,8 +42,9 @@ def test_research_prompts_ground_dates_and_followup_context():
     assert current_date in query[0].content
     assert "fixed scope" in query[0].content
     assert "primary and directly attributable" in query[0].content
-    assert "Entity A Entity B comparison 2025 2026" in query[1].content
-    assert "Entity A reported measurable growth" in query[1].content
+    assert "previous query" in query[1].content
+    assert "do not" in query[0].content
+    assert "generate subquestions" in query[0].content
 
 
 def test_coverage_prompt_includes_safe_source_context():

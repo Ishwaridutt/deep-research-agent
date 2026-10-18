@@ -14,15 +14,17 @@ from src.llm import (
     LLMServiceError,
 )
 from src.llm import factory as llm_factory
-from src.models import EvidenceExtractionOutput
+from src.models import EvidenceExtractionOutput, SemanticCitationCheckOutput
 
 
 class FakeModel:
     def __init__(self, outcome):
         self.outcome = outcome
         self.calls = 0
+        self.structured_options = None
 
-    def with_structured_output(self, output_schema, method):
+    def with_structured_output(self, output_schema, method, **options):
+        self.structured_options = options
         return self
 
     async def ainvoke(self, messages, config):
@@ -120,6 +122,65 @@ def test_structured_output_failure_does_not_blacklist_the_only_provider():
 
     assert result.evidence == []
     assert groq.calls == 2
+
+
+def test_groq_tool_call_failure_is_retried_as_structured_output_error():
+    groq = FakeModel(RuntimeError("tool_use_failed: failed to call a function"))
+    service = _service(("groq", groq), attempts=2)
+
+    with pytest.raises(LLMServiceError, match="invalid structured output"):
+        asyncio.run(_invoke(service, _metadata()))
+
+    assert groq.calls == 2
+
+
+def test_groq_json_validation_failure_is_retried_from_error_code():
+    class GroqValidationError(RuntimeError):
+        body = {
+            "error": {
+                "code": "json_validate_failed",
+                "type": "invalid_request_error",
+                "failed_generation": "PRIVATE GENERATED CONTENT",
+            }
+        }
+
+    groq = FakeModel(GroqValidationError("Bad request"))
+    service = _service(("groq", groq), attempts=2)
+
+    with pytest.raises(LLMServiceError, match="invalid structured output"):
+        asyncio.run(_invoke(service, _metadata()))
+
+    assert groq.calls == 2
+
+
+def test_groq_json_schema_uses_strict_structured_output():
+    groq = FakeModel(SemanticCitationCheckOutput(
+        revised_executive_summary="Supported summary.",
+        finding_results=[],
+    ))
+    service = LLMService({
+        LLMRole.CITATION_CHECKER: [
+            LLMProviderModel(provider="groq", model=groq),
+        ],
+    })
+
+    asyncio.run(service.invoke_structured(
+        role=LLMRole.CITATION_CHECKER,
+        messages=[],
+        output_schema=SemanticCitationCheckOutput,
+        metadata=_metadata(),
+    ))
+
+    assert groq.structured_options == {"strict": True}
+
+
+def test_groq_evidence_extraction_uses_strict_structured_output():
+    groq = FakeModel(EvidenceExtractionOutput(evidence=[]))
+    service = _service(("groq", groq))
+
+    asyncio.run(_invoke(service, _metadata()))
+
+    assert groq.structured_options == {"strict": True}
 
 
 def test_terminal_context_error_does_not_fall_back():

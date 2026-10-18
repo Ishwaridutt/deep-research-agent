@@ -350,9 +350,10 @@ function updateElapsed() {
 }
 function getStageState(stage, round = null) {
     let state = "pending";
+    const stageRound = round ?? (stage === "research_planner" ? 1 : null);
     for (const event of events) {
         if (event.stage !== stage) continue;
-        if (round !== null && event.iteration !== round) continue;
+        if (stageRound !== null && event.iteration !== stageRound) continue;
         if (event.event_type === "stage_started") state = "running";
         if (event.event_type === "stage_completed") state = "completed";
         if (event.event_type === "stage_failed") state = "failed";
@@ -382,7 +383,9 @@ function renderGroup(title, hint, stages) {
     return group;
 }
 function researchRounds() {
-    return [...new Set(events.filter(event => RESEARCH.includes(event.stage) && Number.isInteger(event.iteration))
+    return [...new Set(events.filter(event =>
+        (RESEARCH.includes(event.stage) || (event.stage === "research_planner" && event.iteration > 1))
+        && Number.isInteger(event.iteration))
         .map(event => event.iteration))].sort((a, b) => a - b);
 }
 function roundEvent(round, type) {
@@ -393,14 +396,15 @@ function roundCoverage(round) {
         event.stage === "research_coverage_evaluator" && event.event_type === "stage_completed").at(-1);
 }
 function researchStages(round) {
+    const stages = round > 1 ? ["research_planner", ...RESEARCH] : RESEARCH;
     const selection = events.find(event =>
         event.iteration === round
         && event.stage === "research_source_selection"
         && event.event_type === "stage_completed");
     if (selection?.details?.source_mode === "documents") {
-        return RESEARCH.filter(stage => !["research_web_search", "research_source_processor"].includes(stage));
+        return stages.filter(stage => !["research_web_search", "research_source_processor"].includes(stage));
     }
-    return RESEARCH;
+    return stages;
 }
 function buildRoundCard(round, latest) {
     const retry = roundEvent(round, "research_retry");

@@ -25,6 +25,7 @@ from src.rendering.finalize_report import finalize_report_node
 from src.guardrails.input_guardrail import input_guardrail_node
 from src.graph.graph_routing import (
     research_routing_node,
+    route_after_planning,
     route_after_research,
     route_after_source_selection,
     route_after_terminal_check,
@@ -220,9 +221,10 @@ def build_research_graph(
 
     builder.add_conditional_edges(
         RESEARCH_PLANNER,
-        route_after_terminal_check,
+        route_after_planning,
         {
             "continue": RESEARCH_QUERY_GENERATOR,
+            "write_report": WRITER_PREPARE_EVIDENCE,
             "terminal_error": END,
         },
     )
@@ -231,9 +233,14 @@ def build_research_graph(
     # Retrieval pipeline
     #
 
-    builder.add_edge(
+    builder.add_conditional_edges(
         RESEARCH_QUERY_GENERATOR,
-        RESEARCH_SOURCE_SELECTION,
+        route_after_planning,
+        {
+            "continue": RESEARCH_SOURCE_SELECTION,
+            "write_report": WRITER_PREPARE_EVIDENCE,
+            "terminal_error": END,
+        },
     )
 
     builder.add_conditional_edges(
@@ -278,7 +285,7 @@ def build_research_graph(
         RESEARCH_ROUTING,
         route_after_research,
         {
-            "continue_research": RESEARCH_QUERY_GENERATOR,
+            "continue_research": RESEARCH_PLANNER,
             "write_report": WRITER_PREPARE_EVIDENCE,
             "terminal_error": END,
         },

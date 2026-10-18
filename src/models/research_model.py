@@ -66,6 +66,18 @@ class PlannerOutput(BaseModel):
     subquestions: list[PlannedSubQuestion]
 
 
+class PlannedFollowupSubQuestion(PlannedSubQuestion):
+    """A gap-focused task linked to an original research objective."""
+
+    parent_subquestion_id: str = Field(min_length=1)
+
+
+class FollowupPlannerOutput(BaseModel):
+    """Refinement may return no tasks when another search would not help."""
+
+    subquestions: list[PlannedFollowupSubQuestion]
+
+
 class SubQuestion(BaseModel):
     """A persisted subquestion belonging to the research plan."""
 
@@ -80,6 +92,9 @@ class SubQuestion(BaseModel):
     objective: str = Field(
         min_length=1,
     )
+
+    parent_subquestion_id: str | None = None
+    iteration: int = Field(default=1, ge=1)
 
 
 class GeneratedSearchQuery(BaseModel):

@@ -29,14 +29,19 @@ def _result(
     canonical_id: str,
     url: str,
     metadata: dict | None = None,
+    title: str | None = None,
+    snippet: str | None = None,
+    provider_score: float | None = None,
 ) -> SearchResult:
     return SearchResult(
         id=result_id,
         query_id="query-1",
         provider=provider,
         canonical_id=canonical_id,
-        title=result_id,
+        title=title or result_id,
         url=url,
+        snippet=snippet,
+        provider_score=provider_score,
         provider_metadata=metadata or {},
     )
 
@@ -80,6 +85,54 @@ def test_parallel_search_honors_concurrency_and_provider_limits():
     assert len(results) == 3
     assert tracker["maximum"] == 2
     assert [provider.max_results for provider in providers] == [4, 3, 2]
+
+
+def test_parallel_search_applies_one_ranked_aggregate_limit():
+    class Provider:
+        def __init__(self, results):
+            self.results = results
+
+        async def search(self, *, search_query, max_results):
+            return self.results
+
+        async def close(self):
+            pass
+
+    relevant = _result(
+        result_id="relevant",
+        provider=SourceProvider.WIKIPEDIA,
+        canonical_id="wikipedia:1",
+        url="https://en.wikipedia.org/wiki/Agentic_AI",
+        title="Agentic AI systems",
+        snippet="Agentic AI architectures and applications.",
+    )
+    composite = ParallelSearchProvider(
+        branches=[
+            ("web", Provider([
+                _result(
+                    result_id="web-1",
+                    provider=SourceProvider.TAVILY,
+                    canonical_id="web:https://example.com/1",
+                    url="https://example.com/1",
+                    provider_score=0.2,
+                ),
+                _result(
+                    result_id="web-2",
+                    provider=SourceProvider.TAVILY,
+                    canonical_id="web:https://example.com/2",
+                    url="https://example.com/2",
+                    provider_score=0.1,
+                ),
+            ]), 5),
+            ("wikipedia", Provider([relevant]), 3),
+        ],
+        max_concurrency=2,
+    )
+
+    results = asyncio.run(composite.search(search_query=_query(), max_results=2))
+
+    assert len(results) == 2
+    assert results[0].id == "relevant"
 
 
 def test_canonical_dedup_prefers_native_results_and_merges_provenance():

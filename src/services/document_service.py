@@ -99,6 +99,26 @@ class DocumentService:
         documents = await self.registry.list_documents(owner_id=owner_id)
         return sorted(documents, key=lambda item: item.created_at, reverse=True)
 
+    async def validate_documents_available(
+        self,
+        owner_id: str,
+        document_ids: list[str],
+    ) -> None:
+        """Reject stale selections before a research job is created."""
+
+        for document_id in dict.fromkeys(document_ids):
+            document = await self.registry.get_document(
+                owner_id=owner_id,
+                document_id=document_id,
+            )
+            if document is None or self.file_store.get_path(
+                storage_key=document.storage_key,
+            ) is None:
+                raise ValueError(
+                    "One or more selected documents are no longer available. "
+                    "Refresh the document list and upload them again."
+                )
+
     async def get_document(
         self,
         owner_id: str,
@@ -138,6 +158,7 @@ class DocumentService:
     ) -> None:
         """Parse selected files and build the existing job retrieval session."""
 
+        print("\nStarting document retrieval session for doc_id: ", document_ids)
         selected_document_ids = list(dict.fromkeys(document_ids))
         documents = [
             await self.get_document(owner_id, document_id)

@@ -234,6 +234,9 @@ class ResearchLimitSettings(EnvironmentSettings):
         ge=1,
     )
 
+    # Initial research keeps its allowance; retries focus the remaining budget.
+    max_followup_queries_per_round: int = Field(default=5, ge=1)
+
     max_search_query_chars: int = Field(
         default=500,
         ge=1,

@@ -70,8 +70,11 @@ async def research_evidence_extractor_node(
 
     subquestions_by_id = {
         subquestion.id: subquestion
-        for subquestion in state["research"]["subquestions"]
+        for subquestion in (
+            state["research"].get("active_subquestions") or state["research"]["subquestions"]
+        )
     }
+    original_objective_ids = {item.id for item in state["research"]["subquestions"]}
 
     existing_evidence_keys = {
         (
@@ -109,6 +112,11 @@ async def research_evidence_extractor_node(
         subquestion = subquestions_by_id.get(retrieval_result.subquestion_id)
 
         if subquestion is None:
+            continue
+
+        # Coverage and the writer keep assessing the original objective IDs.
+        objective_id = subquestion.parent_subquestion_id or subquestion.id
+        if objective_id not in original_objective_ids:
             continue
 
         chunks_by_id = {
@@ -182,7 +190,7 @@ async def research_evidence_extractor_node(
                 continue
 
             evidence_key = (
-                subquestion.id,
+                objective_id,
                 _normalize_evidence_text(content),
             )
 
@@ -194,7 +202,7 @@ async def research_evidence_extractor_node(
             new_evidence.append(
                 Evidence(
                     id=generate_evidence_id(),
-                    subquestion_id=subquestion.id,
+                    subquestion_id=objective_id,
                     source_id=(
                         chunk.metadata.get("private_document_id")
                         or chunk.document_id
@@ -207,6 +215,8 @@ async def research_evidence_extractor_node(
                         "chunk_index": chunk.chunk_index,
                         "title": chunk.title,
                         "section": chunk.section,
+                        "research_subquestion_id": subquestion.id,
+                        "research_iteration": target_iteration,
                     },
                     content=content,
                     relevance_score=candidate.relevance_score,

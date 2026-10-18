@@ -29,6 +29,7 @@ from src.services.research_pipeline_stream_service import (
     run_graph_with_events,
 )
 from src.services.research_job_resources import ResearchJobResources
+from src.services.document_service import DocumentService
 
 
 logger = logging.getLogger(__name__)
@@ -36,6 +37,10 @@ logger = logging.getLogger(__name__)
 
 class ResearchJobQueueFull(Exception):
     """The local execution queue has reached its configured limit."""
+
+
+class ResearchRequestValidationError(ValueError):
+    """Raised when a request cannot safely enter the research graph."""
 
 
 def _failure_details(result: ResearchExecutionResult) -> dict:
@@ -64,6 +69,7 @@ class ResearchService:
         settings: Settings,
         job_store: ResearchJobStore,
         llm_service: LLMService | None = None,
+        document_service: DocumentService | None = None,
         max_concurrent_jobs: int = 2,
         max_pending_jobs: int = 20,
     ) -> None:
@@ -71,11 +77,46 @@ class ResearchService:
         self._settings = settings
         self._job_store = job_store
         self._llm_service = llm_service
+        self._document_service = document_service
         self._task_slots = asyncio.Semaphore(max_concurrent_jobs)
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._admission_lock = asyncio.Lock()
         self._max_pending_jobs = max_pending_jobs
         self._shutting_down = False
+
+    async def _validate_source_selection(
+        self,
+        *,
+        source_selection: ResearchSourceSelection | None,
+        owner_id: str | None,
+    ) -> None:
+        """Validate private-document availability before spending LLM budget."""
+
+        selection = source_selection or ResearchSourceSelection()
+        if selection.mode == ResearchSourceMode.WEB:
+            return
+
+        normalized_owner_id = (owner_id or "").strip()
+        if not normalized_owner_id:
+            raise ResearchRequestValidationError(
+                "X-Owner-Id is required when private documents are selected."
+            )
+        if not selection.document_ids:
+            raise ResearchRequestValidationError(
+                "At least one private document must be selected for document research."
+            )
+        if self._document_service is None:
+            raise ResearchRequestValidationError(
+                "Private-document validation is unavailable."
+            )
+
+        try:
+            await self._document_service.validate_documents_available(
+                normalized_owner_id,
+                selection.document_ids,
+            )
+        except ValueError as exc:
+            raise ResearchRequestValidationError(str(exc)) from exc
 
     def _create_state(
         self,
@@ -147,6 +188,10 @@ class ResearchService:
     ) -> ResearchExecutionResult:
         """Preserve the existing synchronous /api/research behavior."""
 
+        await self._validate_source_selection(
+            source_selection=source_selection,
+            owner_id=owner_id,
+        )
         state = self._create_state(
             question=question,
             source_selection=source_selection,
@@ -187,6 +232,10 @@ class ResearchService:
     ) -> ResearchJobCreated:
         """Persist a queued job and start execution independently of SSE."""
 
+        await self._validate_source_selection(
+            source_selection=source_selection,
+            owner_id=owner_id,
+        )
         async with self._admission_lock:
             if self._shutting_down or len(self._tasks) >= self._max_pending_jobs:
                 raise ResearchJobQueueFull("The research job queue is currently full.")
