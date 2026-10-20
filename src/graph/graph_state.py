@@ -45,6 +45,11 @@ class ResearchAgentState(TypedDict):
     web_retrieval_results: list[RetrievalResult]
     document_retrieval_results: list[RetrievalResult]
     evidence: list[Evidence]
+    evidence_stats: dict[str, int | float | bool]
+    evidence_audit: list[dict]
+    retrieved_source_ids: list[str]
+    search_stats: dict
+    extraction_stats: dict
 
     iteration_count: int
 
@@ -62,6 +67,7 @@ class WriterAgentState(TypedDict):
     """
 
     evidence_ids: list[str]
+    source_stats: dict[str, int]
 
     draft_report: DraftReport | None
     citation_result: CitationCheckResult | None
@@ -141,6 +147,11 @@ def create_initial_workflow_state(
             web_retrieval_results=[],
             document_retrieval_results=[],
             evidence=[],
+            evidence_stats={},
+            evidence_audit=[],
+            retrieved_source_ids=[],
+            search_stats={},
+            extraction_stats={},
             iteration_count=0,
             coverage=None,
             stop_reason=None,
@@ -150,6 +161,7 @@ def create_initial_workflow_state(
         ),
         writer=WriterAgentState(
             evidence_ids=[],
+            source_stats={},
             draft_report=None,
             citation_result=None,
             final_report=None,

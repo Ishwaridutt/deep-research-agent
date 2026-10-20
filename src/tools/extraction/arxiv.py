@@ -50,10 +50,12 @@ class ArxivContentExtractor:
         abstract_content = self._abstract_content(search_result)
 
         if not self._full_text_enabled:
+            metadata["abstract_fallback_reason"] = "full_text_disabled"
             return self._abstract_result(search_result, metadata, abstract_content)
 
         pdf_url = str(metadata.get("pdf_url") or "").strip()
         if not pdf_url:
+            metadata["abstract_fallback_reason"] = "pdf_url_missing"
             return self._abstract_result(search_result, metadata, abstract_content)
 
         try:
@@ -65,9 +67,10 @@ class ArxivContentExtractor:
             PyPdfError,
             SourceExtractionError,
             ValueError,
-        ):
+        ) as exc:
             if not abstract_content:
                 raise SourceExtractionError("arXiv paper extraction failed.")
+            metadata["abstract_fallback_reason"] = type(exc).__name__
             return self._abstract_result(search_result, metadata, abstract_content)
 
         content = self._full_text_content(search_result, parsed)
@@ -75,12 +78,19 @@ class ArxivContentExtractor:
             "content_source": "pdf",
             "pdf_bytes": len(pdf),
             "pages_loaded": len(parsed.blocks),
+            "pages_processed": parsed.pages_processed,
+            "total_pages": parsed.total_pages,
+            "pdf_truncated": (
+                parsed.pages_processed < parsed.total_pages
+                if parsed.pages_processed is not None and parsed.total_pages is not None else None
+            ),
         })
 
         print(
             "arXiv paper loaded:",
             f"canonical_id={search_result.canonical_id}",
             f"pages={len(parsed.blocks)}",
+            f"processed={parsed.pages_processed} total={parsed.total_pages} truncated={metadata['pdf_truncated']}",
         )
         return ExtractedSourceContent(
             url=search_result.url,
@@ -168,6 +178,7 @@ class ArxivContentExtractor:
         print(
             "arXiv abstract loaded:",
             f"canonical_id={search_result.canonical_id}",
+            f"reason={metadata.get('abstract_fallback_reason', 'unknown')}",
         )
         return ExtractedSourceContent(
             url=search_result.url,

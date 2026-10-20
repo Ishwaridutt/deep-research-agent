@@ -64,6 +64,12 @@ def _validate_finding_references(
                 )
             )
 
+        if set(_extract_evidence_ids([finding.content])) - set(finding.evidence_ids):
+            finding_issues.append(CitationIssue(
+                finding_index=index,
+                description="Inline citations are not listed in the finding's supporting evidence IDs.",
+            ))
+
         for evidence_id in finding.evidence_ids:
             if evidence_id not in allowed_evidence_ids:
                 finding_issues.append(
@@ -299,6 +305,7 @@ def _build_user_facing_report_content(
     }
     final_findings = [
         FinalReportFinding(
+            section=finding.section,
             title=finding.title,
             content=_render_source_citations(
                 finding.content,
@@ -530,6 +537,14 @@ async def writer_citation_checker_node(
         )
 
     else:
+        summary = semantic_output.revised_executive_summary.strip()
+        supported_ids = {
+            identifier for finding in supported_findings for identifier in finding.evidence_ids
+        }
+        summary_ids = set(_extract_evidence_ids([summary]))
+        # Reject missing citations or references outside the surviving findings.
+        if not summary_ids or not summary_ids.issubset(supported_ids):
+            summary = "See the validated findings below for the supported research conclusions."
         limitations = _with_citation_limitation(
             draft_report.limitations,
             issues=all_issues,
@@ -547,7 +562,14 @@ async def writer_citation_checker_node(
             evidence_by_id=evidence_by_id,
         )
         final_report = ResearchReport(
-            executive_summary=semantic_output.revised_executive_summary.strip(),
+            title=draft_report.title,
+            executive_summary=_render_source_citations(
+                summary,
+                evidence_by_id=evidence_by_id,
+                source_number_by_id={
+                    source.source_id: index for index, source in enumerate(report_sources, 1)
+                },
+            ),
             findings=final_findings,
             limitations=final_limitations,
             sources=report_sources,

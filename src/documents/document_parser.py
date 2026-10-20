@@ -69,5 +69,8 @@ class DocumentParser:
         return ParsedDocument(
             document_id=document_id,
             blocks=blocks,
+            total_pages=len(pages) if document_format == DocumentFormat.PDF else None,
+            pages_processed=(min(len(pages), max_pages) if max_pages is not None else len(pages))
+            if document_format == DocumentFormat.PDF else None,
         )
     

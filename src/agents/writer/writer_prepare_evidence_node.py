@@ -51,7 +51,7 @@ def _evidence_fits_budget(
     max_chars: int,
 ) -> bool:
     """Returns whether an Evidence item fits within the Writer context budget."""
-
+    # added this for groq for char limit so context window does not overlfow
     return True
     # return (
     #     selected_count < max_items
@@ -179,11 +179,18 @@ def writer_prepare_evidence_node(
         evidence_item.id
         for evidence_item in selected_evidence
     ]
+    source_stats = {
+        "collected": len({source.id for source in state["research"]["sources"]}),
+        "retrieved": len(set(state["research"].get("retrieved_source_ids", []))),
+        "accepted": len({item.source_id for item in evidence}),
+        "supplied_to_writer": len({item.source_id for item in selected_evidence}),
+    }
 
     logger.info(
         "Writer evidence preparation completed.",
         extra={
             "event": "writer_evidence_preparation_completed",
+            "data": {"source_lineage": source_stats, "selected_evidence_count": len(selected_evidence)},
             "job_id": state["job_id"],
             "research_session_id": state["research_session_id"],
             "node": "writer_prepare_evidence",
@@ -195,6 +202,7 @@ def writer_prepare_evidence_node(
         "writer": {
             **state["writer"],
             "evidence_ids": selected_evidence_ids,
+            "source_stats": source_stats,
         }
     }
 

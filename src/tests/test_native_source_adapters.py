@@ -169,6 +169,8 @@ def test_arxiv_extractor_reuses_parser_with_pdf_page_limit():
             self.call = (document_id, path, document_format, max_pages)
             return ParsedDocument(
                 document_id=document_id,
+                total_pages=31,
+                pages_processed=7,
                 blocks=[ParsedDocumentBlock(
                     text="Full paper text",
                     location=DocumentSourceLocation(page_start=1, page_end=1),
@@ -216,6 +218,11 @@ def test_arxiv_extractor_reuses_parser_with_pdf_page_limit():
     assert parser.call[0] == result.canonical_id
     assert parser.call[3] == 7
     assert loaded.provider_metadata["content_source"] == "pdf"
+    assert loaded.url == result.url  # Citation stays on /abs/; content comes from the PDF.
+    assert loaded.provider_metadata["pages_loaded"] == 1
+    assert loaded.provider_metadata["pages_processed"] == 7
+    assert loaded.provider_metadata["total_pages"] == 31
+    assert loaded.provider_metadata["pdf_truncated"] is True
     assert "## Page 1" in loaded.content
 
 

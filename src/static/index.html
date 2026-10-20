@@ -7,6 +7,8 @@
     <meta name="description" content="Evidence-grounded deep research with transparent, live execution progress.">
     <title>Deep Research Agent · Workspace</title>
     <link rel="stylesheet" href="/static/css/styles.css">
+    <script src="/static/js/vendor/marked-18.1.1.js" defer></script>
+    <script src="/static/js/vendor/purify-3.4.17.min.js" defer></script>
     <script src="/static/js/app.js" defer></script>
 </head>
 <body>
@@ -75,8 +77,8 @@
 
         <section id="pipeline-panel" class="panel workflow-panel hidden" aria-labelledby="pipeline-heading">
             <div class="section-header">
-                <div><p class="section-kicker">02 / LIVE EXECUTION</p><h2 id="pipeline-heading">Inside the research</h2><p class="section-desc">Actual workflow events, not an estimated progress bar.</p></div>
-                <div class="execution-meta"><span id="workflow-elapsed">00:00 elapsed</span><button type="button" id="copy-job-link" class="text-button" title="Copy a link to this research job">Copy job link ↗</button></div>
+                <div><p class="section-kicker">02 / LIVE EXECUTION</p><h2 id="pipeline-heading">Inside the research</h2><p class="section-desc">Expand completed research stages to inspect the plan, queries, evidence counts, and coverage decisions.</p></div>
+                <div class="execution-meta"><span id="workflow-job"></span><span id="workflow-elapsed">00:00 elapsed</span><button type="button" id="copy-job-link" class="text-button" title="Copy a link to this research job">Copy job link ↗</button></div>
             </div>
             <div class="workflow-grid">
                 <div id="pipeline-timeline" class="pipeline-timeline" aria-label="Research pipeline stages"></div>
@@ -84,8 +86,8 @@
                     <div class="insight-card">
                         <p class="insight-label">LATEST COVERAGE CHECK</p>
                         <div id="coverage-status" class="insight-value">Awaiting evaluation</div>
-                        <p id="coverage-description" class="insight-explanation">The evidence evaluator will check research coverage after extraction.</p>
-                        <div class="insight-stats"><div><strong id="coverage-gap-count">—</strong><span>Open gaps</span></div><div><strong id="coverage-assessment-count">—</strong><span>Objectives assessed</span></div></div>
+                        <p id="coverage-description" class="insight-explanation">The evidence evaluator will check research coverage after scoring.</p>
+                        <div class="insight-stats"><div><strong id="coverage-gap-count">—</strong><span>Gaps / limitations</span></div><div><strong id="coverage-assessment-count">—</strong><span>Objectives assessed</span></div></div>
                     </div>
                     <div class="insight-card activity-card">
                         <div class="insight-heading"><p class="insight-label">ACTIVITY</p><span id="event-count" class="activity-count">0 events</span></div>
@@ -102,10 +104,10 @@
                 <div id="result-status" class="status-badge"></div>
             </div>
             <div id="job-metadata" class="metadata"></div>
-            <section class="report-section"><h3>Executive summary</h3><p id="report-summary" class="report-summary"></p></section>
-            <section class="report-section"><h3>Key findings</h3><div id="report-findings"></div></section>
+            <section class="report-section"><h3>Executive summary</h3><div id="report-summary" class="report-summary report-markdown"></div></section>
+            <section class="report-section"><h3>Research analysis</h3><div id="report-findings"></div></section>
             <section class="report-section"><h3>Limitations</h3><ul id="report-limitations"></ul></section>
-            <section class="report-section"><h3>Sources</h3><ol id="report-sources"></ol></section>
+            <section class="report-section"><h3>Cited sources</h3><p id="source-lineage" class="detail-muted"></p><ol id="report-sources"></ol></section>
             <section id="workflow-errors-section" class="report-section hidden"><h3>Workflow notes</h3><ul id="workflow-errors"></ul></section>
             <details id="markdown-section" class="markdown-section"><summary>View generated Markdown</summary><pre id="report-markdown"></pre></details>
         </section>

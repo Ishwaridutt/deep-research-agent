@@ -2,19 +2,17 @@
 
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from src.models.source_model import SourceType
 
 
 class EvidenceCandidate(BaseModel):
-    """Evidence extracted semantically by the LLM from retrieved context."""
+    """A chunk relevance judgment; source text stays application-owned."""
+
+    model_config = ConfigDict(extra="forbid")
 
     chunk_id: str = Field(
-        min_length=1,
-    )
-
-    content: str = Field(
         min_length=1,
     )
 
@@ -25,9 +23,9 @@ class EvidenceCandidate(BaseModel):
 
 
 class EvidenceExtractionOutput(BaseModel):
-    """Structured output returned by the evidence extractor."""
+    """Chunk scores, retaining the existing schema name and LLM role."""
 
-    evidence: list[EvidenceCandidate]
+    evidence: list[EvidenceCandidate] = Field(description="Exactly one relevance score per supplied chunk ID.")
 
     @field_validator("evidence", mode="before")
     @classmethod

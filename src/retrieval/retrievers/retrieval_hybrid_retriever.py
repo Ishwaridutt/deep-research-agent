@@ -5,6 +5,7 @@ from langchain_core.vectorstores import InMemoryVectorStore
 
 from src.models.retrieval_model import RetrievalChunk, RetrievedChunk
 from src.retrieval.retrievers.retrieval_bm25_retriever import RetrievalBM25Retriever
+from src.retrieval.retrievers.retrieval_content_quality import is_public_noise
 
 
 class RetrievalHybridRetriever:
@@ -44,6 +45,12 @@ class RetrievalHybridRetriever:
         """Builds the session-scoped semantic and BM25 retrievers."""
 
         self.clear()
+
+        # Filter before indexing/top-k so obvious noise cannot consume context
+        # slots. Both retrieval branches still search exactly the same corpus.
+        usable_chunks = [chunk for chunk in chunks if not is_public_noise(chunk)]
+        print("Retrieval passage eligibility:", len(usable_chunks), "kept;", len(chunks) - len(usable_chunks), "noise skipped")
+        chunks = usable_chunks
 
         if not chunks:
             return
@@ -126,5 +133,3 @@ class RetrievalHybridRetriever:
         )
 
         return Document(id=chunk.chunk_id, page_content=searchable_content, metadata=metadata)
-
-    

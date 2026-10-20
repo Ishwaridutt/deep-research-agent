@@ -40,27 +40,16 @@ def _group_evidence_by_subquestion(
 ) -> dict[str, list[Evidence]]:
     """Group accepted evidence by its planned subquestion."""
 
-    grouped = {
-        subquestion.id: []
-        for subquestion in subquestions
-    }
-
-    seen_ids = {
-        subquestion.id: set()
-        for subquestion in subquestions
-    }
+    grouped = {subquestion.id: [] for subquestion in subquestions}
+    seen_ids: set[tuple[str, str]] = set()
 
     for item in evidence:
-        subquestion_id = item.subquestion_id
-
-        if subquestion_id not in grouped:
+        key = (item.subquestion_id, item.id)
+        if item.subquestion_id not in grouped or key in seen_ids:
             continue
 
-        if item.id in seen_ids[subquestion_id]:
-            continue
-
-        grouped[subquestion_id].append(item)
-        seen_ids[subquestion_id].add(item.id)
+        grouped[item.subquestion_id].append(item)
+        seen_ids.add(key)
 
     return grouped
 
@@ -101,16 +90,7 @@ def _normalize_coverage_result(
     subquestions: list[SubQuestion],
     evidence_by_subquestion: dict[str, list[Evidence]],
 ) -> CoverageResult:
-    """
-    Validate LLM assessments against accepted research evidence.
-
-    A subquestion can only be supported when:
-    - Accepted evidence exists.
-    - The LLM supplies an assessment.
-    - Referenced evidence IDs are valid for that subquestion.
-    - Evidence strength is strong or moderate.
-    - No unresolved gap contradicts the assessment.
-    """
+    """Validate references without turning every qualification into more research."""
 
     valid_ids = {
         subquestion.id
@@ -134,14 +114,7 @@ def _normalize_coverage_result(
 
         seen_gaps.add(key)
 
-        gaps.append(
-            CoverageGap(
-                subquestion_id=gap.subquestion_id,
-                description=description,
-                priority=gap.priority,
-                suggested_queries=gap.suggested_queries,
-            )
-        )
+        gaps.append(gap.model_copy(update={"description": description}))
 
     # Only accept assessments for planned subquestions.
     assessments_by_id: dict[str, SubquestionCoverage] = {}
@@ -160,6 +133,7 @@ def _normalize_coverage_result(
         assessments_by_id[subquestion_id] = assessment
 
     normalized_assessments: list[SubquestionCoverage] = []
+    integrity_ok = bool(subquestions)
 
     for subquestion in subquestions:
         subquestion_id = subquestion.id
@@ -174,25 +148,28 @@ def _normalize_coverage_result(
 
         assessment = assessments_by_id.get(subquestion_id)
 
-        if not accepted_evidence_ids:
+        if assessment is None or subquestion_id in duplicate_assessment_ids:
+            integrity_ok = False
+            status = (
+                SubquestionCoverageStatus.PARTIAL if accepted_evidence_ids
+                else SubquestionCoverageStatus.MISSING
+            )
+            strength = EvidenceStrength.UNKNOWN
+            evidence_ids = []
+            reason = "A unique coverage assessment was not returned for this subquestion."
+        elif not accepted_evidence_ids:
+            # An honestly missing peripheral objective may coexist with a useful
+            # report, but claiming support without evidence is invalid output.
+            if assessment.status == SubquestionCoverageStatus.SUPPORTED or assessment.evidence_ids:
+                integrity_ok = False
             status = SubquestionCoverageStatus.MISSING
             strength = EvidenceStrength.UNKNOWN
             evidence_ids = []
             reason = "No accepted evidence is available."
-
-        elif assessment is None:
-            status = SubquestionCoverageStatus.PARTIAL
-            strength = EvidenceStrength.UNKNOWN
-            evidence_ids = []
-            reason = (
-                "No valid quality assessment was returned "
-                "for this subquestion."
-            )
-
         else:
             status = assessment.status
             strength = assessment.evidence_strength
-            reason = assessment.reason.strip()
+            reason = assessment.reason.strip() or "No coverage explanation was supplied."
 
             # Discard invented or incorrectly assigned evidence IDs.
             evidence_ids = list(
@@ -203,60 +180,12 @@ def _normalize_coverage_result(
                 )
             )
 
-            if subquestion_id in duplicate_assessment_ids:
-                status = SubquestionCoverageStatus.PARTIAL
-                reason = (
-                    "Duplicate coverage assessments were returned. "
-                    + reason
-                )
-
-            elif (
-                status == SubquestionCoverageStatus.SUPPORTED
-                and not evidence_ids
+            if set(assessment.evidence_ids) - accepted_evidence_ids or (
+                status == SubquestionCoverageStatus.SUPPORTED and not evidence_ids
             ):
+                integrity_ok = False
                 status = SubquestionCoverageStatus.PARTIAL
-                reason = (
-                    "No valid supporting evidence IDs were supplied. "
-                    + reason
-                )
-
-            elif (
-                status == SubquestionCoverageStatus.SUPPORTED
-                and strength in {
-                    EvidenceStrength.WEAK,
-                    EvidenceStrength.UNKNOWN,
-                }
-            ):
-                status = SubquestionCoverageStatus.PARTIAL
-                reason = (
-                    "Evidence strength is insufficient or unknown. "
-                    + reason
-                )
-
-        # An explicit unresolved gap overrides a supported status.
-        has_gap = any(
-            gap.subquestion_id == subquestion_id
-            for gap in gaps
-        )
-
-        if (
-            has_gap
-            and status == SubquestionCoverageStatus.SUPPORTED
-        ):
-            status = SubquestionCoverageStatus.PARTIAL
-            reason = (
-                "The evaluator reported an unresolved gap. "
-                + reason
-            )
-
-        if status != SubquestionCoverageStatus.SUPPORTED:
-            if not has_gap:
-                gaps.append(
-                    CoverageGap(
-                        subquestion_id=subquestion_id,
-                        description=reason,
-                    )
-                )
+                reason = "Supporting evidence references were invalid or missing. " + reason
 
         normalized_assessments.append(
             SubquestionCoverage(
@@ -268,43 +197,16 @@ def _normalize_coverage_result(
             )
         )
 
-    # Guard against contradictory LLM output:
-    # overall insufficient, but all objectives marked supported.
-    if (
-        coverage.status == CoverageStatus.INSUFFICIENT
-        and not gaps
-        and normalized_assessments
-    ):
-        first_assessment = normalized_assessments[0]
-
-        reason = (
-            "The evaluator reported insufficient overall coverage "
-            "without identifying a specific gap."
-        )
-
-        normalized_assessments[0] = first_assessment.model_copy(
-            update={
-                "status": SubquestionCoverageStatus.PARTIAL,
-                "reason": reason,
-            }
-        )
-
-        gaps.append(
-            CoverageGap(
-                subquestion_id=first_assessment.subquestion_id,
-                description=reason,
-            )
-        )
-
-    all_supported = bool(normalized_assessments) and all(
-        assessment.status == SubquestionCoverageStatus.SUPPORTED
+    # Overall readiness is the model's judgment of the core request, not an
+    # all-objectives checklist. Retain minor gaps for the writer as limitations.
+    has_report_evidence = any(
+        assessment.evidence_ids and assessment.status != SubquestionCoverageStatus.MISSING
         for assessment in normalized_assessments
     )
-
     is_sufficient = (
         coverage.status == CoverageStatus.SUFFICIENT
-        and all_supported
-        and not gaps
+        and integrity_ok
+        and has_report_evidence
     )
 
     return CoverageResult(
@@ -356,20 +258,20 @@ async def research_coverage_evaluator_node(
     subquestions = state["research"]["subquestions"]
     evidence = state["research"]["evidence"]
 
+    log_context = {
+        "job_id": state["job_id"],
+        "research_session_id": state["research_session_id"],
+        "node": "research_coverage_evaluator",
+        "iteration": iteration,
+    }
     logger.info(
         "Research coverage evaluation started.",
-        extra={
-            "event": "coverage_evaluation_started",
-            "job_id": state["job_id"],
-            "research_session_id": state["research_session_id"],
-            "node": "research_coverage_evaluator",
-            "iteration": iteration,
-        },
+        extra={**log_context, "event": "coverage_evaluation_started"},
     )
 
     if not subquestions:
         logger.error(
-            "Research coverage evaluation has no subquestions."
+            "Research coverage evaluation has no subquestions.", extra=log_context,
         )
 
         return _evaluation_error(
@@ -399,10 +301,7 @@ async def research_coverage_evaluator_node(
         )
 
         metadata = LLMCallMetadata(
-            job_id=state["job_id"],
-            research_session_id=state["research_session_id"],
-            node="research_coverage_evaluator",
-            iteration=iteration,
+            **log_context,
             contains_private_data=ResearchSource.DOCUMENTS in state["allowed_sources"],
         )
 
@@ -420,7 +319,11 @@ async def research_coverage_evaluator_node(
         except LLMServiceError as exc:
             print("Error in coverage eval: ", exc)
             logger.exception(
-                "Research coverage evaluation failed."
+                "Research coverage evaluation failed.",
+                extra={
+                    **log_context, "event": "coverage_evaluation_failed",
+                    "error_type": ErrorType.COVERAGE.value,
+                },
             )
 
             return _evaluation_error(
@@ -436,6 +339,11 @@ async def research_coverage_evaluator_node(
             subquestions=subquestions,
             evidence_by_subquestion=grouped_evidence,
         )
+        if raw_coverage.status == CoverageStatus.SUFFICIENT and coverage.status != raw_coverage.status:
+            logger.warning(
+                "Coverage readiness rejected: assessments or evidence references were invalid or lacked usable support.",
+                extra={**log_context, "event": "coverage_readiness_rejected"},
+            )
 
         print('\n coverage eval response: ')
         print(coverage)
@@ -444,10 +352,7 @@ async def research_coverage_evaluator_node(
         "Research coverage evaluation completed.",
         extra={
             "event": "coverage_evaluation_completed",
-            "job_id": state["job_id"],
-            "research_session_id": state["research_session_id"],
-            "node": "research_coverage_evaluator",
-            "iteration": iteration,
+            **log_context,
             "coverage_status": coverage.status.value,
             "gap_count": len(coverage.gaps),
             "assessment_count": len(coverage.assessments),

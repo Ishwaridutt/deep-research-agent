@@ -55,4 +55,6 @@ class RetrievalResult:
     chunks: list[RetrievedChunk]
     context: str
     estimated_tokens: int
+    # Per-intent matches before and after the shared context budget is applied.
+    query_matches: list[dict[str, Any]] = field(default_factory=list)
 

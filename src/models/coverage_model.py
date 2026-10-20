@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field
 
 
 class CoverageStatus(str, Enum):
-    """Overall research coverage."""
+    """Readiness to answer the core request, allowing disclosed minor gaps."""
 
     SUFFICIENT = "sufficient"
     INSUFFICIENT = "insufficient"
@@ -60,15 +60,15 @@ class SubquestionCoverage(BaseModel):
 
 
 class CoverageResult(BaseModel):
-    """Structured result of research coverage evaluation."""
+    """Report readiness plus per-objective diagnostics and remaining gaps."""
 
     status: CoverageStatus
 
     gaps: list[CoverageGap] = Field(
         default_factory=list,
+        description="Material blockers when insufficient; remaining report limitations when sufficient.",
     )
 
     assessments: list[SubquestionCoverage] = Field(
         default_factory=list,
     )
-    

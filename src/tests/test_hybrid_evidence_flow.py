@@ -35,7 +35,6 @@ def test_evidence_output_accepts_provider_items_wrapper():
         "evidence": {
             "items": [{
                 "chunk_id": "chunk-1",
-                "content": "Supported fact.",
                 "relevance_score": 0.9,
             }],
         },
@@ -224,14 +223,12 @@ def test_evidence_boundary_merges_web_and_document_provenance():
             EvidenceExtractionOutput(evidence=[
                 EvidenceCandidate(
                     chunk_id="web-1:0",
-                    content="Web finding",
                     relevance_score=0.9,
                 )
             ]),
             EvidenceExtractionOutput(evidence=[
                 EvidenceCandidate(
                     chunk_id="doc-1:block:0:0",
-                    content="Document finding",
                     relevance_score=0.95,
                 )
             ]),
@@ -252,6 +249,7 @@ def test_evidence_boundary_merges_web_and_document_provenance():
             SourceType.WEB,
             SourceType.DOCUMENT,
         ]
+        assert [item.content for item in evidence] == ["Current web evidence", "Private document evidence"]
         assert evidence[1].source_id == "doc-1"
         assert evidence[1].chunk_id == "doc-1:block:0:0"
         assert evidence[1].provenance["filename"] == "report.pdf"
@@ -300,7 +298,7 @@ def test_document_session_is_reused_across_coverage_iterations():
     asyncio.run(run())
 
 
-def test_hybrid_evidence_deduplicates_matching_claims_across_sources():
+def test_hybrid_evidence_preserves_matching_text_from_independent_sources():
     async def run() -> None:
         state = create_hybrid_state()
         retrieval = await research_retrieval_node(
@@ -316,15 +314,15 @@ def test_hybrid_evidence_deduplicates_matching_claims_across_sources():
         )
         state["research"] = retrieval["research"]
         shared_content = "The same supported claim"
+        for result in [*state["research"]["web_retrieval_results"], *state["research"]["document_retrieval_results"]]:
+            result.chunks[0].chunk.content = shared_content
         llm = FakeEvidenceLLM([
             EvidenceExtractionOutput(evidence=[EvidenceCandidate(
                 chunk_id="web-1:0",
-                content=shared_content,
                 relevance_score=0.9,
             )]),
             EvidenceExtractionOutput(evidence=[EvidenceCandidate(
                 chunk_id="doc-1:block:0:0",
-                content=shared_content,
                 relevance_score=0.9,
             )]),
         ])
@@ -340,7 +338,10 @@ def test_hybrid_evidence_deduplicates_matching_claims_across_sources():
             ),
         )
 
-        assert len(result["research"]["evidence"]) == 1
+        evidence = result["research"]["evidence"]
+        assert len(evidence) == 2
+        assert {item.content for item in evidence} == {shared_content}
+        assert {item.source_id for item in evidence} == {"web-1", "doc-1"}
 
     asyncio.run(run())
 

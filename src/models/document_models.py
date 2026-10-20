@@ -253,6 +253,8 @@ class ParsedDocument(BaseModel):
     """Normalized text extracted from an uploaded document."""
 
     document_id: str = Field(min_length=1)
+    total_pages: int | None = Field(default=None, ge=0)
+    pages_processed: int | None = Field(default=None, ge=0)
 
     blocks: list[ParsedDocumentBlock] = Field(
         default_factory=list,

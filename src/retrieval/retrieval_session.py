@@ -1,3 +1,5 @@
+from itertools import zip_longest
+
 from src.models.retrieval_model import RetrievalChunk, RetrievalDocument, RetrievalRequest, RetrievalResult, RetrievedChunk
 from src.retrieval.chunking.retrieval_chunker import RetrievalChunker
 from src.retrieval.context.retrieval_context_builder import RetrievalContextBuilder
@@ -42,16 +44,40 @@ class RetrievalSession:
         retrieval_query = self._build_retrieval_query(request)
         print(f"\nstarting retrieval for retrieval_query: ", retrieval_query)
 
-        # Search the shared session corpus using BM25 + semantic retrieval + RRF.
-        retrieved_chunks = self.hybrid_retriever.search(retrieval_query, top_k=self.top_k)
+        # Search each intent separately, then interleave rankings so a broad query
+        # cannot hide the narrow follow-up searches before context selection.
+        queries = list(dict.fromkeys(
+            query.strip() for query in request.search_queries if query.strip()
+        )) or [request.subquestion.strip()]
+        print("\nretrieval search intents:", queries)
+        rankings = [self.search(query) for query in queries]
+        retrieved_chunks = []
+        seen_chunk_ids: set[str] = set()
+        for rank_group in zip_longest(*rankings):
+            for result in rank_group:
+                if result is not None and result.chunk.chunk_id not in seen_chunk_ids:
+                    seen_chunk_ids.add(result.chunk.chunk_id)
+                    retrieved_chunks.append(RetrievedChunk(result.chunk, len(retrieved_chunks) + 1))
         print(f"\ncompleted retrieval for retrieval_query: ", retrieval_query, ' retrieved_chunks: ',len(retrieved_chunks))
 
         # Convert the ranked results into token-bounded context for the evidence extractor.
-        return self.context_builder.build(
+        result = self.context_builder.build(
             request=request,
             retrieval_query=retrieval_query,
             retrieved_chunks=retrieved_chunks,
         )
+        selected_ids = {item.chunk.chunk_id for item in result.chunks}
+        result.query_matches = [
+            {
+                "query": query,
+                "retrieved_count": len(ranking),
+                "selected_count": sum(item.chunk.chunk_id in selected_ids for item in ranking),
+                "selected_chunk_ids": [item.chunk.chunk_id for item in ranking if item.chunk.chunk_id in selected_ids],
+            }
+            for query, ranking in zip(queries, rankings)
+        ]
+        print("\nretrieval query matches:", result.query_matches)
+        return result
 
     def search(self, query: str, top_k: int | None = None) -> list[RetrievedChunk]:
         """Runs raw hybrid retrieval without building LLM context."""
@@ -65,11 +91,10 @@ class RetrievalSession:
         self.chunks = []
 
     def _build_retrieval_query(self, request: RetrievalRequest) -> str:
-        """Builds the search query used by both lexical and semantic retrieval."""
+        """Describe the request in result metadata; actual searches stay separate."""
 
         query_parts = [request.subquestion.strip()]
 
-        # Search queries often contain useful keywords and named entities that improve BM25 recall.
         for search_query in request.search_queries:
             search_query = search_query.strip()
 
@@ -77,5 +102,3 @@ class RetrievalSession:
                 query_parts.append(search_query)
 
         return "\n".join(query_parts)
-
-    

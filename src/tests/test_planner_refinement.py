@@ -5,20 +5,20 @@ import json
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
-from src.agents.research.research_planner_node import _build_subquestions, research_planner_node
+from src.agents.research.research_planner_node import _build_subquestions, _refinement_context, research_planner_node
 from src.agents.research.research_query_generator_node import research_query_generator_node
 from src.agents.research.research_retrieval_node import _retrieval_requests
 from src.graph import graph_builder
 from src.graph.graph_routing import route_after_planning
 from src.graph.graph_state import create_initial_workflow_state
-from src.llm import LLMRole
+from src.llm import LLMRole, LLMServiceError
 from src.models import (
-    CoverageGap, CoverageResult, CoverageStatus, EvidenceCandidate,
+    CoverageGap, CoverageResult, CoverageStatus, Evidence, EvidenceCandidate,
     EvidenceExtractionOutput, FollowupPlannerOutput, GeneratedSearchQuery,
     PlannedFollowupSubQuestion, PlannedSubQuestion, PlannerOutput,
     QueryGeneratorOutput, ResearchSource, ResearchStopReason,
     RetrievalChunk, RetrievalRequest, RetrievalResult, RetrievedChunk,
-    SearchQuery, SubQuestion,
+    SearchQuery, SourceType, SubQuestion,
 )
 from src.models.coverage_model import EvidenceStrength, SubquestionCoverage, SubquestionCoverageStatus
 from src.retrieval.context.retrieval_context_builder import RetrievalContextBuilder
@@ -28,7 +28,7 @@ from src.retrieval.retrieval_session import RetrievalSession
 def settings(**overrides):
     limits = dict(
         max_subquestions=5, max_queries_per_subquestion=5,
-        max_followup_queries_per_round=5, max_total_queries_per_job=30,
+        max_total_queries_per_job=30,
         max_search_query_chars=500, max_iterations=3,
         max_evidence_items=100, min_evidence_relevance=0.6,
     )
@@ -64,6 +64,46 @@ class FakeLLM:
     async def invoke_structured(self, **kwargs):
         self.calls.append(kwargs)
         return next(self.outputs)
+
+
+def test_refinement_context_keeps_task_history_and_gaps_without_evidence():
+    state = followup_state()
+    previous = SubQuestion(
+        id="previous-followup", parent_subquestion_id="root", iteration=2,
+        question="What measurements are reported?", objective="Find measured outcomes.",
+    )
+    state["research"]["planning_history"].append(previous)
+    state["research"]["search_queries"].append(SearchQuery(
+        id="followup-query", subquestion_id=previous.id, iteration=2,
+        query="measured outcomes trial", purpose="Retrieve missing results.",
+    ))
+    low_priority = CoverageGap(subquestion_id="root", description="Missing comparison.", priority=2)
+    state["research_control"].pending_gaps.insert(0, low_priority)
+    state["research"]["coverage"] = CoverageResult(
+        status=CoverageStatus.INSUFFICIENT, gaps=state["research_control"].pending_gaps,
+    )
+    state["research"]["evidence"] = [Evidence(
+        id="evidence-1", subquestion_id="root", source_id="source-1", chunk_id="chunk-1",
+        source_type=SourceType.WEB, content="Evidence body stays outside planner context.", relevance_score=0.9,
+    )]
+
+    context = _refinement_context(state, available_query_slots=3, max_queries_per_subquestion=2)
+
+    assert set(context) == {
+        "original_subquestions", "previous_tasks", "unresolved_gaps",
+        "available_query_slots", "max_queries_per_subquestion",
+    }
+    assert context["original_subquestions"][0]["objective"] == "Assess the outcome."
+    assert [item["queries"] for item in context["previous_tasks"]] == [
+        ["original search"], ["measured outcomes trial"],
+    ]
+    assert context["previous_tasks"][1]["parent_subquestion_id"] == "root"
+    assert [gap["priority"] for gap in context["unresolved_gaps"]] == [5, 2]
+    assert context["available_query_slots"] == 3
+    assert context["max_queries_per_subquestion"] == 2
+    assert "Evidence body" not in json.dumps(context)
+    assert len(state["research"]["evidence"]) == 1
+    assert state["research"]["coverage"] is not None
 
 
 def test_followup_validation_rejects_unknown_parents_and_repeated_tasks():
@@ -152,7 +192,9 @@ def test_query_allocation_reuses_unused_slots_and_rejects_old_queries():
             for query in [" ORIGINAL SEARCH ", "first facet", *[f"second facet {i}" for i in range(6)]]
         ]),
     ])
-    update = asyncio.run(research_query_generator_node(state, llm_service=llm, settings=settings()))
+    update = asyncio.run(research_query_generator_node(
+        state, llm_service=llm, settings=settings(max_total_queries_per_job=6),
+    ))
     new_queries = update["research"]["search_queries"][1:]
     assert len(new_queries) == 5
     assert [query.subquestion_id for query in new_queries].count("followup-0") == 1
@@ -172,9 +214,69 @@ def test_query_allocation_reserves_one_for_each_selected_task():
         QueryGeneratorOutput(queries=[GeneratedSearchQuery(query=f"query {i}", purpose="Measure")])
         for i in range(5)
     ])
-    update = asyncio.run(research_query_generator_node(state, llm_service=llm, settings=settings()))
+    update = asyncio.run(research_query_generator_node(
+        state, llm_service=llm, settings=settings(max_total_queries_per_job=6),
+    ))
     assert len(update["research"]["search_queries"]) == 6
     assert all("no more than 1 queries" in call["messages"][0].content for call in llm.calls)
+
+
+def test_query_counts_follow_planned_tasks_across_rounds():
+    async def run():
+        state = initial_state()
+        limits = settings(max_queries_per_subquestion=2)
+        initial_llm = FakeLLM([
+            PlannerOutput(subquestions=[PlannedSubQuestion(
+                question=f"What explains aspect {i}?", objective=f"Research aspect {i}.",
+            ) for i in range(5)]),
+            *[QueryGeneratorOutput(queries=[GeneratedSearchQuery(
+                query=f"initial aspect {i} evidence {j}", purpose="Collect evidence.",
+            ) for j in range(2)]) for i in range(5)],
+        ])
+        state.update(await research_planner_node(state, llm_service=initial_llm, settings=limits))
+        state.update(await research_query_generator_node(state, llm_service=initial_llm, settings=limits))
+        assert len(state["research"]["subquestions"]) == 5
+        assert len(state["research"]["search_queries"]) == 10
+
+        roots = state["research"]["subquestions"]
+        state["research"]["iteration_count"] = 1
+        state["research_control"].pending_gaps = [CoverageGap(
+            subquestion_id=root.id, description=f"Missing outcome {j} for {root.question}",
+        ) for root in roots[:3] for j in range(2)]
+        followup_llm = FakeLLM([
+            FollowupPlannerOutput(subquestions=[PlannedFollowupSubQuestion(
+                parent_subquestion_id=root.id, question=f"Which outcomes are missing for aspect {i}?",
+                objective="Gather the two related missing outcomes.",
+            ) for i, root in enumerate(roots[:3])]),
+            *[QueryGeneratorOutput(queries=[GeneratedSearchQuery(
+                query=f"followup aspect {i} outcome {j}", purpose="Resolve missing outcome.",
+            ) for j in range(2)]) for i in range(3)],
+        ])
+        state.update(await research_planner_node(state, llm_service=followup_llm, settings=limits))
+        state.update(await research_query_generator_node(state, llm_service=followup_llm, settings=limits))
+
+        assert len(state["research"]["active_subquestions"]) == 3
+        assert len(state["research"]["subquestions"]) == 5
+        queries = state["research"]["search_queries"]
+        assert len([query for query in queries if query.iteration == 2]) == 6
+        assert len(queries) == 16
+        prompt = followup_llm.calls[0]["messages"][1].content
+        context = json.loads(prompt.split("<refinement_context>\n")[1].split("\n</refinement_context>")[0])
+        assert context["available_query_slots"] == 20
+        assert len(context["unresolved_gaps"]) == 6
+
+    asyncio.run(run())
+
+
+def test_per_subquestion_query_limit_still_applies_without_round_cap():
+    state = followup_state()
+    llm = FakeLLM([QueryGeneratorOutput(queries=[GeneratedSearchQuery(
+        query=f"new evidence {i}", purpose="Find evidence.",
+    ) for i in range(6)])])
+    result = asyncio.run(research_query_generator_node(
+        state, llm_service=llm, settings=settings(max_queries_per_subquestion=2),
+    ))
+    assert len(result["research"]["search_queries"]) == 3  # One previous query plus two new queries.
 
 
 def test_no_unique_queries_goes_to_writer_without_an_empty_search_round():
@@ -186,6 +288,92 @@ def test_no_unique_queries_goes_to_writer_without_an_empty_search_round():
     state.update(update)
     assert route_after_planning(state) == "write_report"
     assert len(state["research"]["search_queries"]) == 1
+
+
+def test_query_budget_exhaustion_skips_llm_and_records_budget_stop():
+    for executed_queries, job_limit in [(30, 30), (0, 1)]:
+        state = followup_state()
+        state["research_control"].usage.queries_executed = executed_queries
+        state["research_control"].budget.max_search_queries = job_limit
+        llm = FakeLLM([])
+        result = asyncio.run(research_query_generator_node(state, llm_service=llm, settings=settings()))
+        assert llm.calls == []
+        assert result["research"]["stop_reason"] == ResearchStopReason.QUERY_BUDGET_EXHAUSTED
+        assert result["research_control"].last_decision.budget_exhausted
+        assert result["errors"] == []
+
+
+def test_query_generation_skips_expired_jobs():
+    state = followup_state()
+    state["research_control"].usage.started_at = datetime.now(UTC) - timedelta(hours=1)
+    llm = FakeLLM([])
+    result = asyncio.run(research_query_generator_node(state, llm_service=llm, settings=settings()))
+    assert llm.calls == []
+    assert result["research"]["stop_reason"] == ResearchStopReason.TIME_BUDGET_EXHAUSTED
+    assert result["research"]["search_queries"] == state["research"]["search_queries"]
+
+
+def test_query_timeout_preserves_accepted_queries_and_stops_remaining_tasks():
+    state = followup_state()
+    state["allowed_sources"].append(ResearchSource.DOCUMENTS)
+    state["research"]["active_subquestions"] = [SubQuestion(
+        id=f"task-{i}", question=f"Question {i}?", objective="Find evidence.",
+        parent_subquestion_id="root",
+    ) for i in range(3)]
+
+    class TimeoutLLM:
+        def __init__(self):
+            self.calls = []
+
+        async def invoke_structured(self, **kwargs):
+            self.calls.append(kwargs)
+            if len(self.calls) > 1:
+                raise TimeoutError
+            return QueryGeneratorOutput(queries=[GeneratedSearchQuery(
+                query="accepted before timeout", purpose="Find evidence.",
+            )])
+
+    llm = TimeoutLLM()
+    result = asyncio.run(research_query_generator_node(state, llm_service=llm, settings=settings()))
+    assert len(llm.calls) == 2
+    assert all(call["metadata"].contains_private_data for call in llm.calls)
+    assert result["research"]["stop_reason"] == ResearchStopReason.TIME_BUDGET_EXHAUSTED
+    assert [query.query for query in result["research"]["search_queries"]] == [
+        "original search", "accepted before timeout",
+    ]
+    assert result["research_control"].last_decision.action == "write_report"
+
+
+def test_failed_task_does_not_block_later_task_or_accept_invalid_queries():
+    state = followup_state()
+    state["research"]["active_subquestions"] = [SubQuestion(
+        id=f"task-{i}", question=f"Question {i}?", objective="Find evidence.",
+    ) for i in range(2)]
+
+    class RecoveringLLM:
+        def __init__(self):
+            self.calls = 0
+
+        async def invoke_structured(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise LLMServiceError(role=LLMRole.QUERY_GENERATOR, message="Provider unavailable.")
+            return QueryGeneratorOutput(queries=[GeneratedSearchQuery(query=query, purpose=purpose)
+                for query, purpose in [
+                    (" ", "Find evidence"), ("blank purpose", " "), ("x" * 50, "Find evidence"),
+                    (" ORIGINAL   SEARCH ", "Already attempted"), ("valid search", "Find evidence"),
+                ]])
+
+    llm = RecoveringLLM()
+    result = asyncio.run(research_query_generator_node(
+        state, llm_service=llm, settings=settings(max_search_query_chars=20),
+    ))
+    assert llm.calls == 2
+    assert result["research"]["search_queries"][-1].query == "valid search"
+    assert result["research"]["search_queries"][-1].subquestion_id == "task-1"
+    assert len(result["research"]["search_queries"]) == 2
+    assert result["research"]["stop_reason"] is None
+    assert len(result["errors"]) == 1 and result["errors"][0].recoverable
 
 
 def test_multiquery_retrieval_searches_independently_and_merges_once():
@@ -245,7 +433,7 @@ def test_real_graph_replans_twice_and_accumulates_evidence_under_original_object
                 )])
             if role == LLMRole.EVIDENCE_EXTRACTOR:
                 return EvidenceExtractionOutput(evidence=[EvidenceCandidate(
-                    chunk_id=f"chunk-{iteration}", content=f"Measured finding {iteration}.", relevance_score=0.9,
+                    chunk_id=f"chunk-{iteration}", relevance_score=0.9,
                 )])
             assert role == LLMRole.COVERAGE_EVALUATOR
             context = json.loads(messages[1].content.split("<research_context>\n")[1].split("\n</research_context>")[0])
@@ -305,5 +493,6 @@ def test_real_graph_replans_twice_and_accumulates_evidence_under_original_object
     assert research["evidence"][2].provenance["research_subquestion_id"] == research["active_subquestions"][0].id
     assert len(planner_inputs[1]["previous_tasks"]) == 2
     assert planner_inputs[1]["previous_tasks"][1]["queries"] == ["measured outcome 2"]
-    assert len(planner_inputs[1]["accepted_findings"][root_id]) == 2
+    assert all("coverage" not in context and "accepted_findings" not in context for context in planner_inputs)
+    assert planner_inputs[1]["unresolved_gaps"][0]["subquestion_id"] == root_id
     assert len(final["research_control"].history) == 3

@@ -51,7 +51,9 @@ def _retrieval_requests(
             subquestion=subquestion.question,
             search_queries=list(dict.fromkeys(search_queries)),
         )
-        for subquestion in state["research"]["subquestions"]
+        for subquestion in (
+            state["research"].get("active_subquestions") or state["research"]["subquestions"]
+        )
         if (search_queries := queries_by_subquestion.get(subquestion.id))
     ]
 
@@ -68,19 +70,13 @@ async def _retrieve(
 
 def _web_documents(
     state: WorkflowState,
-    iteration_queries: list[SearchQuery],
 ) -> list[RetrievalDocument]:
-    query_ids = {query.id for query in iteration_queries}
-    result_ids = {
-        result.id
-        for result in state["research"]["search_results"]
-        if result.query_id in query_ids
-    }
+    # Follow-up intents can discover answers in earlier collected sources too.
+    # This remains a job-local public corpus, separate from private documents.
     iteration_sources = [
         source
         for source in state["research"]["sources"]
         if source.source_type == SourceType.WEB
-        and result_ids.intersection(source.search_result_ids)
     ]
 
     return [
@@ -162,7 +158,7 @@ async def research_retrieval_node(
     document_results: list[RetrievalResult] = []
 
     if ResearchSource.WEB in allowed_sources:
-        documents = _web_documents(state, iteration_queries)
+        documents = _web_documents(state)
         if documents:
             web_session = retrieval_session_factory.create_session()
             try:
@@ -236,6 +232,10 @@ async def research_retrieval_node(
     return {
         "research": {
             **state["research"],
+            "retrieved_source_ids": sorted(set(state["research"].get("retrieved_source_ids", [])) | {
+                item.chunk.metadata.get("private_document_id") or item.chunk.document_id
+                for result in [*web_results, *document_results] for item in result.chunks
+            }),
             "sources": sources,
             "web_retrieval_results": web_results,
             "document_retrieval_results": document_results,

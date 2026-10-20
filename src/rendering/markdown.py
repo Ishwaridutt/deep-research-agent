@@ -89,21 +89,21 @@ def _render_dict_report(
 
     findings = report.get("findings")
     if findings:
-        rendered_findings = []
+        grouped_findings: dict[str, list[str]] = {}
         for finding in findings:
             if hasattr(finding, "model_dump"):
                 finding = finding.model_dump()
             if not isinstance(finding, dict):
                 continue
-            rendered_findings.append(
+            heading = str(finding.get("section") or "Detailed Analysis").strip() or "Detailed Analysis"
+            grouped_findings.setdefault(heading, []).append(
                 f"### {finding.get('title', 'Finding')}\n\n"
                 f"{str(finding.get('content', '')).strip()}"
             )
-        if rendered_findings:
-            sections.append(
-                "## Detailed Analysis\n\n"
-                + "\n\n".join(rendered_findings)
-            )
+        sections.extend(
+            f"## {heading}\n\n" + "\n\n".join(items)
+            for heading, items in grouped_findings.items()
+        )
 
     limitations = report.get("limitations")
     if limitations:
@@ -143,7 +143,7 @@ def _render_dict_report(
 
         if sources_markdown:
             sections.append(
-                "## Sources\n\n"
+                "## Cited Sources\n\n"
                 + sources_markdown
             )
 
@@ -169,7 +169,7 @@ def _render_research_approach(
     )
     reason = getattr(stop_reason, "value", stop_reason)
     status_messages = {
-        "coverage_sufficient": "The planned evidence coverage was satisfied.",
+        "coverage_sufficient": "The evidence was judged sufficient for a grounded report on the core question.",
         "max_iterations": (
             "The configured research-round limit was reached; unresolved evidence "
             "gaps are disclosed below."

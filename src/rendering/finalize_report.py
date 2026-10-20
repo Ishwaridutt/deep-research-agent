@@ -95,6 +95,7 @@ def finalize_report_node(
         "Final report rendered.",
         extra={
             "event": "final_report_rendered",
+            "data": {"source_lineage": {**state["writer"].get("source_stats", {}), "cited": len(final_report.sources)}},
             "job_id": state["job_id"],
             "research_session_id": state["research_session_id"],
             "node": "finalize_report",

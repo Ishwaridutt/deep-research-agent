@@ -13,7 +13,6 @@ from src.models import (
     CoverageGap,
     DraftReport,
     ErrorType,
-    Evidence,
     ResearchError,
     ResearchSource,
     ResearchStopReason,
@@ -22,34 +21,6 @@ from src.prompts.writer_prompt import build_writer_messages
 
 
 logger = logging.getLogger(__name__)
-
-
-def _resolve_selected_evidence(
-    state: WorkflowState,
-) -> list[Evidence]:
-    """Resolves selected Writer evidence IDs to authoritative Evidence objects."""
-
-    evidence_by_id = {
-        evidence.id: evidence
-        for evidence in state["research"]["evidence"]
-    }
-
-    resolved_evidence: list[Evidence] = []
-    seen_ids: set[str] = set()
-
-    for evidence_id in state["writer"]["evidence_ids"]:
-        if evidence_id in seen_ids:
-            continue
-
-        evidence = evidence_by_id.get(evidence_id)
-
-        if evidence is None:
-            continue
-
-        seen_ids.add(evidence_id)
-        resolved_evidence.append(evidence)
-
-    return resolved_evidence
 
 
 def _build_no_evidence_report(
@@ -65,57 +36,22 @@ def _build_no_evidence_report(
 
     if stop_reason is not None:
         limitations.append(
-            f"Research stopped with reason: {stop_reason.value}."
+            f"Research stopped: {stop_reason.value.replace('_', ' ')}."
         )
 
     limitations.extend(
-        (
-            f"Unresolved research gap for {gap.subquestion_id}: "
-            f"{gap.description}"
-        )
+        gap.description
         for gap in coverage_gaps
     )
 
     return DraftReport(
+        title="Insufficient research evidence",
         executive_summary=(
             "The research process did not obtain enough usable evidence "
             "to produce supported findings."
         ),
         findings=[],
         limitations=limitations,
-    )
-
-
-def _sanitize_draft_report(
-    *,
-    draft_report: DraftReport,
-    allowed_evidence_ids: set[str],
-) -> DraftReport:
-    """Removes evidence IDs that were not supplied to the Writer."""
-
-    sanitized_findings = []
-
-    for finding in draft_report.findings:
-        valid_evidence_ids = list(
-            dict.fromkeys(
-                evidence_id
-                for evidence_id in finding.evidence_ids
-                if evidence_id in allowed_evidence_ids
-            )
-        )
-
-        sanitized_findings.append(
-            finding.model_copy(
-                update={
-                    "evidence_ids": valid_evidence_ids,
-                }
-            )
-        )
-
-    return draft_report.model_copy(
-        update={
-            "findings": sanitized_findings,
-        }
     )
 
 
@@ -126,18 +62,22 @@ async def writer_synthesis_node(
 ) -> dict:
     """Synthesizes selected research evidence into a structured DraftReport."""
 
+    log_context = {
+        "job_id": state["job_id"],
+        "research_session_id": state["research_session_id"],
+        "node": "writer_synthesis",
+        "iteration": state["research"]["iteration_count"],
+    }
     logger.info(
         "Writer synthesis started.",
-        extra={
-            "event": "writer_synthesis_started",
-            "job_id": state["job_id"],
-            "research_session_id": state["research_session_id"],
-            "node": "writer_synthesis",
-            "iteration": state["research"]["iteration_count"],
-        },
+        extra={**log_context, "event": "writer_synthesis_started"},
     )
-
-    evidence = _resolve_selected_evidence(state)
+    evidence_by_id = {item.id: item for item in state["research"]["evidence"]}
+    evidence = [
+        evidence_by_id[identifier]
+        for identifier in dict.fromkeys(state["writer"]["evidence_ids"])
+        if identifier in evidence_by_id
+    ]
 
     coverage = state["research"]["coverage"]
     coverage_gaps = list(coverage.gaps) if coverage is not None else []
@@ -154,10 +94,7 @@ async def writer_synthesis_node(
             "Writer synthesis skipped because no usable evidence was available.",
             extra={
                 "event": "writer_synthesis_no_evidence",
-                "job_id": state["job_id"],
-                "research_session_id": state["research_session_id"],
-                "node": "writer_synthesis",
-                "iteration": state["research"]["iteration_count"],
+                **log_context,
             },
         )
 
@@ -177,10 +114,7 @@ async def writer_synthesis_node(
     )
 
     metadata = LLMCallMetadata(
-        job_id=state["job_id"],
-        research_session_id=state["research_session_id"],
-        node="writer_synthesis",
-        iteration=state["research"]["iteration_count"],
+        **log_context,
         contains_private_data=ResearchSource.DOCUMENTS in state["allowed_sources"],
     )
 
@@ -197,10 +131,7 @@ async def writer_synthesis_node(
             "Writer synthesis failed.",
             extra={
                 "event": "writer_synthesis_failed",
-                "job_id": state["job_id"],
-                "research_session_id": state["research_session_id"],
-                "node": "writer_synthesis",
-                "iteration": state["research"]["iteration_count"],
+                **log_context,
                 "error_type": ErrorType.SYNTHESIS.value,
             },
         )
@@ -219,24 +150,13 @@ async def writer_synthesis_node(
             ]
         }
 
-    # Keep unsupported evidence references visible to the citation checker,
-    # but prevent references to evidence the Writer was never given.
-    draft_report = _sanitize_draft_report(
-        draft_report=draft_report,
-        allowed_evidence_ids={
-            evidence_item.id
-            for evidence_item in evidence
-        },
-    )
-
+    # The citation checker owns reference validation; retain invalid IDs so it
+    # can reject unsupported blocks rather than silently repairing their references.
     logger.info(
         "Writer synthesis completed.",
         extra={
             "event": "writer_synthesis_completed",
-            "job_id": state["job_id"],
-            "research_session_id": state["research_session_id"],
-            "node": "writer_synthesis",
-            "iteration": state["research"]["iteration_count"],
+            **log_context,
         },
     )
 

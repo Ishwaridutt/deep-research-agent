@@ -1,5 +1,7 @@
 """Focused tests for generic multi-round research quality controls."""
 
+import json
+
 from src.models import (
     CoverageResult,
     CoverageStatus,
@@ -8,7 +10,7 @@ from src.models import (
     SubQuestion,
 )
 from src.prompts.coverage_evaluator_prompt import build_coverage_evaluator_messages
-from src.prompts.planner_prompt import build_planner_messages
+from src.prompts.research_planner_prompt import build_planner_messages
 from src.prompts.query_generator_prompt import build_query_generator_messages
 
 
@@ -36,15 +38,40 @@ def test_research_prompts_ground_dates_and_followup_context():
     )
 
     assert current_date in planner[0].content
-    assert "exact date or year range" in planner[0].content
+    assert "Resolve relative dates" in planner[0].content
     assert "final report" in planner[0].content
-    assert "same selected set" in planner[0].content
+    assert "consistent entities and criteria" in planner[0].content
+    assert "no more than 5 subquestions" in planner[0].content
+    assert "Follow-up planning:" not in planner[0].content
     assert current_date in query[0].content
     assert "fixed scope" in query[0].content
     assert "primary and directly attributable" in query[0].content
     assert "previous query" in query[1].content
-    assert "do not" in query[0].content
-    assert "generate subquestions" in query[0].content
+    normalized_query_prompt = " ".join(query[0].content.split()).casefold()
+    assert "do not answer the question or generate subquestions" in normalized_query_prompt
+    assert "no more than 2 queries" in query[0].content
+    assert "short purpose" in query[0].content
+
+
+def test_planner_refinement_keeps_lineage_and_history_with_concise_rules():
+    context = {
+        "original_subquestions": [{"id": "sq-1", "question": "What changed?"}],
+        "unresolved_gaps": [{"subquestion_id": "sq-1", "description": "Missing measurements."}],
+        "previous_tasks": [{"id": "sq-1", "queries": ["earlier search"]}],
+        "available_query_slots": 3,
+        "max_queries_per_subquestion": 2,
+    }
+    messages = build_planner_messages(
+        question="Explain the changes.", max_subquestions=3,
+        current_date="2026-10-18", refinement_context=context,
+    )
+
+    assert "no more than 3 subquestions" in messages[0].content
+    assert "parent_subquestion_id from an unresolved gap" in messages[0].content
+    assert "original objectives fixed" in messages[0].content
+    assert "empty subquestions list" in messages[0].content
+    payload = messages[1].content.split("<refinement_context>\n")[1].split("\n</refinement_context>")[0]
+    assert json.loads(payload) == context
 
 
 def test_coverage_prompt_includes_safe_source_context():
@@ -83,4 +110,6 @@ def test_coverage_prompt_includes_safe_source_context():
     assert "directly executable" in messages[0].content
     assert "previously supported" in messages[0].content
     assert '"previous_coverage":{"status":"sufficient"' in messages[1].content
-    assert "exactly that same set" in messages[0].content
+    assert "Minor omissions" in messages[0].content
+    assert "A generic" in messages[0].content
+    assert "do not require two sources" in messages[0].content

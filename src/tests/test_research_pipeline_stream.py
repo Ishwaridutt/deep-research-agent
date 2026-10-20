@@ -36,6 +36,9 @@ def test_source_progress_details_expose_counts_not_private_data():
 
     assert selection == {"source_mode": "hybrid", "document_count": 2}
     assert retrieval == {
+        "web_groups": [{"question": "", "passage_count": 1, "estimated_tokens": 0, "query_matches": []}],
+        "document_groups": [{"question": "", "passage_count": 2, "estimated_tokens": 0, "query_matches": []}],
+        "details_truncated": False,
         "web_result_count": 1,
         "document_result_count": 1,
         "web_chunk_count": 1,
@@ -43,6 +46,80 @@ def test_source_progress_details_expose_counts_not_private_data():
     }
     assert "SECRET" not in str(retrieval)
     assert "private.pdf" not in str(retrieval)
+
+
+def test_retrieval_details_keep_query_lineage_without_private_passages():
+    from src.models.retrieval_model import RetrievalResult
+    result = RetrievalResult("task", "PRIVATE RAW CONTEXT", [], "SECRET", 50, query_matches=[{
+        "query": "published research", "retrieved_count": 8, "selected_count": 3,
+        "chunks": [{"content": "SECRET", "filename": "private.pdf"}],
+    }])
+    details = _safe_details("research_retrieval", {"research": {
+        "subquestions": [{"id": "task", "question": "What works?"}],
+        "document_retrieval_results": [result],
+    }}, iteration=2)
+    assert details["document_groups"] == [{
+        "question": "What works?", "passage_count": 0, "estimated_tokens": 50,
+        "query_matches": [{"query": "published research", "retrieved_count": 8, "selected_count": 3}],
+    }]
+    assert "SECRET" not in str(details) and "private.pdf" not in str(details)
+
+
+def test_discovery_and_extraction_counts_are_current_round_and_allowlisted():
+    research = {
+        "search_stats": {"iteration": 2, "provider_counts": {"tavily": 10, "arxiv": 6, "wikipedia": 0, "SECRET": 8},
+                         "failed_branches": ["wikipedia", "SECRET"], "failed_query_count": 1},
+        "extraction_stats": {"iteration": 2, "extracted_count": 4, "attempted_count": 6,
+                             "reused_count": 1, "deferred_count": 3,
+                             "extracted_provider_counts": {"arxiv": 1, "tavily": 3, "SECRET": 5}},
+    }
+    details = _safe_details("research_web_search", {"research": research}, iteration=2)
+    assert details["discovered_provider_counts"] == {"tavily": 10, "arxiv": 6, "wikipedia": 0}
+    assert details["discovered_count"] == 16 and details["result_count"] == 0
+    assert details["failed_branches"] == ["wikipedia"]
+    assert "SECRET" not in str(details)
+    assert "discovered_count" not in _safe_details("research_web_search", {"research": research}, iteration=3)
+    extracted = _safe_details("research_source_processor", {"research": research}, iteration=2)
+    assert extracted["extracted_count"] == 4 and extracted["deferred_count"] == 3
+    assert extracted["extracted_provider_counts"] == {"tavily": 3, "arxiv": 1}
+    assert "SECRET" not in str(extracted)
+
+
+def test_log_and_event_search_counts_match_for_the_same_job_and_round(caplog):
+    import logging
+    from types import SimpleNamespace
+    from src.agents.research.research_web_search_node import research_web_search_node
+    from src.graph.graph_state import create_initial_workflow_state
+    from src.models import ResearchSource, SearchQuery
+    from src.tools.search.parallel_search import SearchResults
+
+    class Provider:
+        def __init__(self, wiki_counts):
+            self.wiki_counts = iter(wiki_counts)
+
+        async def search(self, **kwargs):
+            return SearchResults([], {"provider_counts": {"tavily": 5, "arxiv": 3, "wikipedia": next(self.wiki_counts)}})
+
+    settings = SimpleNamespace(research_limits=SimpleNamespace(max_total_queries_per_job=30, max_search_results_per_query=5),
+                               search=SimpleNamespace(min_provider_score=0.7))
+    caplog.set_level(logging.INFO)
+    for job, round_number, wiki_counts, expected in [
+        ("new-job", 1, [1] * 12, {"tavily": 60, "arxiv": 36, "wikipedia": 12}),
+        ("old-job", 2, [1, 1] + [0] * 12, {"tavily": 70, "arxiv": 42, "wikipedia": 2}),
+    ]:
+        state = create_initial_workflow_state(job_id=job, research_session_id="session", question="Topic?", allowed_sources=[ResearchSource.WEB])
+        state["research"]["iteration_count"] = round_number - 1
+        state["research"]["search_queries"] = [SearchQuery(
+            id=f"query-{n}", subquestion_id="task", query="research", purpose="Research", iteration=round_number,
+        ) for n in range(len(wiki_counts))]
+        update = asyncio.run(research_web_search_node(state, search_provider=Provider(wiki_counts), settings=settings))
+        details = _safe_details("research_web_search", update, iteration=round_number)
+        record = next(record for record in reversed(caplog.records) if getattr(record, "event", "") == "web_search_completed")
+        assert record.job_id == job and record.iteration == round_number
+        assert details["discovered_provider_counts"] == expected
+        assert details["executed_query_count"] == len(wiki_counts)
+        for key in ("count_scope", "executed_query_count", "discovered_provider_counts", "discovered_count", "provider_counts", "result_count"):
+            assert details[key] == record.data[key]
 
 
 def test_provider_progress_exposes_only_safe_counts_and_branch_names():
@@ -96,6 +173,150 @@ def test_provider_progress_exposes_only_safe_counts_and_branch_names():
     assert "SECRET" not in str(search)
     assert "SECRET" not in str(extraction)
     assert "private.example" not in str(search)
+
+
+def test_planner_and_queries_expose_bounded_current_tasks_not_history_or_prompts():
+    research = {
+        "subquestions": [{"id": "root", "question": "Original objective?", "objective": "Original scope"}],
+        "active_subquestions": [{
+            "id": "followup", "question": "Which outcome is missing?", "objective": "Measure the outcome",
+            "parent_subquestion_id": "root", "private_text": "SECRET",
+        }],
+        "planning_history": [{"id": "old", "question": "HISTORICAL PRIVATE QUESTION"}],
+        "search_queries": [
+            {"id": "old-query", "subquestion_id": "old", "query": "OLD PRIVATE QUERY", "iteration": 1},
+            {"id": "q1", "subquestion_id": "followup", "query": "current trial result", "purpose": "Find measurement", "iteration": 2},
+            {"id": "q2", "subquestion_id": "followup", "query": "current outcome uncertainty", "purpose": "Find uncertainty", "iteration": 2},
+        ],
+        "evidence": [{"content": "SECRET EVIDENCE"}],
+        "sources": [{"content": "SECRET SOURCE"}],
+    }
+    planner = _safe_details("research_planner", {"research": research}, iteration=2)
+    queries = _safe_details("research_query_generator", {"research": research}, iteration=2)
+
+    assert planner["subquestions"] == [{
+        "id": "followup", "question": "Which outcome is missing?", "objective": "Measure the outcome",
+        "parent_question": "Original objective?",
+    }]
+    assert queries["query_count"] == 2
+    assert len(queries["query_groups"]) == 1
+    assert queries["query_groups"][0]["subquestion_id"] == "followup"
+    assert [item["query"] for item in queries["query_groups"][0]["queries"]] == [
+        "current trial result", "current outcome uncertainty",
+    ]
+    assert "PRIVATE" not in str(planner) + str(queries)
+    assert "SECRET" not in str(planner) + str(queries)
+
+
+def test_stage_detail_limits_preserve_totals_and_signal_truncation():
+    research = {
+        "subquestions": [{"id": f"task-{index}", "question": "Q" * 2000, "objective": "Scope"} for index in range(105)],
+        "search_queries": [{"subquestion_id": "task-0", "query": f"query-{index}", "iteration": 1} for index in range(105)],
+    }
+    planner = _safe_details("research_planner", {"research": research}, iteration=1)
+    queries = _safe_details("research_query_generator", {"research": research}, iteration=1)
+    assert planner["active_subquestion_count"] == 105
+    assert len(planner["subquestions"]) == 100
+    assert planner["subquestions"][0]["question"] == "Q" * 1000 + "…"
+    assert planner["details_truncated"]
+    assert queries["query_count"] == 105
+    assert len(queries["query_groups"][0]["queries"]) == 100
+    assert queries["details_truncated"]
+
+
+def test_coverage_details_include_per_objective_reasons_and_limits_not_evidence_text():
+    from src.models import CoverageGap, CoverageResult, SubQuestion
+    from src.models.coverage_model import SubquestionCoverage
+
+    output = {"research": {
+        "subquestions": [
+            SubQuestion(id="root", question="What changed?", objective="Find change"),
+            SubQuestion(id="other", question="Why did it change?", objective="Explain change"),
+        ],
+        "evidence": [{"id": "EV-PRIVATE", "content": "SECRET"}],
+        "coverage": CoverageResult(status="sufficient", assessments=[
+            SubquestionCoverage(subquestion_id="root", status="supported", evidence_ids=["EV-PRIVATE"], reason="A specific measurement answers this."),
+            SubquestionCoverage(subquestion_id="other", status="partial", evidence_ids=[], reason="The minor historical cause is uncertain."),
+        ], gaps=[CoverageGap(subquestion_id="other", description="Historical context not provided.", priority=2)]),
+    }}
+    details = _safe_details("research_coverage_evaluator", output, iteration=1)
+    assert details["coverage_status"] == "sufficient"
+    assert details["assessment_counts"] == {"supported": 1, "partial": 1, "missing": 0, "conflicting": 0}
+    assert details["assessments"][0]["question"] == "What changed?"
+    assert details["assessments"][0]["supporting_evidence_count"] == 1
+    assert details["assessments"][1]["reason"] == "The minor historical cause is uncertain."
+    assert details["gaps"] == [{"question": "Why did it change?", "description": "Historical context not provided.", "priority": 2}]
+    assert "EV-PRIVATE" not in str(details)
+    assert "SECRET" not in str(details)
+
+
+def test_evidence_progress_is_numeric_allowlisted_and_never_replays_stale_counts():
+    stats = {
+        "iteration": 2, "scored_chunk_count": 8, "accepted_chunk_count": 5,
+        "low_relevance_chunk_count": 2, "capacity_skipped_chunk_count": 1,
+        "total_evidence_count": 12, "min_evidence_relevance": 0.6,
+        "content": "SECRET PASSAGE", "filename": "private.pdf", "prompt": "SECRET",
+    }
+    output = {"research": {"evidence_stats": stats, "evidence": [{"content": "SECRET"}]}}
+    details = _safe_details("research_evidence_extractor", output, iteration=2)
+    assert details["accepted_chunk_count"] == 5
+    assert details["low_relevance_chunk_count"] == 2
+    assert details["capacity_skipped_chunk_count"] == 1
+    assert details["total_evidence_count"] == 12
+    assert "SECRET" not in str(details)
+    assert "private.pdf" not in str(details)
+    assert _safe_details("research_evidence_extractor", output, iteration=3) == {}
+
+
+def test_scoring_previews_are_bounded_allowlisted_and_private_text_is_redacted_again():
+    public = {"chunk_id": "public:1", "title": "Study", "source_type": "web",
+              "preview": "a" * 5000, "relevance_score": .9, "decision": "accepted", "owner_id": "SECRET"}
+    private = {**public, "chunk_id": "SECRET", "source_type": "document", "title": "SECRET.pdf",
+               "preview": "SECRET", "uri": "document://SECRET"}
+    output = {"research": {"evidence_stats": {"iteration": 2}, "evidence_audit": [
+        {"question": "Outcomes?", "passages": [public, private] * 60},
+    ]}}
+    details = _safe_details("research_evidence_extractor", output, iteration=2)
+    rows = details["scoring_groups"][0]["passages"]
+    assert len(rows) == 100 and details["details_truncated"]
+    assert len(rows[0]["preview"]) == 801
+    assert rows[1]["title"] == "Private document" and rows[1]["preview"] == ""
+    assert "SECRET" not in str(details)
+    assert _safe_details("research_evidence_extractor", output, iteration=3) == {}
+
+
+def test_writer_source_lineage_reports_counts_without_source_bodies():
+    output = {"writer": {"source_stats": {"collected": 40, "retrieved": 17, "accepted": 11,
+                                          "supplied_to_writer": 9, "SECRET": 1},
+                         "final_report": {"sources": [{"content": "SECRET"}] * 8}}}
+    details = _safe_details("finalize_report", output)
+    assert details == {"source_lineage": {"collected": 40, "retrieved": 17, "accepted": 11,
+                                         "supplied_to_writer": 9, "cited": 8}}
+
+
+def test_completed_research_details_survive_persistence_and_sse_replay(tmp_path):
+    from src.persistence import ResearchJobStore
+    from src.models.pipeline_event import PipelineEvent
+
+    async def run():
+        store = ResearchJobStore(tmp_path / "details.sqlite3")
+        await store.initialize()
+        try:
+            await store.create_job(job_id="job-1", research_session_id="session-1", question="Test", allowed_sources=["web"])
+            details = _safe_details("research_planner", {"research": {
+                "active_subquestions": [{"id": "task", "question": "What changed?", "objective": "Find measurements"}],
+            }}, iteration=1)
+            event = PipelineEvent(job_id="job-1", sequence=1, event_type="stage_completed",
+                                  stage="research_planner", status="completed", iteration=1, details=details)
+            await store.append_event(event)
+            replay = await store.get_events("job-1", after=0)
+            assert replay[0].details == details
+            assert "What changed?" in encode_sse(replay[0])
+            assert await store.get_events("job-1", after=1) == []
+        finally:
+            await store.close()
+
+    asyncio.run(run())
 
 
 def test_ui_polls_status_only_as_an_sse_fallback():
@@ -275,6 +496,44 @@ def test_stream_captures_final_state_without_duplicate_execution():
         assert "SECRET" not in payload
         assert "id: 6\n" in payload
         assert "event: research_retry\n" in payload
+
+    asyncio.run(run())
+
+
+def test_planner_early_stop_emits_safe_research_stopped_event():
+    class EarlyStopGraph(FakeGraph):
+        async def astream_events(self, initial_state, *, config, version):
+            async for event in super().astream_events(initial_state, config=config, version=version):
+                if event["name"] == "research_routing":
+                    continue
+                if event["name"] == "research_planner" and event["event"] == "on_chain_end":
+                    event["data"]["output"] = {
+                        "research": {
+                            "active_subquestions": [], "stop_reason": "no_actionable_gaps",
+                            "planning_history": [{"question": "PRIVATE QUESTION"}],
+                        },
+                        "research_control": {"pending_gaps": ["PRIVATE GAP"]},
+                    }
+                yield event
+
+    async def run():
+        state = {"job_id": "job-1", "research": {"iteration_count": 1}}
+        events = []
+
+        async def persist(event):
+            events.append(event)
+
+        final = await run_graph_with_events(
+            graph=EarlyStopGraph(state), state=state, config={"recursion_limit": 50},
+            recorder=PipelineRecorder(job_id="job-1", persist=persist),
+        )
+        assert final is state
+        stop = events[-1]
+        assert stop.event_type == "research_stopped"
+        assert stop.iteration == 2
+        assert stop.details["stop_reason"] == "no_actionable_gaps"
+        assert stop.details["gap_count"] == 1
+        assert "PRIVATE" not in "".join(encode_sse(event) for event in events)
 
     asyncio.run(run())
 

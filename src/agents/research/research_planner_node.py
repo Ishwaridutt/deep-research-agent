@@ -24,7 +24,7 @@ from src.models import (
     SubQuestion,
 )
 from src.models.research_quality import ResearchDecision
-from src.prompts.planner_prompt import build_planner_messages
+from src.prompts.research_planner_prompt import build_planner_messages
 from src.services import generate_subquestion_id
 
 
@@ -85,7 +85,8 @@ def _build_subquestions(
     return subquestions
 
 
-def _refinement_context(state: WorkflowState, remaining_queries: int, max_queries_per_subquestion: int) -> dict:
+def _refinement_context(state: WorkflowState, available_query_slots: int, max_queries_per_subquestion: int) -> dict:
+    """Build follow-up planning context from tasks, searches, gaps, and limits."""
     research = state["research"]
     gaps = sorted(state["research_control"].pending_gaps, key=lambda gap: gap.priority, reverse=True)
     history = research.get("planning_history") or research["subquestions"]
@@ -98,26 +99,14 @@ def _refinement_context(state: WorkflowState, remaining_queries: int, max_querie
             }
             for item in history
         ],
-        "coverage": research["coverage"].model_dump(mode="json") if research["coverage"] else None,
         "unresolved_gaps": [gap.model_dump(mode="json") for gap in gaps],
-        # Bounded findings explain what was learned, not just what was searched.
-        "accepted_findings": {
-            item.id: [
-                {"content": evidence.content[:800], "title": evidence.provenance.get("title")}
-                for evidence in sorted(
-                    (e for e in research["evidence"] if e.subquestion_id == item.id),
-                    key=lambda e: e.relevance_score, reverse=True,
-                )[:3]
-            ]
-            for item in research["subquestions"]
-        },
-        "available_query_slots": remaining_queries,
+        "available_query_slots": available_query_slots,
         "max_queries_per_subquestion": max_queries_per_subquestion,
     }
 
 
 def _stop_refinement(state: WorkflowState, reason: ResearchStopReason) -> dict:
-    """An exhausted plan goes to the writer with accumulated evidence intact."""
+    """An exhausted research plan goes to the writer with accumulated evidence intact."""
     control = state["research_control"]
     logger.info("Research refinement stopped.", extra={
         "event": "research_refinement_stopped", "job_id": state["job_id"],
@@ -162,6 +151,8 @@ async def research_planner_node(
     research = state["research"]
     control = state["research_control"]
     is_followup = research["iteration_count"] > 0
+    # research time and query limit validation
+    # calculates how many queries remain in the job
     remaining_queries = max(0, min(
         settings.research_limits.max_total_queries_per_job,
         control.budget.max_search_queries,
@@ -176,16 +167,14 @@ async def research_planner_node(
     if is_followup and not control.pending_gaps:
         return _stop_refinement(state, ResearchStopReason.NO_ACTIONABLE_GAPS)
 
-    round_queries = remaining_queries
-    if is_followup:
-        round_queries = min(round_queries, settings.research_limits.max_followup_queries_per_round)
-    max_subquestions = min(settings.research_limits.max_subquestions, round_queries)
+    # Every selected task needs at least one search from the remaining job budget.
+    max_subquestions = min(settings.research_limits.max_subquestions, remaining_queries)
     planner_prompt = build_planner_messages(
         question=state["question"],
         max_subquestions=max_subquestions,
         current_date=datetime.now(UTC).date().isoformat(),
         refinement_context=_refinement_context(
-            state, round_queries, settings.research_limits.max_queries_per_subquestion,
+            state, remaining_queries, settings.research_limits.max_queries_per_subquestion,
         ) if is_followup else None,
     )
 

@@ -19,6 +19,7 @@ from src.models import (
     ResearchSourceSelection,
 )
 from src.models.pipeline_event import ResearchJobCreated
+from src.models.research_quality import ResearchBudget
 from src.persistence import ResearchJobStore
 from src.services.generate_research_ids import (
     generate_job_id,
@@ -143,6 +144,9 @@ class ResearchService:
             source_mode=selection.mode,
             owner_id=(owner_id or "").strip() or None,
             selected_document_ids=list(dict.fromkeys(selection.document_ids)),
+            research_budget=ResearchBudget(max_extracted_pages_per_round=getattr(
+                getattr(self._settings, "research_limits", None), "max_extracted_pages_per_round", 30,
+            )),
         )
 
     def _graph_config(

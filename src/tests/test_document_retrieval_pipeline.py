@@ -200,6 +200,10 @@ def test_pdf_parser_skips_whitespace_only_pages(monkeypatch):
     assert [block.text for block in parsed.blocks] == ["useful text"]
     assert parsed.blocks[0].location.page_start == 3
     assert parsed.blocks[0].location.page_end == 3
+    assert parsed.total_pages == 3 and parsed.pages_processed == 3
+
+    limited = DocumentParser().parse("document-1", Path("document.pdf"), DocumentFormat.PDF, 3)
+    assert limited.pages_processed == 3 and limited.total_pages == 3
 
 
 def test_upload_only_saves_file_and_metadata():

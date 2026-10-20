@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+from collections import Counter
 from datetime import datetime, timezone
 
 from src.config import Settings
@@ -37,6 +38,10 @@ async def research_web_search_node(
     current_results = list(research["search_results"])
     errors = list(state["errors"])
     new_results: list[SearchResult] = []
+    provider_counts: dict[str, int] = {}
+    failed_branches: set[str] = set()
+    fallback_activated = False
+    failed_query_count = 0
 
     # Count provider attempts, including unsuccessful calls.
     queries_executed = control.usage.queries_executed
@@ -80,6 +85,7 @@ async def research_web_search_node(
                 timeout=seconds_remaining,
             )
         except TimeoutError:
+            failed_query_count += 1
             logger.warning("Web search timed out at the research deadline.")
             errors.append(ResearchError(
                 error_type=ErrorType.SEARCH,
@@ -89,6 +95,7 @@ async def research_web_search_node(
             ))
             break
         except SearchProviderError as exc:
+            failed_query_count += 1
             logger.exception(
                 "Web search failed.",
                 extra={
@@ -116,6 +123,19 @@ async def research_web_search_node(
         print("\nweb search completed for query:", search_query)
         print("\ntotal search results: ", len(results))
 
+        # Capture discovery before aggregate ranking and score filtering hide providers.
+        diagnostics = getattr(results, "diagnostics", {})
+        counts = diagnostics.get("provider_counts")
+        if counts is None:
+            counts = {}
+            for result in results:
+                name = result.provider.value
+                counts[name] = counts.get(name, 0) + 1
+        for name, count in counts.items():
+            provider_counts[name] = provider_counts.get(name, 0) + count
+        failed_branches.update(diagnostics.get("failed_branches", []))
+        fallback_activated |= bool(diagnostics.get("web_fallback_activated"))
+
         # Retain unscored results for providers that do not expose relevance scores.
         filtered_results = [
             result for result in results
@@ -131,6 +151,7 @@ async def research_web_search_node(
 
     updated_usage = control.usage.model_copy(update={"queries_executed": queries_executed})
     updated_control = control.model_copy(update={"usage": updated_usage})
+    executed_query_count = queries_executed - control.usage.queries_executed
 
     logger.info(
         "Web search completed.",
@@ -142,11 +163,27 @@ async def research_web_search_node(
             "iteration": target_iteration,
             "queries_executed": queries_executed,
             "new_results": len(new_results),
+            "data": {
+                "count_scope": "round", "executed_query_count": executed_query_count,
+                "discovered_provider_counts": provider_counts, "discovered_count": sum(provider_counts.values()),
+                "provider_counts": dict(Counter(result.provider.value for result in new_results)),
+                "result_count": len(new_results), "failed_branches": sorted(failed_branches),
+                "failed_query_count": failed_query_count,
+            },
         },
     )
 
     return {
-        "research": {**research, "search_results": [*current_results, *new_results]},
+        "research": {
+            **research, "search_results": [*current_results, *new_results],
+            "search_stats": {
+                "iteration": target_iteration, "provider_counts": provider_counts,
+                "executed_query_count": executed_query_count,
+                "failed_branches": sorted(failed_branches),
+                "web_fallback_activated": fallback_activated,
+                "failed_query_count": failed_query_count,
+            },
+        },
         "research_control": updated_control,
         "errors": errors,
     }

@@ -83,6 +83,7 @@ def test_final_report_uses_source_numbers_and_hides_evidence_ids():
     payload = report.model_dump(mode="json")
 
     assert payload["findings"] == [{
+        "section": "Detailed Analysis",
         "title": "Finding",
         "content": "First claim. [1] Second claim. [2]",
     }]
@@ -130,3 +131,13 @@ def test_markdown_contains_full_report_and_numbered_linked_sources():
     assert "### Finding\n\nSupported claim. [1]" in markdown
     assert "1. [Source one](https://example.com/SRC-1)" in markdown
     assert "EV-" not in markdown
+
+
+def test_sufficient_coverage_does_not_claim_every_objective_was_perfectly_covered():
+    markdown = render_markdown_report(
+        ResearchReport(executive_summary="A qualified answer.", limitations=["Minor background gap."]),
+        stop_reason=ResearchStopReason.COVERAGE_SUFFICIENT,
+    )
+    assert "sufficient for a grounded report on the core question" in markdown
+    assert "## Evidence Gaps and Limitations\n\n- Minor background gap." in markdown
+    assert "planned evidence coverage was satisfied" not in markdown

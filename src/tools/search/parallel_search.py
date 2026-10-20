@@ -2,6 +2,7 @@
 
 import asyncio
 import re
+from itertools import zip_longest
 from urllib.parse import unquote, urlsplit
 
 from src.guardrails import url_dedup_key
@@ -17,6 +18,14 @@ _SEARCH_STOPWORDS = {
     "latest", "of", "on", "or", "the", "to", "what", "when", "which",
     "who", "why", "with",
 }
+
+
+class SearchResults(list[SearchResult]):
+    """Keep per-call diagnostics even when all branches return no matches."""
+
+    def __init__(self, results: list[SearchResult], diagnostics: dict):
+        super().__init__(results)
+        self.diagnostics = diagnostics
 
 
 class ParallelSearchProvider(SearchProvider):
@@ -65,15 +74,18 @@ class ParallelSearchProvider(SearchProvider):
             )
 
         deduplicated = deduplicate_search_results(results)
-        selected = sorted(
-            deduplicated,
-            key=lambda result: _result_rank(result, search_query.query),
-            reverse=True,
-        )[:max_results]
+        selected = rank_search_results(deduplicated, search_query.query)[:max_results]
         successful_branches = [
             name for name, _, error in outcomes if error is None
         ]
         diagnostics = {
+            "provider_counts": {
+                provider: sum(result.provider.value == provider for result in results)
+                for provider in dict.fromkeys([
+                    *("tavily" if name == "web" else name for name, _, _ in outcomes),
+                    *(result.provider.value for result in results),
+                ])
+            },
             "successful_branches": successful_branches,
             "failed_branches": failures,
             "web_fallback_activated": any(
@@ -93,11 +105,13 @@ class ParallelSearchProvider(SearchProvider):
         ]
         print(
             "\nParallel search completed:",
-            f"query={search_query.id}",
+            f"query id={search_query.id}",
+            f"query={search_query.query}",
             f"results={len(selected)}",
+            f"discovered_provider_counts={diagnostics['provider_counts']}",
             f"failed_branches={failures}",
         )
-        return selected
+        return SearchResults(selected, diagnostics)
 
     async def _search_branch(
         self,
@@ -130,17 +144,24 @@ class ParallelSearchProvider(SearchProvider):
 def deduplicate_search_results(
     results: list[SearchResult],
 ) -> list[SearchResult]:
-    """Merge results that identify the same page, paper, or article."""
+    """
+    Merge results that identify the same page, paper, or article.
+    Keep one result per identifiable source, while remembering every provider result that led us to it.
+    """
 
     groups: list[tuple[set[str], list[SearchResult]]] = []
     for result in results:
         identities = _identity_keys(result)
+        # Find every existing group that shares at least one known identifier with this new result
         matches = [group for group in groups if group[0] & identities]
         if not matches:
+            # We have not seen anything identifying this source yet. Start a collection for it.
             groups.append((identities, [result]))
             continue
 
         target = matches[0]
+        # adds the new identifiers to the existing set. 
+        # Sets automatically avoid duplicate entries.
         target[0].update(identities)
         target[1].append(result)
 
@@ -154,20 +175,47 @@ def deduplicate_search_results(
     return [_merge_group(group_results) for _, group_results in groups]
 
 
-def _result_rank(result: SearchResult, query: str) -> tuple[float, float, int]:
-    """Rank provider-neutral results by query fit, score, and corroboration."""
+def rank_search_results(
+    results: list[SearchResult], query: str, *, provider_offset: int | None = None,
+) -> list[SearchResult]:
+    """Interleave provider buckets ranked by the same query-fit signals."""
+    tokens = _search_tokens(query)
+    # Diversity is a tie-breaking opportunity, not an obligation to promote a
+    # provider's zero-overlap result. Keep those as fallback, not forced slots.
+    eligible = [result for result in results if not tokens or tokens & _search_tokens(
+        f"{result.title} {result.snippet or ''}"
+    )]
+    deferred = [result for result in results if result not in eligible]
+    if not eligible:
+        eligible, deferred = results, []
+    buckets: dict[SourceProvider, list[SearchResult]] = {}
+    for result in sorted(eligible, key=lambda item: _result_rank(item, query), reverse=True):
+        buckets.setdefault(result.provider, []).append(result)
+    # Extraction rotates a stable provider cycle, independent of which provider
+    # has the highest text score on each individual query.
+    groups = (list(buckets.values()) if provider_offset is None
+              else [buckets[provider] for provider in SourceProvider if provider in buckets])
+    if not groups:
+        return []
+    # Rotate the first provider across extraction intents so a small page budget
+    # does not always spend each query's first opportunity on the same provider.
+    offset = (provider_offset or 0) % len(groups)
+    groups = groups[offset:] + groups[:offset]
+    return [item for row in zip_longest(*groups) for item in row if item is not None] + deferred
+
+
+def _result_rank(result: SearchResult, query: str) -> tuple[float, int]:
+    """Use shared text/date signals, never incomparable raw provider scores."""
+    # break query in tokens
     query_tokens = _search_tokens(query)
+    # Calculate how much of the query appears in the title
     title_overlap = _overlap(query_tokens, _search_tokens(result.title))
+    # Calculate the same overlap for the snippet
     snippet_overlap = _overlap(query_tokens, _search_tokens(result.snippet or ""))
     provenance = result.provider_metadata.get("discovery_provenance", [])
-    provider_scores = [result.provider_score, *(
-        item.get("provider_score") for item in provenance if isinstance(item, dict)
-    )]
-    provider_score = max(
-        (score for score in provider_scores if isinstance(score, (int, float))),
-        default=0.0,
-    )
+    # Give a small preference to a source encountered through multiple discoveries.
     provenance_count = len(provenance)
+    # check for year match if present in query
     query_years = set(_YEAR.findall(query))
     source_dates = " ".join(str(result.provider_metadata.get(key) or "") for key in (
         "published_at", "updated_at", "last_edited_at",
@@ -176,14 +224,15 @@ def _result_rank(result: SearchResult, query: str) -> tuple[float, float, int]:
     combined = (
         (3.0 * title_overlap)
         + (1.5 * snippet_overlap)
-        + (1.5 * provider_score)
         + (0.25 * min(max(provenance_count - 1, 0), 2))
         + temporal_match
     )
-    return combined, provider_score, provenance_count
+    return combined, provenance_count
 
 
 def _search_tokens(value: str) -> set[str]:
+    # Removes words in your configured stopword list
+    # Returns a set, so repeated words appear only once.
     return {
         token for token in _TOKEN.findall(value.casefold())
         if token not in _SEARCH_STOPWORDS

@@ -230,12 +230,9 @@ class ResearchLimitSettings(EnvironmentSettings):
     )
 
     max_queries_per_subquestion: int = Field(
-        default=2,
+        default=3,
         ge=1,
     )
-
-    # Initial research keeps its allowance; retries focus the remaining budget.
-    max_followup_queries_per_round: int = Field(default=5, ge=1)
 
     max_search_query_chars: int = Field(
         default=500,
@@ -251,6 +248,9 @@ class ResearchLimitSettings(EnvironmentSettings):
         default=5,
         ge=1,
     )
+
+    # Allow broader first-round collection without increasing the job-wide cap.
+    max_extracted_pages_per_round: int = Field(default=30, ge=1)
 
     # Reserved for extraction providers where our application controls
     # the raw HTTP download. Tavily performs the remote fetch in Phase 1.
@@ -273,6 +273,7 @@ class ResearchLimitSettings(EnvironmentSettings):
         default=0.60,
         ge=0.0,
         le=1.0,
+        description="Minimum LLM relevance score for retaining an original retrieved chunk as evidence.",
     )
 
     # Maximum number of useful evidence items retained by one research job.

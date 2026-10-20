@@ -3,25 +3,20 @@
 import asyncio
 import json
 import logging
-import re
 from datetime import UTC, datetime
+from itertools import zip_longest
 from pprint import pprint
 
 from src.graph.graph_state import WorkflowState
 from src.guardrails import URLValidationError, url_dedup_key, validate_public_http_url
-from src.models import ErrorType, ResearchError, SearchQuery, SearchResult, Source, SourceType
+from src.models import ErrorType, ResearchError, SearchQuery, SearchResult, Source, SourceProvider, SourceType
 from src.services import generate_source_id
 from src.tools.cleaning import SourceCleaner, SourceCleaningError
 from src.tools.extraction import SourceContentExtractor, SourceExtractionError
+from src.tools.search.parallel_search import rank_search_results
 
 
 logger = logging.getLogger(__name__)
-
-_TOKEN = re.compile(r"[a-z0-9]{2,}")
-_STOPWORDS = {
-    "about", "and", "for", "from", "how", "of", "on", "or", "the", "to",
-    "what", "when", "which", "who", "why", "with",
-}
 
 
 def _get_iteration_search_results(state: WorkflowState, *, iteration: int) -> list[SearchResult]:
@@ -56,58 +51,43 @@ def _canonical_key(canonical_id: str) -> str:
     return f"canonical:{canonical_id.casefold()}"
 
 
-def _tokens(value: str) -> set[str]:
-    return {
-        token for token in _TOKEN.findall(value.casefold())
-        if token not in _STOPWORDS
-    }
-
-
-def _result_priority(result: SearchResult, query: SearchQuery) -> float:
-    query_tokens = _tokens(query.query)
-    overlap = len(query_tokens & _tokens(f"{result.title} {result.snippet or ''}"))
-    relevance = overlap / len(query_tokens) if query_tokens else 0.0
-    provenance = result.provider_metadata.get("discovery_provenance", [])
-    provider_scores = [result.provider_score, *(
-        item.get("provider_score") for item in provenance if isinstance(item, dict)
-    )]
-    provider_score = max(
-        (score for score in provider_scores if isinstance(score, (int, float))),
-        default=0.0,
-    )
-    return relevance + provider_score + (0.2 * min(len(provenance), 3))
-
-
 def _rank_grouped_results(
     grouped_results: dict[str, list[SearchResult]],
     *,
     queries: list[SearchQuery],
     subquestion_ids: list[str],
 ) -> list[tuple[str, list[SearchResult]]]:
-    """Rank candidates within each subquestion, then interleave the buckets."""
-    queries_by_id = {query.id: query for query in queries}
-    buckets: dict[str, list[tuple[float, str, list[SearchResult]]]] = {}
+    """Balance query and provider opportunities within the existing page budget."""
+    task_queries: dict[str, list[SearchQuery]] = {}
+    for query in queries:
+        if any(result.query_id == query.id for results in grouped_results.values() for result in results):
+            task_queries.setdefault(query.subquestion_id, []).append(query)
+    task_order = list(dict.fromkeys([*subquestion_ids, *task_queries]))
+    query_order = [
+        query for group in zip_longest(*(task_queries.get(task, []) for task in task_order))
+        for query in group if query is not None
+    ]
+    results_by_id = {result.id: key for key, results in grouped_results.items() for result in results}
+    buckets = []
+    for index, query in enumerate(query_order):
+        candidates = [result for results in grouped_results.values() for result in results if result.query_id == query.id]
+        buckets.append([
+            (results_by_id[result.id], grouped_results[results_by_id[result.id]])
+            for result in rank_search_results(candidates, query.query, provider_offset=index)
+        ])
 
-    for url_key, results in grouped_results.items():
-        ranked_matches = [
-            (_result_priority(result, query), query.subquestion_id)
-            for result in results
-            if (query := queries_by_id.get(result.query_id)) is not None
-        ]
-        priority, subquestion_id = max(ranked_matches, default=(0.0, "unassigned"))
-        buckets.setdefault(subquestion_id, []).append((priority, url_key, results))
-
-    for bucket in buckets.values():
-        bucket.sort(key=lambda item: item[0], reverse=True)
-
-    bucket_order = [item for item in subquestion_ids if item in buckets]
-    bucket_order.extend(item for item in buckets if item not in bucket_order)
+    # Deduplicate globally, retaining every query's discovery IDs on each page.
     ranked: list[tuple[str, list[SearchResult]]] = []
-    while any(buckets[item] for item in bucket_order):
-        for subquestion_id in bucket_order:
-            if buckets[subquestion_id]:
-                _, url_key, results = buckets[subquestion_id].pop(0)
+    seen: set[str] = set()
+    while any(buckets):
+        for bucket in buckets:
+            while bucket and bucket[0][0] in seen:
+                bucket.pop(0)
+            if bucket:
+                url_key, results = bucket.pop(0)
+                seen.add(url_key)
                 ranked.append((url_key, results))
+    ranked.extend((key, results) for key, results in grouped_results.items() if key not in seen)
     return ranked
 
 
@@ -141,6 +121,8 @@ async def research_source_processor_node(
     page_attempts = control.usage.page_extraction_attempts
     round_page_attempts = 0
     skipped_for_budget = 0
+    extracted_counts: dict[str, int] = {}
+    reused_count = 0
 
     existing_source_indexes = {
         url_dedup_key(source.uri): index for index, source in enumerate(sources)
@@ -189,7 +171,12 @@ async def research_source_processor_node(
     print("\nsource processor existing source indexes:", existing_source_indexes)
 
     for url_key, search_results in ranked_results:
-        representative_result = search_results[0]
+        # A shared URL can be discovered by different queries/providers. Retain
+        # native metadata so its page or paper uses the correct extractor.
+        representative_result = next(
+            (item for item in search_results if item.provider in {SourceProvider.ARXIV, SourceProvider.WIKIPEDIA}),
+            search_results[0],
+        )
         search_result_ids = [result.id for result in search_results]
         canonical_key = _canonical_key(representative_result.canonical_id)
 
@@ -198,6 +185,7 @@ async def research_source_processor_node(
         if existing_index is None:
             existing_index = existing_source_indexes.get(url_key)
         if existing_index is not None:
+            reused_count += 1
             sources[existing_index] = _merge_search_result_ids(
                 source=sources[existing_index], search_result_ids=search_result_ids
             )
@@ -345,6 +333,8 @@ async def research_source_processor_node(
             },
         )
         sources.append(source)
+        provider = source.provider.value
+        extracted_counts[provider] = extracted_counts.get(provider, 0) + 1
         existing_source_indexes[extracted_key] = len(sources) - 1
         existing_source_indexes[url_key] = len(sources) - 1
         existing_source_indexes[canonical_key] = len(sources) - 1
@@ -377,10 +367,23 @@ async def research_source_processor_node(
             "page_extraction_attempts": page_attempts,
             "round_page_attempts": round_page_attempts,
             "sources_count": len(sources),
+            "data": {"extracted_provider_counts": extracted_counts, "extracted_count": sum(extracted_counts.values()),
+                     "reused_count": reused_count, "attempted_count": round_page_attempts,
+                     "deferred_count": skipped_for_budget},
         },
     )
     return {
-        "research": {**research, "sources": sources},
+        "research": {
+            **research, "sources": sources,
+            "extraction_stats": {
+                "iteration": target_iteration,
+                "extracted_provider_counts": extracted_counts,
+                "extracted_count": sum(extracted_counts.values()),
+                "reused_count": reused_count,
+                "attempted_count": round_page_attempts,
+                "deferred_count": skipped_for_budget,
+            },
+        },
         "research_control": updated_control,
         "errors": errors,
     }

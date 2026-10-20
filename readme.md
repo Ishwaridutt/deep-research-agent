@@ -37,13 +37,13 @@ The project addresses a common failure mode in research assistants: sending larg
 | Search results contain duplicates, snippets, boilerplate, and irrelevant text. | Provider adapters normalize results, canonical identifiers merge duplicates, deterministic cleaning removes noise, and retrieval selects relevant passages. |
 | One provider can be unavailable or rate-limited. | Search, extraction, and LLM calls use ordered fallbacks with bounded retries and circuit breakers. |
 | Public and private sources require different handling. | Web content and private documents use separate retrieval sessions while sharing one chunker and one hybrid-ranking implementation. |
-| An LLM may stop too early or repeat broad searches. | A coverage evaluator identifies specific gaps, and a deterministic router permits only bounded, gap-targeted follow-up rounds. |
+| An LLM may stop too early or repeat broad searches. | A coverage evaluator identifies specific gaps, a deterministic router checks budgets, and the planner creates focused follow-up subquestions before new queries are generated. |
 | Generated claims may not be supported by cited evidence. | The writer can reference only accepted evidence, and the citation checker removes unsupported findings before final rendering. |
 | Long-running work is hard to understand from a request spinner. | Persisted stage events drive a live, replayable SSE timeline in the UI. |
 
 ## Key Features
 
-- **Multi-stage LangGraph workflow:** Explicit nodes handle input validation, planning, query generation, source selection, retrieval, evidence extraction, coverage evaluation, writing, citation checking, and rendering.
+- **Multi-stage LangGraph workflow:** Explicit nodes handle input validation, planning, query generation, source selection, retrieval, evidence relevance scoring, coverage evaluation, writing, citation checking, and rendering.
 - **Three research modes:** Run web-only, document-only, or hybrid research from the same API and UI.
 - **Parallel public search:** Search the general web, arXiv, and Wikipedia concurrently for every generated query.
 - **Canonical deduplication:** Merge equivalent pages, papers, and articles using canonical IDs, URLs, arXiv IDs, DOIs, and Wikipedia page IDs.
@@ -53,7 +53,7 @@ The project addresses a common failure mode in research assistants: sending larg
 - **Shared retrieval pipeline:** Chonkie creates structure-aware chunks, a dense in-memory index and BM25 search the same corpus, and weighted Reciprocal Rank Fusion combines their rankings.
 - **Bounded LLM context:** Enforce token limits and per-document diversity before sending retrieved text to the evidence extractor.
 - **Private-document provenance:** Preserve document, filename, page, section, character-offset, and chunk metadata through retrieval, evidence, and final citations.
-- **Evidence coverage loop:** Detect missing, partial, conflicting, and supported objectives, then research only actionable gaps while budgets permit.
+- **Evidence coverage loop:** Judge whether the core request has enough evidence for a grounded report. Return to the planner for material gaps while budgets permit; disclose minor gaps without requiring perfect coverage. Evidence remains linked to the original objectives across rounds.
 - **Citation-safe reporting:** Validate evidence references deterministically, perform semantic support checks, remove unsupported findings, and render Markdown from the validated report.
 - **Ordered LLM fallback:** Configure OpenAI, Gemini, and Groq independently for each logical role, with private-data provider allowlisting.
 - **Persistent job history:** Store asynchronous job status, final results, errors, and ordered progress events in SQLite.
@@ -178,9 +178,12 @@ flowchart TD
     Start([START]) --> Guardrail[input_guardrail]
     Guardrail -->|valid| Planner[research_planner]
     Guardrail -->|terminal error| End([END])
-    Planner -->|plan created| Query[research_query_generator]
+    Planner -->|initial or refined tasks created| Query[research_query_generator]
+    Planner -->|no useful follow-ups or budget exhausted| Prepare[writer_prepare_evidence]
     Planner -->|terminal error| End
-    Query --> Select[research_source_selection]
+    Query -->|new queries| Select[research_source_selection]
+    Query -->|no usable new queries or time exhausted| Prepare
+    Query -->|terminal error| End
 
     Select -->|web or hybrid| Search[research_web_search]
     Select -->|documents only| Retrieve[research_retrieval]
@@ -192,8 +195,8 @@ flowchart TD
     Evidence --> Coverage[research_coverage_evaluator]
     Coverage --> Router[research_routing]
 
-    Router -->|actionable gaps and budget remains| Query
-    Router -->|coverage sufficient or stop limit| Prepare[writer_prepare_evidence]
+    Router -->|unresolved gaps and budget remains| Planner
+    Router -->|coverage sufficient or stop limit| Prepare
     Router -->|terminal error| End
 
     Prepare --> Synthesis[writer_synthesis]
@@ -211,17 +214,17 @@ Hybrid mode follows the public-search branch, but `research_source_selection` al
 | Node | Problem solved | Implementation |
 |---|---|---|
 | `input_guardrail` | Invalid questions or incomplete source selections should fail before provider calls. | Validates question length, allowed sources, owner identity, and document selection. |
-| `research_planner` | A broad question needs a research plan. | Uses structured LLM output to create bounded subquestions and objectives. |
-| `research_query_generator` | Each objective needs searchable wording. | Creates initial queries or gap-focused follow-up queries and applies job query limits. |
+| `research_planner` | Initial planning and unresolved gaps need focused research tasks. | Creates original objectives initially. On retries, uses gaps, previous tasks/queries, and remaining query capacity to create follow-up subquestions linked to unresolved original objectives. |
+| `research_query_generator` | Each planned task needs searchable wording. | Translates the planner's active subquestions into only the necessary queries, deduplicates against prior searches, and enforces per-task and total-job query limits. Gap selection belongs to the planner. |
 | `research_source_selection` | Source modes need different runtime resources. | Authorizes selected documents and builds one job-scoped document retrieval session. `route_after_source_selection` chooses the public-search or document-only edge. |
 | `research_web_search` | One public search source is incomplete and may fail. | Runs current-round queries through the parallel composite provider and retains normalized results and diagnostics. |
 | `research_source_processor` | Search results are not evidence-ready documents. | Loads provider-native or webpage content, cleans it, deduplicates it, and creates normalized `Source` objects. |
-| `research_retrieval` | Entire sources are too large and noisy for an LLM. | Builds a current-round public retrieval session, reuses the job-owned private session, and returns separate bounded web/document contexts. |
-| `research_evidence_extractor` | Retrieved text must become explicit claims with provenance. | Produces schema-validated evidence linked to chunks, sources, and research objectives; normalizes duplicates. |
-| `research_coverage_evaluator` | The system must know what remains unanswered. | Rates each subquestion, validates referenced evidence IDs, and emits actionable coverage gaps. |
-| `research_routing` | An LLM should not control an unbounded loop. | Deterministically checks coverage, iteration count, query usage, extraction attempts, elapsed time, and evidence gain. |
+| `research_retrieval` | Entire sources are too large and noisy for an LLM. | Builds a public retrieval session over all public sources collected in this job, reuses the job-owned private session, searches each active task's queries independently, and merges ranked chunks into separate bounded web/document contexts. |
+| `research_evidence_extractor` | Retrieved passages may be irrelevant, while rewriting them can lose useful detail. | Scores each new chunk against its active task, objective, and current queries; retains original passages meeting `MIN_EVIDENCE_RELEVANCE`. Evidence stays linked to the original objective with task, query, iteration, and source provenance. |
+| `research_coverage_evaluator` | The system must know when enough evidence exists to write. | Assesses stable original objectives and overall report readiness, validates evidence IDs, and distinguishes material blockers from minor limitations. |
+| `research_routing` | An LLM should not control an unbounded loop. | Deterministically checks coverage, iteration count, query usage, extraction attempts, elapsed time, and evidence gain; continues at `research_planner` or stops for writing. |
 | `writer_prepare_evidence` | The writer needs a relevant, balanced evidence set. | Ranks evidence by relevance, gives each subquestion an opportunity to contribute, and stores only selected evidence IDs in writer state. |
-| `writer_synthesis` | Evidence must become a readable report without inventing claims. | Produces a structured draft from selected evidence and records unresolved gaps as limitations. |
+| `writer_synthesis` | Evidence must become a readable report without inventing claims. | Produces a topic-specific title, cited summary, and detailed findings grouped into free-form sections; records unresolved gaps as limitations. |
 | `writer_citation_checker` | Draft citations may be missing or unsupported. | Performs deterministic reference checks and semantic evidence-to-claim validation; unsupported findings are removed. |
 | `finalize_report` | Output formatting should not change validated meaning. | Deterministically renders the validated `ResearchReport` into Markdown. |
 
@@ -229,22 +232,32 @@ Hybrid mode follows the public-search branch, but `research_source_selection` al
 
 The research loop continues only when coverage contains actionable gaps and all configured budgets still allow another round.
 
+The path is `research_coverage_evaluator` → `research_routing` → `research_planner` → `research_query_generator`. The router records unresolved gaps in `research_control.pending_gaps`. The planner receives those gaps, the original objectives, previous subquestions and associated queries, and available query capacity. Full coverage assessments and accepted evidence remain in state but are excluded from the refinement prompt. The planner returns focused follow-up subquestions rather than replacing the original objectives.
+
+Each follow-up has a `parent_subquestion_id` identifying an unresolved original objective. The application rejects unknown parents and exact repeated task wording. The query generator translates the selected tasks into searches, reserves one query slot per remaining task, and carries unused capacity forward. Semantic repetition is discouraged by prompts; deterministic deduplication checks normalized text.
+
+Query counts depend on the selected tasks and their evidence needs; there is no separate initial or follow-up round quota. For example, five initial tasks can produce ten queries, then six related gaps can be grouped into three follow-up tasks producing six queries. With a total job allowance of 30, that leaves 14 queries available. These are possible counts, not required quotas: the planner and query generator may return fewer tasks or searches when sufficient.
+
 ```mermaid
 stateDiagram-v2
-    [*] --> ResearchRound
+    [*] --> InitialPlanning
+    InitialPlanning --> QueryGeneration
+    QueryGeneration --> ResearchRound
     ResearchRound --> CoverageEvaluation
-    CoverageEvaluation --> WriteReport: coverage sufficient
-    CoverageEvaluation --> WriteReport: no actionable gaps
-    CoverageEvaluation --> WriteReport: iteration/query/extraction/time budget reached
-    CoverageEvaluation --> WriteReport: no evidence improvement
-    CoverageEvaluation --> GapTargetedQueries: unresolved gaps + budget available
-    GapTargetedQueries --> ResearchRound
+    CoverageEvaluation --> ResearchRouting
+    ResearchRouting --> WriteReport: coverage sufficient or no actionable gaps
+    ResearchRouting --> WriteReport: iteration/query/extraction/time budget reached
+    ResearchRouting --> WriteReport: no evidence improvement
+    ResearchRouting --> PlannerRefinement: unresolved gaps + budget available
+    PlannerRefinement --> QueryGeneration: focused follow-up subquestions
+    PlannerRefinement --> WriteReport: no usable follow-ups or budget exhausted
+    QueryGeneration --> WriteReport: no usable new queries or time exhausted
     WriteReport --> [*]
 ```
 
 Supported stop reasons include:
 
-- **`coverage_sufficient`:** Evidence adequately supports the planned objectives.
+- **`coverage_sufficient`:** Evidence supports a grounded answer to the core request at the requested depth; minor limitations may remain.
 - **`max_iterations`:** The bounded round limit was reached.
 - **`query_budget_exhausted`:** The job used its permitted query count.
 - **`extraction_budget_exhausted`:** The job reached its page-processing limit.
@@ -293,7 +306,8 @@ flowchart LR
 #### Search Behavior
 
 - **Parallel branches:** General web, arXiv, and Wikipedia searches run concurrently under a shared semaphore.
-- **Per-provider limits:** Each branch keeps its own result cap instead of comparing incompatible provider scores.
+- **Result limits and fairness:** Each branch keeps its own result cap. After canonical merging, shared title/snippet/date ranking orders each provider's bucket, and the buckets are interleaved before the aggregate limit. Raw provider scores do not affect cross-provider ranking or its tie-breaks; missing native scores are not treated as poor relevance. Not every discovered result reaches extraction. Progress records both discovered and retained provider counts.
+- **Relevance before diversity:** When text-matching candidates exist, zero-overlap title/snippet candidates wait until after their provider-interleaved matches. They remain fallback candidates, not discarded sources. This is a conservative lexical heuristic, not proof of semantic relevance.
 - **Partial success:** A failed branch does not discard useful results from healthy branches. The query fails only when every branch fails.
 - **General-search fallback:** Tavily retries first. Brave activates only for failures classified as eligible for fallback and only when `BRAVE_API_KEY` is configured.
 - **Canonical merging:** Duplicate identities are detected from canonical IDs, normalized URLs, DOI values, arXiv IDs without version suffixes, Wikipedia page IDs, and Wikipedia titles.
@@ -301,8 +315,9 @@ flowchart LR
 
 #### Extraction Behavior
 
+- **Query/provider-balanced allocation:** Candidate pages rotate across queries and subquestions, reusing the shared provider-interleaving ranker. The starting provider rotates across intents so one provider does not always consume their first extraction opportunities. Shared URLs are extracted once and retain every discovery relationship; round/job extraction caps still apply. Provider diversity is an opportunity to inspect content, not a guarantee that the evidence scorer will accept it.
 - **General webpages:** Tavily Extract is primary; Firecrawl is the optional fallback.
-- **arXiv:** The native adapter downloads a bounded PDF and reuses the existing PDF parser. If full text is disabled or unusable, it falls back to the abstract.
+- **arXiv:** The native adapter downloads a bounded PDF and reuses the existing PDF parser. If full text is disabled or unusable, it falls back to the abstract. Metadata records PDF versus abstract, fallback reason, total pages, pages processed, pages with text, and page-limit truncation. The citation URL can remain `/abs/` even when extraction used `/pdf/`.
 - **Wikipedia:** The native adapter requests canonical plain text, redirects, page ID, and revision metadata from MediaWiki.
 - **Circuit breaking:** Repeated eligible failures temporarily open a provider circuit so every URL or query does not repeatedly call an unhealthy service.
 
@@ -406,6 +421,12 @@ flowchart TD
 
 `src/retrieval/chunking/retrieval_chunker.py` is the only chunking implementation. Public sources and private documents both pass through it, ensuring consistent chunk boundaries and provenance behavior.
 
+For each active task, `RetrievalSession.retrieve()` searches its queries independently, interleaves the rankings, and removes duplicate chunk IDs before applying the existing context and per-document limits. Each source branch produces one bounded context per task, avoiding an extra evidence-scoring LLM call for every search query.
+
+`RetrievalResult.query_matches` records each intent's hybrid match count and how many matches entered the final bounded context. The same passage may match several queries: per-query counts overlap and do not represent distinct accepted evidence. Progress events expose these counts and generated query text, not raw passages or private file metadata.
+
+Before indexing public chunks, the shared hybrid retriever excludes obvious link menus and bibliography-dominated passages. The filter preserves numbered factual lists, tables, and ordinary in-text citations, and does not filter private-document chunks. It does not rewrite content, change chunk IDs, replace RRF, or guarantee that every remaining match is useful. Follow-up queries search the job's earlier collected public sources too; the bounded public index is rebuilt per round, while accepted evidence is not rescored for the same original objective.
+
 ### Data Transformation
 
 ```text
@@ -420,25 +441,29 @@ SearchResult
     -> ResearchReport
 ```
 
-Each transformation narrows the data while retaining identifiers needed to trace a final finding back to its source and chunk.
+The pipeline selects and transforms data while retaining identifiers needed to trace a final finding back to its source and chunk. The evidence stage retains selected chunk text unchanged rather than generating compressed claims.
 
 ## Evidence, Coverage, and Writing
 
 ### Evidence Boundary
 
-The evidence extractor receives only retrieved contexts—not complete source corpora. It returns schema-validated evidence containing:
+`research_evidence_extractor` keeps its existing node name and `EVIDENCE_MODEL` configuration, but now performs relevance scoring rather than text extraction. For each source branch and active task, it supplies new, nonblank retrieved chunks plus the original question, task objective, and current-round queries. The LLM returns only each chunk's exact ID and a 0–1 relevance score; the application builds evidence containing:
 
-- the supported claim or relevant content;
+- the original chunk text, unchanged;
 - the associated subquestion;
 - the source and chunk identifiers;
 - relevance and provenance metadata; and
 - private-document locations when applicable.
 
-Evidence from web and document results is normalized into one evidence collection. Exact normalized duplicates within the same subquestion are not added twice; every retained item keeps the provenance of its supporting chunk and source.
+`MIN_EVIDENCE_RELEVANCE` controls admission (default `0.60`, inclusive). Scores judge usefulness, not factual certainty or source reliability; relevant contradictions and null results can be useful. Unknown IDs and duplicate judgments are rejected, and missing scores never default to acceptance. Partial responses retain only valid, sufficiently relevant judgments and record a recoverable error plus log diagnostics. Within each response, higher-scored chunks receive remaining evidence capacity first.
+
+Web and document evidence joins one downstream collection. Deduplication uses original objective ID plus chunk ID, preserving equal text from different source chunks. Already accepted chunks are not rescored for that objective, and evidence from earlier rounds remains available. Full retained passages can increase downstream context costs; retrieval and writer limits still apply.
+
+Follow-up evidence uses the original objective's ID in `Evidence.subquestion_id`. Provenance records `research_subquestion_id`, `research_iteration`, and `research_query_ids` for the task that discovered it. These query IDs identify task-level search intent, not an exact per-chunk query match. Coverage and writing therefore retain access to evidence from all rounds.
 
 ### Coverage Evaluation
 
-The coverage evaluator checks every planned subquestion and classifies its support. It can identify:
+The coverage evaluator checks every original planned subquestion against accumulated evidence and the previous coverage result. Follow-up tasks do not become additional coverage requirements. It can identify:
 
 - supported objectives;
 - partially supported objectives;
@@ -446,7 +471,11 @@ The coverage evaluator checks every planned subquestion and classifies its suppo
 - conflicting evidence; and
 - actionable follow-up gaps.
 
-The deterministic router—not the LLM—decides whether those gaps justify another iteration.
+The evaluator judges report readiness rather than requiring every objective to be perfectly covered. One specific, relevant passage can support a subquestion; corroboration is preferred, not a fixed two-source requirement. Evidence strength remains descriptive, and uncertainty or explainable disagreement does not automatically require another round. Explicitly requested topics, comparisons, and time periods must not be dismissed as optional.
+
+When overall status is `insufficient`, `coverage.gaps` identifies material blockers and the evidence needed to resolve them. When status is `sufficient`, the same field preserves remaining minor limitations for the writer. Partial or missing peripheral objectives therefore need not block a useful report. Reference validation still rejects unsupported readiness claims, invented/cross-objective evidence IDs, and missing or duplicate assessments. Normalization no longer manufactures research gaps from every partial status or from contradictory overall output.
+
+The deterministic router—not the LLM—enforces the stop conditions. `sufficient` goes directly to writing even with minor limitations and unused budget. Otherwise, actionable gaps return to the planner while limits permit; absent actionable gaps stop research rather than generating artificial follow-ups. The planner turns material gaps into follow-up subquestions before the query generator creates searches.
 
 ### Writer and Citation Pipeline
 
@@ -464,6 +493,14 @@ flowchart LR
 ```
 
 The writer cannot cite evidence it did not receive. The citation checker verifies that referenced evidence and sources exist, then checks whether the cited evidence actually supports each finding. Findings that fail validation do not reach the final report.
+
+`DraftReport` keeps the report structure flexible without creating topic-specific schemas:
+
+- **Title and executive summary:** A subject-specific title and an answer-first, evidence-cited summary.
+- **Thematic findings:** Each finding has a free-form `section`, focused `title`, detailed `content`, and supporting `evidence_ids`. Content can contain paragraphs, lists, or Markdown tables. Sections fit the question rather than a fixed financial, scientific, or technical template.
+- **Limitations:** Missing evidence, conflicts, and research constraints are explicit. Comparisons, scenarios, and implications appear only when supported by supplied evidence.
+
+The synthesis node does not silently strip invalid references; the citation checker rejects affected findings. The checker also produces a summary based on surviving findings and converts its evidence citations to the same source numbers used in the body. The final API report preserves `title` and each finding's `section`; the UI and Markdown renderer group related findings under those headings. Markdown rendering generates the research approach and Cited Sources once. Older reports without the new fields use the existing default title and Detailed Analysis section.
 
 ## LLM and Provider Fallbacks
 
@@ -539,7 +576,7 @@ Representative event types:
 | `stage_started` | A named pipeline node started. |
 | `stage_completed` | A node completed successfully. |
 | `stage_failed` | A node returned or raised a terminal failure. |
-| `research_retry` | The router scheduled a gap-targeted round. |
+| `research_retry` | The router scheduled a follow-up round starting with planner refinement. |
 | `research_stopped` | Research ended and writing can begin. |
 | `workflow_completed` | A final report was persisted. |
 | `workflow_failed` | A terminal error was persisted. |
@@ -567,7 +604,25 @@ flowchart TD
     Poll -->|job terminal| Final
 ```
 
-Progress events expose counts, stage names, provider names, fallback activation, coverage status, and sanitized error summaries. They do not persist prompts, source bodies, evidence text, private document IDs, credentials, or final report contents.
+Completed research stages have expandable output details:
+
+- **Research planning:** Current subquestions, objectives, and the original question behind each follow-up task. Initial planning appears inside research round one, just like follow-up planning.
+- **Generate search queries:** Current-round queries and their purposes, grouped under the associated subquestion.
+- **Search public sources:** Discovered Tavily/Brave, arXiv, and Wikipedia result counts before aggregate selection, alongside retained totals after filtering, partial failures, and fallback activation. Zero-result enabled branches remain visible. Counts are returned matches, not the provider's total estimated hits or globally unique sources.
+- **Extract public source content:** New usable pages per discovery provider and in total, extraction attempts, reused pages, and budget-deferred candidates. Reused pages are available for retrieval but are not counted as newly extracted pages.
+- **Find relevant passages:** Separate public and private rows show per-subquestion context sizes and each query's retrieved/selected passage counts. Both rows describe the same graph retrieval node. With no documents attached, the private row is greyed out and marked skipped; document-only research omits the public stages.
+- **Score evidence relevance:** Passages scored, kept, filtered below the configured threshold, or skipped because of evidence capacity. Missing/invalid judgments and scoring failures are separate diagnostics; below-threshold does not mean factually incorrect. Previously accepted passages are not rescored.
+- **Evaluate coverage:** Supported, partial, missing, and conflicting objective counts, with each objective's explanation, evidence strength, supporting-passage count, and remaining gaps. Sufficient coverage labels remaining gaps as report limitations.
+
+Details are scoped to their research round and replay with persisted events after refresh. User-expanded panels remain open during live updates. Writer stages retain their existing progress-only view. Older events without richer payloads still render their available counts. To bound event size, lists display at most 100 items and text fields at most 1,000 characters; the UI marks list truncation and shortened text uses an ellipsis. Totals include all items.
+
+The timeline identifies the current job, and search details explicitly identify their job/round and executed-query count when recorded. Counts are per round, not cumulative job totals. The `web_search_completed` application log uses matching discovered/retained summary fields under the same job and iteration, so compare matching scopes rather than another job's individual provider prints.
+
+Report bodies use locally bundled Marked and DOMPurify for sanitized GitHub-flavored Markdown, including tables, lists, emphasis, links, and code. Table columns preserve alignment and scroll horizontally when needed. Images, scripts, embeds, event handlers, and unsafe links are excluded. Headings retain the safe inline formatter. The generated-Markdown disclosure remains a literal, copyable source view; no CDN is needed.
+
+Scoring details group passage decisions by research task and show matched queries, scores, the threshold, and computed acceptance/rejection reasons. Public previews are limited to 800 characters; scoring still uses the complete retrieved passage. At most 100 audit rows enter each event, with truncation indicated. Private passage contents, chunk identifiers, filenames, paths, and owner IDs are redacted; only their scores/decisions remain visible. A source funnel shows collected → retrieved → accepted → supplied to writer → cited counts. The final list is labeled **Cited sources**, not all downloaded sources.
+
+Event payloads explicitly allowlist generated summaries, counters, and bounded public scoring previews, not full prompts, source bodies, provider responses, or reports. Generated questions, queries, and coverage explanations can still contain research-sensitive information. Job-viewing routes are currently unauthenticated, so treat a job link and its stored events as sensitive, just like the final report. Authentication remains required before production use with private research.
 
 ## State and Resource Lifetimes
 
@@ -577,7 +632,7 @@ Understanding resource scope is important because the project intentionally avoi
 |---|---|---|
 | Application process | Settings, provider clients, embedding service, tokenizer, retrieval factory, document service, in-memory document registry | Server process |
 | Research job | LangGraph state, private-document retrieval session, LLM provider preference/failure state | One job |
-| Public retrieval invocation | Current-round public chunks, dense index, BM25 index, retrieval contexts | Built for one retrieval-node invocation; the current explicit `clear()` call is disabled |
+| Public retrieval invocation | Job-collected public chunks, dense index, BM25 index, current-task retrieval contexts | Rebuilt for one retrieval-node invocation; the current explicit `clear()` call is disabled |
 | Persistent local storage | SQLite jobs/events, uploaded source files | Until manually removed |
 | Browser | Temporary owner ID and last job ID | Browser local storage |
 
@@ -586,13 +641,15 @@ Understanding resource scope is important because the project intentionally avoi
 | State section | Owns |
 |---|---|
 | Root | Job/session IDs, question, owner ID, selected source mode, selected document IDs, structured errors |
-| `research` | Plan, queries, search results, normalized sources, separate web/document retrieval results, evidence, coverage, iteration count, stop reason |
+| `research` | Original `subquestions`, current `active_subquestions`, `planning_history`, queries, search results, normalized sources, separate web/document retrieval results, accumulated evidence, current-round `search_stats`, `extraction_stats`, `evidence_stats`, private-safe `evidence_audit`, cumulative `retrieved_source_ids`, coverage, iteration count, stop reason |
 | `research_control` | Budgets, usage, pending gaps, routing decision, and round history |
-| `writer` | Selected evidence IDs, draft report, citation result, and final report |
+| `writer` | Selected evidence IDs, source-lineage counters (`source_stats`), draft report, citation result, and final report |
 
 Non-serializable retrieval indexes stay in `ResearchJobResources`, outside graph state.
 
 `WorkflowState` is a `TypedDict` without `Annotated` reducers. A returned top-level key replaces that key; nodes preserve nested `research` and `writer` fields with explicit dictionary spreads, append or deduplicate lists themselves, and update `ResearchControlState` through Pydantic `model_copy()`. The private retrieval session and per-job LLM provider health remain runtime resources rather than serializable graph state.
+
+Initial planning populates all three planning lists. Later planner calls preserve `subquestions`, replace `active_subquestions`, and append new tasks to `planning_history`. Queries reference active task IDs; accepted evidence is mapped back to original objective IDs.
 
 ## Getting Started
 
@@ -849,9 +906,10 @@ All retrieval variables use the `RETRIEVAL_` prefix.
 
 | Variable | Purpose |
 |---|---|
-| `MAX_SUBQUESTIONS` | Maximum planning breadth. |
-| `MAX_QUERIES_PER_SUBQUESTION` | Query-generation limit per objective. |
+| `MAX_SUBQUESTIONS` | Maximum original objectives or follow-up tasks produced by a planner call, subject to remaining query capacity. Default: 5. |
+| `MAX_QUERIES_PER_SUBQUESTION` | Maximum queries per active task; the model may generate fewer when sufficient. Default: 3. |
 | `MAX_TOTAL_QUERIES_PER_JOB` | Job-wide query budget. |
+| `MAX_EXTRACTED_PAGES_PER_ROUND` | Extraction attempts per round, default 30; the existing job-wide limit remains 60. Reused sources do not consume new extraction attempts. |
 | `MAX_SOURCE_DOWNLOAD_BYTES` | Bounded source/PDF download size. |
 | `MIN_SOURCE_CONTENT_CHARS`, `MAX_SOURCE_CONTENT_CHARS` | Cleaner acceptance limits. |
 | `MIN_EVIDENCE_RELEVANCE` | Minimum accepted evidence relevance. |

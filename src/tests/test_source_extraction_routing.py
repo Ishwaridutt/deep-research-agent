@@ -111,7 +111,7 @@ def test_source_processor_preserves_native_provenance_for_retrieval():
             source_cleaner=SourceCleaner(min_chars=20, max_chars=1_000),
         )
         updated_state = {**state, "research": update["research"]}
-        return update["research"]["sources"][0], _web_documents(updated_state, [query])[0]
+        return update["research"]["sources"][0], _web_documents(updated_state)[0]
 
     source, document = asyncio.run(run())
 
@@ -122,3 +122,29 @@ def test_source_processor_preserves_native_provenance_for_retrieval():
     assert document.metadata["provider"] == "arxiv"
     assert document.metadata["canonical_id"] == "arxiv:2401.12345:v2"
     assert document.metadata["provider_metadata"]["pages_loaded"] == 4
+
+
+def test_shared_url_across_queries_keeps_native_extraction_and_all_discovery_ids():
+    calls = []
+
+    class Extractor:
+        async def extract(self, *, search_result):
+            calls.append(search_result)
+            return ExtractedSourceContent(url=search_result.url, content="Detailed source evidence from the native paper extractor.")
+
+    async def run():
+        state = create_initial_workflow_state(job_id="job", research_session_id="session",
+                                              question="What is agentic AI?", allowed_sources=[ResearchSource.WEB])
+        native = _result(SourceProvider.ARXIV).model_copy(update={"id": "native", "query_id": "query-2"})
+        web = native.model_copy(update={"id": "web", "query_id": "query-1", "provider": SourceProvider.TAVILY,
+                                        "canonical_id": f"web:{native.url}", "provider_score": 0.99, "provider_metadata": {}})
+        state["research"]["search_queries"] = [SearchQuery(id=f"query-{n}", subquestion_id="task", query="agentic AI", purpose="Research", iteration=1) for n in (1, 2)]
+        state["research"]["search_results"] = [web, native]
+        return await research_source_processor_node(state, source_extractor=Extractor(), source_cleaner=SourceCleaner(min_chars=20, max_chars=1000))
+
+    update = asyncio.run(run())
+    assert len(calls) == 1 and calls[0].provider == SourceProvider.ARXIV
+    source = update["research"]["sources"][0]
+    assert source.provider == SourceProvider.ARXIV
+    assert set(source.search_result_ids) == {"web", "native"}
+    assert update["research"]["extraction_stats"]["extracted_provider_counts"] == {"arxiv": 1}

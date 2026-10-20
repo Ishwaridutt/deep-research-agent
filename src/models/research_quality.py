@@ -26,7 +26,7 @@ class ResearchBudget(BaseModel):
     )
 
     max_extracted_pages_per_round: int = Field(
-        default=20,
+        default=30,
         ge=1,
     )
 

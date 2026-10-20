@@ -7,6 +7,7 @@ python-multipart
 python-docx
 pypdf
 httpx
+fonttools
 
 langchain
 langchain-core

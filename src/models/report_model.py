@@ -8,25 +8,39 @@ from src.models.source_model import SourceType
 
 
 class ReportFinding(BaseModel):
-    """A report finding grounded in specific evidence."""
+    """A citation-checked analysis block in a topic-appropriate report section."""
 
+    section: str = Field(
+        default="Detailed Analysis", min_length=1,
+        description="Free-form section heading chosen for the research topic; reuse it for related findings.",
+    )
     title: str = Field(min_length=1)
-    content: str = Field(min_length=1)
-    evidence_ids: list[str] = Field(default_factory=list)
+    content: str = Field(
+        min_length=1,
+        description="Detailed evidence-grounded paragraphs, lists, or Markdown tables with inline evidence citations.",
+    )
+    evidence_ids: list[str] = Field(default_factory=list, description="Supplied evidence IDs supporting this block.")
 
 
 class FinalReportFinding(BaseModel):
     """A user-facing finding with internal evidence IDs removed."""
 
+    section: str = Field(default="Detailed Analysis", min_length=1)
     title: str = Field(min_length=1)
     content: str = Field(min_length=1)
 
 
 class DraftReport(BaseModel):
-    """Structured report created by the Writer Agent."""
+    """A topic-adaptive report whose analysis blocks share one citation pipeline."""
 
-    executive_summary: str = Field(min_length=1)
-    findings: list[ReportFinding] = Field(default_factory=list)
+    title: str = Field(default="Deep Research Report", min_length=1, description="Specific, plain-text title naming the research subject.")
+    executive_summary: str = Field(
+        min_length=1, description="Answer-first summary of supported conclusions and material uncertainty, with evidence citations.",
+    )
+    findings: list[ReportFinding] = Field(
+        default_factory=list,
+        description="Ordered analysis blocks grouped by free-form section headings. Choose sections and depth to fit the question and evidence.",
+    )
 
     limitations: list[str] = Field(
         default_factory=list,
@@ -80,7 +94,9 @@ class SemanticFindingCheck(BaseModel):
 class SemanticCitationCheckOutput(BaseModel):
     """Structured LLM output used during semantic citation checking."""
 
-    revised_executive_summary: str = Field(min_length=1)
+    revised_executive_summary: str = Field(
+        min_length=1, description="Summary supported by validated findings, with inline evidence-ID citations.",
+    )
     finding_results: list[SemanticFindingCheck]
 
 
@@ -97,6 +113,7 @@ class ReportSource(BaseModel):
 class ResearchReport(BaseModel):
     """Validated final report returned by the research application."""
 
+    title: str = Field(default="Deep Research Report", min_length=1)
     executive_summary: str = Field(min_length=1)
     findings: list[FinalReportFinding] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
