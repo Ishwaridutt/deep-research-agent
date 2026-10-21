@@ -1,6 +1,7 @@
 """Core research request, planning, and query domain models."""
 
 from enum import Enum
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -97,6 +98,11 @@ class SubQuestion(BaseModel):
     iteration: int = Field(default=1, ge=1)
 
 
+# Search branches a query may use. General web search always runs; the native
+# arXiv and Wikipedia branches run only for queries that request them.
+SearchProviderName = Literal["web", "arxiv", "wikipedia"]
+
+
 class GeneratedSearchQuery(BaseModel):
     """LLM-generated query before system metadata is attached."""
 
@@ -108,11 +114,30 @@ class GeneratedSearchQuery(BaseModel):
         min_length=1,
     )
 
+    providers: list[SearchProviderName] = Field(
+        default_factory=lambda: ["web"],
+        description=(
+            'Search branches for this query. Always include "web". Add "arxiv" only '
+            'for computer science, maths, physics, statistics, or quantitative-biology '
+            'research papers; add "wikipedia" only for definitions, background, entities, or history.'
+        ),
+    )
 
-class QueryGeneratorOutput(BaseModel):
-    """Structured output returned by the query generator."""
+
+class SubquestionSearchQueries(BaseModel):
+    """Queries generated for one subquestion within a batched generator call."""
+
+    subquestion_id: str = Field(
+        min_length=1,
+    )
 
     queries: list[GeneratedSearchQuery]
+
+
+class QueryGeneratorOutput(BaseModel):
+    """Structured output returned by one batched query generator call."""
+
+    subquestions: list[SubquestionSearchQueries]
 
 
 class SearchQuery(BaseModel):
@@ -136,5 +161,9 @@ class SearchQuery(BaseModel):
 
     iteration: int = Field(
         ge=1,
+    )
+
+    providers: list[SearchProviderName] = Field(
+        default_factory=lambda: ["web"],
     )
 

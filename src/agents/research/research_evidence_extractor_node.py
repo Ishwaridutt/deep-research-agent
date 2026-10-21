@@ -1,5 +1,6 @@
 """Score retrieved chunks and retain original passages as research evidence."""
 
+import asyncio
 import logging
 import json
 from collections import Counter
@@ -115,6 +116,7 @@ async def research_evidence_extractor_node(
         )
     )
 
+    batches = []
     for retrieval_result in retrieval_results:
         subquestion = subquestions_by_id.get(retrieval_result.subquestion_id)
 
@@ -166,28 +168,39 @@ async def research_evidence_extractor_node(
             chunks=list(chunks_by_id.values()),
         )
 
-        metadata = LLMCallMetadata(
-            **log_context,
-            contains_private_data=ResearchSource.DOCUMENTS in state["allowed_sources"],
-        )
+        batches.append((subquestion, objective_id, queries, audit_rows, chunks_by_id, messages))
 
+    metadata = LLMCallMetadata(
+        **log_context,
+        contains_private_data=ResearchSource.DOCUMENTS in state["allowed_sources"],
+    )
+
+    async def score_batch(messages):
+        """Score one subquestion's chunks; a provider failure is returned, not raised."""
         try:
             print("\nevidence scoring llm prompt: ", messages)
-            scoring_output = await llm_service.invoke_structured(
+            return await llm_service.invoke_structured(
                 role=LLMRole.EVIDENCE_EXTRACTOR,
                 messages=messages,
                 output_schema=EvidenceExtractionOutput,
                 metadata=metadata,
             )
-
-            print("\nevidence scoring llm response: ", scoring_output)
-
         except LLMServiceError as exc:
+            return exc
+
+    # Subquestions are scored concurrently; results are applied in plan order so
+    # evidence capacity and IDs stay deterministic.
+    print(f"\nscoring {len(batches)} evidence batches concurrently")
+    scoring_outputs = await asyncio.gather(*(score_batch(batch[-1]) for batch in batches))
+
+    for (subquestion, objective_id, queries, audit_rows, chunks_by_id, _), scoring_output in zip(batches, scoring_outputs):
+        if isinstance(scoring_output, LLMServiceError):
+            exc = scoring_output
             for chunk_id in chunks_by_id:
                 audit_rows[chunk_id]["decision"] = "scoring_failed"
             evidence_stats["failed_batch_count"] += 1
             print('Evidence scoring error: ', exc)
-            logger.exception(
+            logger.error(
                 "Evidence scoring failed.",
                 extra={
                     "event": "evidence_extraction_failed",
@@ -207,6 +220,8 @@ async def research_evidence_extractor_node(
             )
 
             continue
+
+        print("\nevidence scoring llm response: ", scoring_output)
 
         # Partial output is usable, but never invent a score for missing chunks or
         # choose between ambiguous duplicate judgments. Report contract violations.

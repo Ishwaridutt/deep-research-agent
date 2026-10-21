@@ -38,7 +38,7 @@ function renderer(events) {
     };
     vm.createContext(context);
     vm.runInContext(source.slice(source.indexOf("const PLANNING"), source.indexOf("const WRITING")), context);
-    for (const name of ["create", "clear", "label", "safeHttpUrl", "renderReportText", "renderReportMarkdown", "renderFindings", "renderLimitations", "renderResult", "getStageState", "appendStageMetrics", "renderStageDetails", "renderStages", "researchRounds", "researchStages", "activityDescription"]) {
+    for (const name of ["create", "clear", "label", "safeHttpUrl", "renderReportText", "renderReportMarkdown", "renderFindings", "renderLimitations", "renderUnverified", "renderResult", "stageRow", "writerRuns", "renderWriterGroup", "parseTimestamp", "formatDuration", "stageDuration", "withDuration", "appendTextItem", "renderErrors", "getStageState", "appendStageMetrics", "renderStageDetails", "renderStages", "researchRounds", "researchStages", "activityDescription"]) {
         const start = source.indexOf(`function ${name}(`);
         const end = source.indexOf("\nfunction ", start + 1);
         vm.runInContext(source.slice(start, end), context);
@@ -222,12 +222,12 @@ test("retrieval shows separate branch query counts and explains overlap", () => 
     })]);
     let text = context.renderStageDetails("research_retrieval", 1).textContent;
     assert.match(text, /4 passages selected/);
-    assert.match(text, /8 retrieved · 4 included after context limits/);
+    assert.ok(text.includes("8 retrieved · 4 used (others were already included by another search, over the per-source cap, or over the token budget)"));
     assert.match(text, /counts overlap and must not be added/);
     assert.doesNotMatch(text, /document query/);
     text = context.renderStageDetails("research_document_retrieval", 1).textContent;
     assert.match(text, /Document task\?/);
-    assert.match(text, /5 retrieved · 2 included/);
+    assert.match(text, /5 retrieved · 2 used/);
     assert.doesNotMatch(text, /public query/);
 });
 
@@ -281,8 +281,8 @@ test("report emphasis creates safe DOM elements while preserving citations and H
 
 test("findings, summary and limitations render emphasis but the raw Markdown view stays raw", () => {
     const context = renderer([]);
-    context.ui = Object.fromEntries(["findings", "limitations", "reportHeading", "resultStatus", "summary", "markdown", "result"].map(key => [key, new Element("div")]));
-    context.renderMetadata = context.renderSources = context.renderErrors = context.show = () => {};
+    context.ui = Object.fromEntries(["findings", "limitations", "unverified", "unverifiedSection", "reportHeading", "resultStatus", "summary", "markdown", "result"].map(key => [key, new Element("div")]));
+    context.renderMetadata = context.renderSources = context.renderErrors = context.show = context.hide = () => {};
     const markdown = "# Report\n\n**Practical approach:** Use evidence. [1]";
     context.renderResult({status: "completed", report: {title: "Report", executive_summary: "**Summary:** Grounded.",
         findings: [{section: "Analysis", title: "Finding", content: "**Practical approach:** Use evidence. [1]"}],
@@ -293,4 +293,84 @@ test("findings, summary and limitations render emphasis but the raw Markdown vie
     assert.equal(content.children.find(child => child.tag === "strong").textContent.trim(), "Practical approach:");
     assert.equal(context.ui.limitations.children[0].children.find(child => child.tag === "strong").textContent.trim(), "Limitation:");
     assert.equal(context.ui.markdown.textContent, markdown);
+});
+
+test("unverified material renders as text with safe source links and toggles its section", () => {
+    const context = renderer([]);
+    context.URL = URL;  // safeHttpUrl needs the URL parser inside the VM context.
+    const visibility = [];
+    context.ui = {unverified: new Element("div"), unverifiedSection: new Element("section")};
+    context.show = () => visibility.push("show");
+    context.hide = () => visibility.push("hide");
+    context.renderUnverified([{
+        title: "<b>Claim</b>", content: "Possibly useful statement.",
+        sources: [{title: "Study", uri: "https://example.com/study"}, {title: "Script", uri: "javascript:alert(1)"}],
+    }]);
+    const article = context.ui.unverified.children[0];
+    assert.match(article.textContent, /<b>Claim<\/b>/);
+    const links = article.children[2].children.filter(child => child.tag === "a");
+    assert.equal(links.length, 1);
+    assert.equal(links[0].href, "https://example.com/study");
+    assert.match(article.children[2].textContent, /Script/);
+    context.renderUnverified([]);
+    assert.deepEqual(visibility, ["show", "hide"]);
+});
+
+test("writer runs show the draft, critic feedback, a separate revision row, and remaining stages", () => {
+    const run = (stage, type, details = {}) => ({stage, event_type: type, details, iteration: null});
+    const context = renderer([
+        run("writer_prepare_evidence", "stage_started"),
+        run("writer_prepare_evidence", "stage_completed", {evidence_count: 3, evidence_groups: [{question: "Q?", evidence_count: 3, source_count: 2}]}),
+        run("writer_synthesis", "stage_started"),
+        run("writer_synthesis", "stage_completed", {revision: false, finding_count: 2, findings: []}),
+        run("writer_critic", "stage_started"),
+        run("writer_critic", "stage_completed", {verdict: "revise", issue_count: 1, issue_types: {unsupported_claim: 1},
+            issues: [{issue_type: "unsupported_claim", finding_index: 0, instruction: "<b>Qualify</b> the claim."}]}),
+        run("writer_synthesis", "stage_started"),
+        run("writer_synthesis", "stage_completed", {revision: true, finding_count: 2, findings: []}),
+        run("writer_citation_checker", "stage_started"),
+    ]);
+    vm.runInContext(`WRITING = ["writer_prepare_evidence", "writer_synthesis", "writer_critic", "writer_citation_checker", "finalize_report"];
+        Object.assign(STAGES, {writer_prepare_evidence: "Prepare evidence", writer_critic: "Review draft",
+            writer_citation_checker: "Verify citations", finalize_report: "Finalize report"});`, context);
+    const list = context.renderWriterGroup().children[1];
+    const names = list.children.map(row => row.children[0]?.children?.[1]?.textContent?.trim() || row.textContent.trim().split(" ")[0]);
+    assert.deepEqual(names, ["Prepare evidence", "Synthesize report", "Review draft", "↻", "Revise report (critic feedback)", "Verify citations", "Finalize report"]);
+    assert.deepEqual(list.children.filter(row => row.dataset?.state).map(row => row.dataset.state),
+        ["completed", "completed", "completed", "completed", "running", "pending"]);
+    const critic = list.children[2].children[1];
+    assert.match(critic.textContent, /Revision requested · 1 issues/);
+    assert.match(critic.textContent, /<b>Qualify<\/b> the claim\./);
+});
+
+test("section durations come from event timestamps and say 'so far' while running", () => {
+    const at = (stage, type, time, iteration = 1) => ({stage, event_type: type, iteration, details: {}, timestamp: `2026-10-20T10:${time}Z`});
+    const context = renderer([
+        at("research_planner", "stage_started", "00:00"),
+        at("research_coverage_evaluator", "stage_completed", "04:01"),
+        at("research_planner", "stage_started", "04:02", 2),
+        at("research_routing", "stage_completed", "06:12", 2),
+        at("writer_synthesis", "stage_started", "06:13", null),
+    ]);
+    assert.equal(context.stageDuration(event => event.iteration === 1), "4 min 1 sec");
+    assert.equal(context.stageDuration(event => event.iteration === 2), "2 min 10 sec");
+    assert.equal(context.stageDuration(event => event.iteration !== null), "6 min 12 sec");
+    assert.equal(context.stageDuration(event => event.stage === "writer_synthesis"), "");
+    context.events.push(at("writer_critic", "stage_started", "06:33", null));
+    assert.equal(context.stageDuration(event => event.iteration === null), "20 sec so far");
+    assert.equal(context.withDuration("Hint", ""), "Hint");
+});
+
+test("workflow notes are collapsible with a count and hidden when empty", () => {
+    const context = renderer([]);
+    const visibility = [];
+    context.ui = {errors: new Element("ul"), errorsSection: new Element("details"), errorsSummary: new Element("summary")};
+    context.show = () => visibility.push("show");
+    context.hide = () => visibility.push("hide");
+    context.renderErrors([{component: "writer_critic", message: "Critic review failed."}, {message: "Second note."}]);
+    assert.equal(context.ui.errorsSummary.textContent.trim(), "View workflow notes (2)");
+    assert.match(context.ui.errors.textContent, /\[writer_critic\] Critic review failed\./);
+    assert.equal(context.ui.errorsSection.open, false);
+    context.renderErrors([]);
+    assert.deepEqual(visibility, ["show", "hide"]);
 });

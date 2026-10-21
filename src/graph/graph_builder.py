@@ -17,6 +17,7 @@ from src.agents.research import (
 )
 from src.agents.writer import (
     writer_citation_checker_node,
+    writer_critic_node,
     writer_prepare_evidence_node,
     writer_synthesis_node,
 )
@@ -27,7 +28,9 @@ from src.graph.graph_routing import (
     research_routing_node,
     route_after_planning,
     route_after_research,
+    route_after_critic,
     route_after_source_selection,
+    route_after_synthesis,
     route_after_terminal_check,
 )
 from src.graph.graph_state import WorkflowState
@@ -36,7 +39,7 @@ from src.retrieval import RetrievalSessionFactory
 from src.services.document_service import DocumentService
 from src.tools.cleaning import SourceCleaner
 from src.tools.extraction import SourceContentExtractor
-from src.tools.search import SearchProvider
+from src.tools.search import SearchProvider, SearchRelevanceGate
 
 
 INPUT_GUARDRAIL = "input_guardrail"
@@ -51,6 +54,7 @@ RESEARCH_COVERAGE_EVALUATOR = "research_coverage_evaluator"
 RESEARCH_ROUTING = "research_routing"
 WRITER_PREPARE_EVIDENCE = "writer_prepare_evidence"
 WRITER_SYNTHESIS = "writer_synthesis"
+WRITER_CRITIC = "writer_critic"
 WRITER_CITATION_CHECKER = "writer_citation_checker"
 FINALIZE_REPORT = "finalize_report"
 
@@ -64,6 +68,7 @@ def build_research_graph(
     source_cleaner: SourceCleaner,
     retrieval_session_factory: RetrievalSessionFactory,
     document_service: DocumentService,
+    relevance_gate: SearchRelevanceGate | None = None,
 ) -> CompiledStateGraph:
     """
     Build and compile the research workflow with selected source branches.
@@ -128,6 +133,8 @@ def build_research_graph(
             research_source_processor_node,
             source_extractor=source_extractor,
             source_cleaner=source_cleaner,
+            relevance_gate=relevance_gate,
+            extraction_concurrency=settings.search.extraction_max_concurrency,
         ),
     )
 
@@ -166,16 +173,21 @@ def build_research_graph(
 
     builder.add_node(
         WRITER_PREPARE_EVIDENCE,
-        partial(
-            writer_prepare_evidence_node,
-            settings=settings,
-        ),
+        writer_prepare_evidence_node,
     )
 
     builder.add_node(
         WRITER_SYNTHESIS,
         partial(
             writer_synthesis_node,
+            llm_service=llm_service,
+        ),
+    )
+
+    builder.add_node(
+        WRITER_CRITIC,
+        partial(
+            writer_critic_node,
             llm_service=llm_service,
         ),
     )
@@ -298,11 +310,24 @@ def build_research_graph(
         WRITER_SYNTHESIS,
     )
 
+    # First draft -> critic; a revised draft skips straight to citation checking.
     builder.add_conditional_edges(
         WRITER_SYNTHESIS,
-        route_after_terminal_check,
+        route_after_synthesis,
         {
-            "continue": WRITER_CITATION_CHECKER,
+            "critic": WRITER_CRITIC,
+            "citation_check": WRITER_CITATION_CHECKER,
+            "terminal_error": END,
+        },
+    )
+
+    # At most one revision with the same evidence; never back to research.
+    builder.add_conditional_edges(
+        WRITER_CRITIC,
+        route_after_critic,
+        {
+            "revise": WRITER_SYNTHESIS,
+            "citation_check": WRITER_CITATION_CHECKER,
             "terminal_error": END,
         },
     )

@@ -105,13 +105,27 @@ async def writer_synthesis_node(
             }
         }
 
+    # A "revise" verdict on the first draft triggers exactly one revision with the same evidence.
+    review = state["writer"].get("critic_review")
+    previous_draft = state["writer"].get("draft_report")
+    is_revision = (
+        review is not None
+        and review.verdict == "revise"
+        and previous_draft is not None
+        and state["writer"].get("revision_count", 0) == 0
+    )
+
     messages = build_writer_messages(
         original_question=state["question"],
         subquestions=state["research"]["subquestions"],
         evidence=evidence,
         coverage_gaps=coverage_gaps,
         stop_reason=stop_reason,
+        previous_draft=previous_draft if is_revision else None,
+        critic_issues=review.issues if is_revision else None,
     )
+    if is_revision:
+        print("\nwriter revision requested by critic:", review)
 
     metadata = LLMCallMetadata(
         **log_context,
@@ -127,6 +141,28 @@ async def writer_synthesis_node(
         )
 
     except LLMServiceError as exc:
+        if is_revision:
+            # A failed revision keeps the reviewed draft; citation checking still runs.
+            logger.exception(
+                "Writer revision failed; keeping the previous draft.",
+                extra={
+                    "event": "writer_revision_failed",
+                    **log_context,
+                    "error_type": ErrorType.SYNTHESIS.value,
+                },
+            )
+            return {
+                "writer": {**state["writer"], "revision_count": 1},
+                "errors": [
+                    *state["errors"],
+                    ResearchError(
+                        error_type=ErrorType.SYNTHESIS,
+                        component="writer_synthesis",
+                        message=f"Critic-requested revision failed; the reviewed draft was kept: {exc}",
+                        recoverable=True,
+                    ),
+                ],
+            }
         logger.exception(
             "Writer synthesis failed.",
             extra={
@@ -157,6 +193,11 @@ async def writer_synthesis_node(
         extra={
             "event": "writer_synthesis_completed",
             **log_context,
+            "data": {
+                "revision": is_revision,
+                "finding_count": len(draft_report.findings),
+                "evidence_count": len(evidence),
+            },
         },
     )
 
@@ -164,6 +205,7 @@ async def writer_synthesis_node(
         "writer": {
             **state["writer"],
             "draft_report": draft_report,
+            "revision_count": state["writer"].get("revision_count", 0) + int(is_revision),
         }
     }
 

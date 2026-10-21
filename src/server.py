@@ -14,6 +14,7 @@ from src.config import Settings, get_settings
 from src.config.logging import configure_logging
 from src.documents.document_dependencies import create_document_service
 from src.graph.graph_builder import build_research_graph
+from src.guardrails.input_classifier import ResearchInputGuard
 from src.llm import create_llm_service
 from src.persistence import ResearchJobStore
 from src.retrieval import RetrievalSessionFactory
@@ -28,7 +29,7 @@ from src.services import ResearchService
 from src.services.document_service import DocumentService
 from src.tools.cleaning import SourceCleaner
 from src.tools.extraction import SourceContentExtractor, create_source_content_extractor
-from src.tools.search import SearchProvider, create_search_provider
+from src.tools.search import SearchProvider, SearchRelevanceGate, create_search_provider
 
 
 logger = logging.getLogger(__name__)
@@ -108,6 +109,7 @@ def _create_research_service(
     job_store: ResearchJobStore,
     retrieval_session_factory: RetrievalSessionFactory,
     document_service: DocumentService,
+    relevance_gate: SearchRelevanceGate,
 ) -> ResearchService:
     """Create the complete research application service."""
 
@@ -120,6 +122,7 @@ def _create_research_service(
         source_cleaner=source_cleaner,
         retrieval_session_factory=retrieval_session_factory,
         document_service=document_service,
+        relevance_gate=relevance_gate,
     )
 
     return ResearchService(
@@ -128,6 +131,10 @@ def _create_research_service(
         job_store=job_store,
         llm_service=llm_service,
         document_service=document_service,
+        input_guard=ResearchInputGuard(
+            llm_service,
+            classifier_enabled=settings.research_limits.input_classifier_enabled,
+        ),
     )
 
 
@@ -158,6 +165,12 @@ def create_app() -> FastAPI:
     document_service = create_document_service(
         settings=settings,
     )
+    # The pre-extraction relevance gate reuses the shared embedding model.
+    relevance_gate = SearchRelevanceGate(
+        embeddings=embedding_service.embeddings,
+        threshold=settings.research_limits.search_relevance_threshold,
+        min_keep=settings.research_limits.search_relevance_min_keep,
+    )
     # Build the graph and expensive shared dependencies once per process.
     research_service = _create_research_service(
         settings=settings,
@@ -167,6 +180,7 @@ def create_app() -> FastAPI:
         job_store=job_store,
         retrieval_session_factory=retrieval_session_factory,
         document_service=document_service,
+        relevance_gate=relevance_gate,
     )
 
     @asynccontextmanager
@@ -205,6 +219,14 @@ def create_app() -> FastAPI:
     app.mount(
         "/static", StaticFiles(directory=str(_STATIC_DIRECTORY)), name="static",
     )
+
+    @app.middleware("http")
+    async def revalidate_frontend_assets(request, call_next):
+        """Make browsers revalidate the page and its assets so UI updates load after a restart."""
+        response = await call_next(request)
+        if request.url.path == "/" or request.url.path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-cache"
+        return response
 
     return app
 

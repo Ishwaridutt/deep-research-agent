@@ -38,6 +38,9 @@ class RetrievalContextBuilder:
         document_counts: dict[str, int] = defaultdict(int)
         seen_chunk_ids: set[str] = set()
 
+        used_tokens = 0
+        separator_tokens = self.token_counter("\n\n")
+
         # Walk through the fused ranking while preventing duplicate chunks and source domination.
         for retrieved_chunk in retrieved_chunks:
             chunk = retrieved_chunk.chunk
@@ -49,14 +52,16 @@ class RetrievalContextBuilder:
                 continue
 
             formatted_chunk = self._format_chunk(len(selected_chunks) + 1, retrieved_chunk)
-            candidate_context = "\n\n".join(context_parts + [formatted_chunk])
-            candidate_tokens = self.token_counter(candidate_context)
+            # Count only the new part instead of re-tokenizing the whole context each time.
+            chunk_tokens = self.token_counter(formatted_chunk)
+            candidate_tokens = used_tokens + chunk_tokens + (separator_tokens if context_parts else 0)
 
             # Skip chunks that would push the final retrieval context beyond the configured budget.
             if candidate_tokens > self.max_context_tokens:
                 continue
 
             context_parts.append(formatted_chunk)
+            used_tokens = candidate_tokens
             selected_chunks.append(retrieved_chunk)
             seen_chunk_ids.add(chunk.chunk_id)
             document_counts[chunk.document_id] += 1

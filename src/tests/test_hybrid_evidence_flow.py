@@ -55,6 +55,13 @@ class FakeRetrievalSession:
     def build(self, documents) -> None:
         self.documents = list(documents)
 
+    def add(self, documents) -> int:
+        known = {document.document_id for document in self.documents}
+        new = [document for document in documents if document.document_id not in known]
+        self.documents.extend(new)
+        self.add_calls = getattr(self, "add_calls", 0) + 1
+        return len(new)
+
     def retrieve(self, request) -> RetrievalResult:
         self.requests.append(request)
         if self.source_type == SourceType.WEB:
@@ -187,7 +194,9 @@ def test_hybrid_retrieval_keeps_results_separate_and_preserves_sources():
 
         assert len(research["web_retrieval_results"]) == 1
         assert len(research["document_retrieval_results"]) == 1
-        assert factory.sessions[0].clear_calls == 1
+        # The web session is job-owned: kept for later rounds, cleared with the job.
+        assert factory.sessions[0].clear_calls == 0
+        assert resources.web_retrieval_session is factory.sessions[0]
         assert document_session.clear_calls == 0
         assert factory.sessions[0].documents[0].metadata["provider"] == "tavily"
         assert factory.sessions[0].documents[0].metadata["canonical_id"] == (
@@ -200,6 +209,38 @@ def test_hybrid_retrieval_keeps_results_separate_and_preserves_sources():
         )
         assert document_source.id == "doc-1"
         assert document_source.title == "report.pdf"
+
+        resources.clear()
+        assert factory.sessions[0].clear_calls == 1
+        assert document_session.clear_calls == 1
+        assert resources.web_retrieval_session is None
+
+    asyncio.run(run())
+
+
+def test_web_session_is_reused_and_indexes_only_new_sources_across_rounds():
+    async def run() -> None:
+        state = create_hybrid_state()
+        state["allowed_sources"] = [ResearchSource.WEB]
+        resources = ResearchJobResources()
+        factory = FakeSessionFactory()
+        config = {"configurable": {"job_resources": resources}}
+
+        await research_retrieval_node(state, config, retrieval_session_factory=factory)
+        state["research"]["iteration_count"] = 1
+        state["research"]["search_queries"].append(SearchQuery(
+            id="query-2", subquestion_id="sq-1", query="remaining gap", purpose="Close gap", iteration=2,
+        ))
+        state["research"]["sources"].append(state["research"]["sources"][0].model_copy(update={
+            "id": "web-2", "uri": "https://example.com/second",
+        }))
+        await research_retrieval_node(state, config, retrieval_session_factory=factory)
+
+        assert len(factory.sessions) == 1
+        session = factory.sessions[0]
+        assert session.add_calls == 2
+        assert [document.document_id for document in session.documents] == ["web-1", "web-2"]
+        assert session.clear_calls == 0
 
     asyncio.run(run())
 

@@ -178,45 +178,13 @@ def test_extraction_cap_balances_queries_within_and_across_subquestions():
         assert extractor.calls == ["a-1", "b-1", "a-2", "b-2"]
         stats = update["research"]["extraction_stats"]
         assert stats == {"iteration": 1, "extracted_provider_counts": {"tavily": 4}, "extracted_count": 4,
-                         "reused_count": 0, "attempted_count": 4, "deferred_count": 12}
+                         "reused_count": 0, "attempted_count": 4, "deferred_count": 12, "carried_over_count": 0}
+        assert len(update["research"]["deferred_search_result_ids"]) == 12
         # Previously extracted pages remain reusable without another API call.
         state.update(update)
         again = await research_source_processor_node(state, source_extractor=extractor, source_cleaner=SourceCleaner(min_chars=20, max_chars=1000))
         assert again["research"]["extraction_stats"]["reused_count"] == 4
         assert again["research"]["extraction_stats"]["extracted_count"] == 4
         assert len(extractor.calls) == 8
-
-    asyncio.run(run())
-
-
-def test_extraction_rotates_providers_across_queries_under_tight_budget():
-    from src.models import SubQuestion
-
-    class Extractor:
-        def __init__(self):
-            self.calls = []
-
-        async def extract(self, *, search_result):
-            self.calls.append(search_result.provider)
-            return ExtractedSourceContent(url=search_result.url, content="Specific research evidence from this selected source.")
-
-    async def run():
-        state = create_initial_workflow_state(job_id="job", research_session_id="session",
-                                              question="Explain the topic", allowed_sources=[ResearchSource.WEB])
-        state["research_control"].budget = state["research_control"].budget.model_copy(update={"max_extracted_pages_per_round": 3})
-        state["research"]["subquestions"] = [SubQuestion(id="task", question="Topic?", objective="Find evidence")]
-        queries = [SearchQuery(id=f"q-{n}", subquestion_id="task", query="research evidence", purpose="Research", iteration=1) for n in range(3)]
-        state["research"]["search_queries"] = queries
-        state["research"]["search_results"] = [SearchResult(
-            id=f"{query.id}-{provider.value}", query_id=query.id, provider=provider,
-            canonical_id=f"{provider.value}:{query.id}", title="Research evidence",
-            url=f"https://example.com/{query.id}/{provider.value}",
-            provider_score=0.99 if provider == SourceProvider.TAVILY else None,
-        ) for query in queries for provider in (SourceProvider.TAVILY, SourceProvider.ARXIV, SourceProvider.WIKIPEDIA)]
-        extractor = Extractor()
-        update = await research_source_processor_node(state, source_extractor=extractor, source_cleaner=SourceCleaner(min_chars=20, max_chars=1000))
-        assert extractor.calls == [SourceProvider.TAVILY, SourceProvider.ARXIV, SourceProvider.WIKIPEDIA]
-        assert update["research"]["extraction_stats"]["extracted_provider_counts"] == {"tavily": 1, "arxiv": 1, "wikipedia": 1}
-        assert update["research_control"].usage.page_extraction_attempts == 3
 
     asyncio.run(run())

@@ -68,6 +68,8 @@ def _build_missing_evidence_coverage(
                     "No accepted evidence is available "
                     "for this subquestion."
                 ),
+                priority=1,
+                blocking=True,
             )
             for subquestion in subquestions
         ],
@@ -197,17 +199,26 @@ def _normalize_coverage_result(
             )
         )
 
-    # Overall readiness is the model's judgment of the core request, not an
-    # all-objectives checklist. Retain minor gaps for the writer as limitations.
+    # Deterministic stop rule: research continues only for blocking gaps on
+    # explicitly requested parts. Everything else becomes a report limitation.
+    gapped_ids = {gap.subquestion_id for gap in gaps}
+    for assessment in normalized_assessments:
+        # A planned part with no accepted evidence and no model judgment is a blocker.
+        if assessment.status == SubquestionCoverageStatus.MISSING and assessment.subquestion_id not in gapped_ids:
+            gaps.append(CoverageGap(
+                subquestion_id=assessment.subquestion_id,
+                description="No accepted evidence is available for this subquestion.",
+                priority=1,
+                blocking=True,
+            ))
+
     has_report_evidence = any(
         assessment.evidence_ids and assessment.status != SubquestionCoverageStatus.MISSING
         for assessment in normalized_assessments
     )
-    is_sufficient = (
-        coverage.status == CoverageStatus.SUFFICIENT
-        and integrity_ok
-        and has_report_evidence
-    )
+    is_sufficient = has_report_evidence and not any(gap.blocking for gap in gaps)
+    if not integrity_ok:
+        print("\ncoverage integrity issue: assessments were missing, duplicated, or cited invalid evidence IDs")
 
     return CoverageResult(
         status=(
@@ -339,10 +350,18 @@ async def research_coverage_evaluator_node(
             subquestions=subquestions,
             evidence_by_subquestion=grouped_evidence,
         )
-        if raw_coverage.status == CoverageStatus.SUFFICIENT and coverage.status != raw_coverage.status:
+        if coverage.status != raw_coverage.status:
+            # The final status follows blocking gaps, not the model's overall label.
             logger.warning(
-                "Coverage readiness rejected: assessments or evidence references were invalid or lacked usable support.",
-                extra={**log_context, "event": "coverage_readiness_rejected"},
+                "Coverage status was overridden by the blocking-gap rule.",
+                extra={
+                    **log_context,
+                    "event": "coverage_status_overridden",
+                    "data": {
+                        "model_status": raw_coverage.status.value,
+                        "final_status": coverage.status.value,
+                    },
+                },
             )
 
         print('\n coverage eval response: ')
@@ -356,6 +375,18 @@ async def research_coverage_evaluator_node(
             "coverage_status": coverage.status.value,
             "gap_count": len(coverage.gaps),
             "assessment_count": len(coverage.assessments),
+            "data": {
+                "blocking_gap_count": sum(gap.blocking for gap in coverage.gaps),
+                "gaps": [
+                    {
+                        "subquestion_id": gap.subquestion_id,
+                        "blocking": gap.blocking,
+                        "priority": gap.priority,
+                        "description": gap.description[:300],
+                    }
+                    for gap in coverage.gaps
+                ],
+            },
         },
     )
 

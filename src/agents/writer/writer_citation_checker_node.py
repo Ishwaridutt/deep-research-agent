@@ -24,6 +24,7 @@ from src.models import (
     ResearchSource,
     SemanticCitationCheckOutput,
     Source,
+    UnverifiedMaterial,
 )
 from src.prompts.citation_checker_prompt import (
     build_citation_checker_messages,
@@ -34,6 +35,14 @@ logger = logging.getLogger(__name__)
 
 _EVIDENCE_CITATION_PATTERN = re.compile(r"\[([^\[\]]+)\]")
 _SOURCE_CITATION_GROUP_PATTERN = re.compile(r"(?:\[\d+\])+")
+# A sentence ends at ., !, or ? followed by whitespace (so "1.6 g/kg" stays whole),
+# keeping any trailing citation brackets; lines also end sentences (lists, tables).
+_SENTENCE_PATTERN = re.compile(r"(?:[^.!?\n]|[.!?](?=\S))+(?:[.!?]+|$)(?:[ \t]*\[[^\[\]\n]+\])*", re.MULTILINE)
+_MIN_MATCH_CHARS = 20
+_SEMANTIC_UNAVAILABLE_LIMITATION = (
+    "Semantic citation verification was unavailable for this report; citations were "
+    "checked only for valid evidence references, not for whether they fully support each claim."
+)
 
 
 def _validate_finding_references(
@@ -131,23 +140,63 @@ def _collect_referenced_evidence(
     ]
 
 
+def _normalize_sentence(text: str) -> str:
+    """Compare sentences without citations, spacing, case, or trailing punctuation."""
+    text = _EVIDENCE_CITATION_PATTERN.sub("", text)
+    return " ".join(text.split()).casefold().rstrip(".!?;: ")
+
+
+def _remove_sentences(content: str, sentences: list[str]) -> tuple[str, list[str]]:
+    """
+    Removes the flagged sentences from a finding and returns (remaining, removed).
+
+    Matching ignores inline citations and whitespace, so a sentence copied with or
+    without its [EV-...] references is still found.
+    """
+    targets = [target for target in (_normalize_sentence(item) for item in sentences) if target]
+    removed: list[str] = []
+
+    def drop(match: re.Match[str]) -> str:
+        sentence = match.group(0)
+        normalized = _normalize_sentence(sentence)
+        if normalized and any(
+            normalized == target
+            or (len(target) >= _MIN_MATCH_CHARS and target in normalized)
+            or (len(normalized) >= _MIN_MATCH_CHARS and normalized in target)
+            for target in targets
+        ):
+            removed.append(sentence.strip())
+            return ""
+        return sentence
+
+    remaining = _SENTENCE_PATTERN.sub(drop, content)
+    remaining = re.sub(r"[ \t]{2,}", " ", remaining)
+    remaining = re.sub(r"\n{3,}", "\n\n", remaining).strip()
+    return remaining, removed
+
+
 def _select_semantically_supported_findings(
     *,
     candidate_findings: list[tuple[int, ReportFinding]],
     semantic_output: SemanticCitationCheckOutput,
-) -> tuple[list[ReportFinding], list[CitationIssue]]:
-    """Keeps only findings confirmed as supported by semantic verification."""
+) -> tuple[list[ReportFinding], list[ReportFinding], list[CitationIssue]]:
+    """
+    Keeps verified findings and moves unverified content aside.
+
+    A partly supported finding keeps its supported sentences; only the flagged
+    sentences move to the unverified list. When the flagged text cannot be
+    located, or nothing cited remains, the whole finding moves instead.
+    Returns (supported_findings, unverified_findings, issues).
+    """
 
     # Keep the first model decision if duplicate finding indexes are returned.
     semantic_results = {}
 
     for result in semantic_output.finding_results:
-        semantic_results.setdefault(
-            result.finding_index,
-            (result.supported, result.reason),
-        )
+        semantic_results.setdefault(result.finding_index, result)
 
     supported_findings: list[ReportFinding] = []
+    unverified_findings: list[ReportFinding] = []
     issues: list[CitationIssue] = []
 
     for finding_index, finding in candidate_findings:
@@ -163,25 +212,78 @@ def _select_semantically_supported_findings(
                     ),
                 )
             )
+            unverified_findings.append(finding)
             continue
 
-        supported, reason = result
+        if result.supported:
+            supported_findings.append(finding)
+            continue
 
-        if not supported:
-            issues.append(
-                CitationIssue(
-                    finding_index=finding_index,
-                    description=(
-                        reason
-                        or "Cited evidence did not sufficiently support the finding."
-                    ),
-                )
+        issues.append(
+            CitationIssue(
+                finding_index=finding_index,
+                description=(
+                    result.reason
+                    or "Cited evidence did not sufficiently support the finding."
+                ),
             )
+        )
+
+        remaining, removed = _remove_sentences(finding.content, result.unsupported_sentences)
+        remaining_ids = [
+            evidence_id for evidence_id in _extract_evidence_ids([remaining])
+            if evidence_id in finding.evidence_ids
+        ]
+        if removed and remaining_ids:
+            print(f"\ncitation check trimmed finding {finding_index}: removed {len(removed)} unsupported sentence(s)")
+            supported_findings.append(finding.model_copy(update={
+                "content": remaining,
+                "evidence_ids": remaining_ids,
+            }))
+            removed_text = " ".join(removed)
+            removed_ids = [
+                evidence_id for evidence_id in _extract_evidence_ids([removed_text])
+                if evidence_id in finding.evidence_ids
+            ]
+            # Link the removed text only to the sources it cites (all of the finding's when uncited).
+            unverified_findings.append(finding.model_copy(update={
+                "content": removed_text,
+                "evidence_ids": removed_ids or finding.evidence_ids,
+            }))
+        else:
+            print(f"\ncitation check moved finding {finding_index} to unverified material")
+            unverified_findings.append(finding)
+
+    return supported_findings, unverified_findings, issues
+
+
+def _build_unverified_material(
+    *,
+    findings: list[ReportFinding],
+    evidence_by_id: dict[str, Evidence],
+    sources_by_id: dict[str, Source],
+) -> list[UnverifiedMaterial]:
+    """Keeps unverified draft content readable, with its sources linked but not numbered."""
+
+    material: list[UnverifiedMaterial] = []
+    for finding in findings:
+        content = _render_source_citations(
+            finding.content,
+            evidence_by_id=evidence_by_id,
+            source_number_by_id={},
+        )
+        if not content:
             continue
-
-        supported_findings.append(finding)
-
-    return supported_findings, issues
+        material.append(UnverifiedMaterial(
+            title=finding.title,
+            content=content,
+            sources=_build_report_sources(
+                findings=[finding],
+                evidence_by_id=evidence_by_id,
+                sources_by_id=sources_by_id,
+            ),
+        ))
+    return material
 
 
 def _build_report_sources(
@@ -339,8 +441,8 @@ def _with_citation_limitation(
         return updated
 
     message = (
-        "One or more draft findings were removed because citation verification "
-        "could not confirm sufficient evidence support."
+        "Some draft statements could not be verified against their cited evidence; "
+        "they are listed under \"Additional material (not citation-verified)\"."
     )
 
     if message not in updated:
@@ -354,6 +456,7 @@ def _build_no_supported_findings_report(
     draft_report: DraftReport,
     issues: list[CitationIssue],
     evidence_by_id: dict[str, Evidence],
+    unverified_material: list[UnverifiedMaterial] | None = None,
 ) -> ResearchReport:
     """Builds a fail-closed report when no finding survives citation validation."""
 
@@ -377,6 +480,7 @@ def _build_no_supported_findings_report(
             for limitation in limitations
         ],
         sources=[],
+        unverified_material=unverified_material or [],
     )
 
 
@@ -389,7 +493,9 @@ async def writer_citation_checker_node(
     Validates DraftReport citations and creates the final ResearchReport.
 
     Validation uses deterministic reference checks followed by semantic
-    evidence-to-claim verification. Unsupported findings are removed.
+    evidence-to-claim verification. Unsupported sentences are removed from
+    findings; content that cannot be verified is kept in a separate,
+    clearly labelled unverified section rather than deleted.
     """
 
     iteration = state["research"]["iteration_count"]
@@ -439,6 +545,12 @@ async def writer_citation_checker_node(
         source_ids=set(sources_by_id),
     )
 
+    candidate_indexes = {index for index, _ in candidate_findings}
+    reference_failures = [
+        finding for index, finding in enumerate(draft_report.findings)
+        if index not in candidate_indexes
+    ]
+
     # Avoid an LLM call when deterministic checks already removed every finding.
     if not candidate_findings:
         citation_result = CitationCheckResult(
@@ -450,6 +562,11 @@ async def writer_citation_checker_node(
             draft_report=draft_report,
             issues=deterministic_issues,
             evidence_by_id=evidence_by_id,
+            unverified_material=_build_unverified_material(
+                findings=reference_failures,
+                evidence_by_id=evidence_by_id,
+                sources_by_id=sources_by_id,
+            ),
         )
 
         return {
@@ -460,6 +577,7 @@ async def writer_citation_checker_node(
             }
         }
 
+    errors = list(state["errors"])
     referenced_evidence = _collect_referenced_evidence(
         findings=candidate_findings,
         evidence_by_id=evidence_by_id,
@@ -488,8 +606,10 @@ async def writer_citation_checker_node(
         )
 
     except LLMServiceError as exc:
+        # Degrade instead of failing the job: findings that passed the reference
+        # checks are kept, and the report says semantic verification did not run.
         logger.exception(
-            "Semantic citation checking failed.",
+            "Semantic citation checking failed; keeping reference-checked findings.",
             extra={
                 "event": "writer_citation_check_failed",
                 "job_id": state["job_id"],
@@ -499,24 +619,31 @@ async def writer_citation_checker_node(
                 "error_type": ErrorType.CITATION.value,
             },
         )
-
-        error = ResearchError(
+        errors.append(ResearchError(
             error_type=ErrorType.CITATION,
             component="writer_citation_checker",
-            message=str(exc),
-            recoverable=False,
+            message=f"Semantic citation verification was unavailable; citations were checked for validity only: {exc}",
+            recoverable=True,
+        ))
+        semantic_output = None
+
+    if semantic_output is None:
+        supported_findings = [finding for _, finding in candidate_findings]
+        unverified_findings, semantic_issues = [], []
+        summary_text = draft_report.executive_summary
+        draft_limitations = [*draft_report.limitations, _SEMANTIC_UNAVAILABLE_LIMITATION]
+    else:
+        print("\nsemantic citation check output:", semantic_output)
+        supported_findings, unverified_findings, semantic_issues = _select_semantically_supported_findings(
+            candidate_findings=candidate_findings,
+            semantic_output=semantic_output,
         )
-
-        return {
-            "errors": [
-                *state["errors"],
-                error,
-            ]
-        }
-
-    supported_findings, semantic_issues = _select_semantically_supported_findings(
-        candidate_findings=candidate_findings,
-        semantic_output=semantic_output,
+        summary_text = semantic_output.revised_executive_summary
+        draft_limitations = draft_report.limitations
+    unverified_material = _build_unverified_material(
+        findings=[*reference_failures, *unverified_findings],
+        evidence_by_id=evidence_by_id,
+        sources_by_id=sources_by_id,
     )
 
     all_issues = [
@@ -534,10 +661,11 @@ async def writer_citation_checker_node(
             draft_report=draft_report,
             issues=all_issues,
             evidence_by_id=evidence_by_id,
+            unverified_material=unverified_material,
         )
 
     else:
-        summary = semantic_output.revised_executive_summary.strip()
+        summary = summary_text.strip()
         supported_ids = {
             identifier for finding in supported_findings for identifier in finding.evidence_ids
         }
@@ -546,7 +674,7 @@ async def writer_citation_checker_node(
         if not summary_ids or not summary_ids.issubset(supported_ids):
             summary = "See the validated findings below for the supported research conclusions."
         limitations = _with_citation_limitation(
-            draft_report.limitations,
+            draft_limitations,
             issues=all_issues,
         )
         report_sources = _build_report_sources(
@@ -573,6 +701,7 @@ async def writer_citation_checker_node(
             findings=final_findings,
             limitations=final_limitations,
             sources=report_sources,
+            unverified_material=unverified_material,
         )
 
     logger.info(
@@ -583,6 +712,12 @@ async def writer_citation_checker_node(
             "research_session_id": state["research_session_id"],
             "node": "writer_citation_checker",
             "iteration": iteration,
+            "data": {
+                "draft_finding_count": len(draft_report.findings),
+                "verified_finding_count": len(final_report.findings),
+                "unverified_item_count": len(final_report.unverified_material),
+                "issues": [issue.description[:300] for issue in citation_result.issues],
+            },
         },
     )
 
@@ -591,5 +726,6 @@ async def writer_citation_checker_node(
             **state["writer"],
             "citation_result": citation_result,
             "final_report": final_report,
-        }
+        },
+        "errors": errors,
     }

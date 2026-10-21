@@ -157,26 +157,40 @@ async def research_retrieval_node(
     web_results: list[RetrievalResult] = []
     document_results: list[RetrievalResult] = []
 
+    resources = config.get("configurable", {}).get("job_resources")
+    if not isinstance(resources, ResearchJobResources):
+        raise RuntimeError("Research job resources are unavailable.")
+
     if ResearchSource.WEB in allowed_sources:
         documents = _web_documents(state)
         if documents:
-            web_session = retrieval_session_factory.create_session()
-            try:
-                await asyncio.to_thread(web_session.build, documents)
-                web_results = await _retrieve(web_session, requests)
-            finally:
-                # web_session.clear()
-                pass
+            # One job-owned web session grows across rounds: only sources added
+            # since the last round are chunked and embedded. ResearchService
+            # clears it with the other job resources on every terminal path.
+            if resources.web_retrieval_session is None:
+                resources.web_retrieval_session = retrieval_session_factory.create_session()
+            web_session = resources.web_retrieval_session
+            new_document_count = await asyncio.to_thread(web_session.add, documents)
+            logger.info(
+                "Web retrieval index updated.",
+                extra={
+                    "event": "web_retrieval_index_updated",
+                    "job_id": state["job_id"],
+                    "research_session_id": state["research_session_id"],
+                    "node": "research_retrieval",
+                    "iteration": state["research"]["iteration_count"] + 1,
+                    "data": {
+                        "new_document_count": new_document_count,
+                        "total_document_count": len(documents),
+                    },
+                },
+            )
+            web_results = await _retrieve(web_session, requests)
 
     if ResearchSource.DOCUMENTS in allowed_sources:
-        resources = config.get("configurable", {}).get("job_resources")
-        if not isinstance(resources, ResearchJobResources):
-            raise RuntimeError("Research job resources are unavailable.")
-
         document_session = resources.document_retrieval_session
         if document_session is None:
             raise RuntimeError("Private-document retrieval session is unavailable.")
-
         document_results = await _retrieve(document_session, requests)
 
     sources = _with_document_sources(

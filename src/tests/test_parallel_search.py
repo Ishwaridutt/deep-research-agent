@@ -9,18 +9,17 @@ from src.tools.search.base import SearchProviderError
 from src.tools.search.parallel_search import (
     ParallelSearchProvider,
     deduplicate_search_results,
-    rank_search_results,
-    _result_rank,
 )
 
 
-def _query() -> SearchQuery:
+def _query(providers=("web", "arxiv", "wikipedia")) -> SearchQuery:
     return SearchQuery(
         id="query-1",
         subquestion_id="subquestion-1",
         query="agentic AI",
         purpose="Find sources",
         iteration=1,
+        providers=list(providers),
     )
 
 
@@ -89,52 +88,38 @@ def test_parallel_search_honors_concurrency_and_provider_limits():
     assert [provider.max_results for provider in providers] == [4, 3, 2]
 
 
-def test_parallel_search_applies_one_ranked_aggregate_limit():
+def test_native_branches_run_only_when_the_query_requests_them():
+    calls = []
+
     class Provider:
-        def __init__(self, results):
-            self.results = results
+        def __init__(self, name, provider):
+            self.name, self.provider = name, provider
 
         async def search(self, *, search_query, max_results):
-            return self.results
+            calls.append(self.name)
+            return [_result(result_id=self.name, provider=self.provider, canonical_id=f"{self.name}:1",
+                            url=f"https://example.com/{self.name}")]
 
         async def close(self):
             pass
 
-    relevant = _result(
-        result_id="relevant",
-        provider=SourceProvider.WIKIPEDIA,
-        canonical_id="wikipedia:1",
-        url="https://en.wikipedia.org/wiki/Agentic_AI",
-        title="Agentic AI systems",
-        snippet="Agentic AI architectures and applications.",
-    )
-    composite = ParallelSearchProvider(
-        branches=[
-            ("web", Provider([
-                _result(
-                    result_id="web-1",
-                    provider=SourceProvider.TAVILY,
-                    canonical_id="web:https://example.com/1",
-                    url="https://example.com/1",
-                    provider_score=0.2,
-                ),
-                _result(
-                    result_id="web-2",
-                    provider=SourceProvider.TAVILY,
-                    canonical_id="web:https://example.com/2",
-                    url="https://example.com/2",
-                    provider_score=0.1,
-                ),
-            ]), 5),
-            ("wikipedia", Provider([relevant]), 3),
-        ],
-        max_concurrency=2,
-    )
+    composite = ParallelSearchProvider(branches=[
+        ("web", Provider("web", SourceProvider.TAVILY), 5),
+        ("arxiv", Provider("arxiv", SourceProvider.ARXIV), 3),
+        ("wikipedia", Provider("wikipedia", SourceProvider.WIKIPEDIA), 3),
+    ], max_concurrency=3)
 
-    results = asyncio.run(composite.search(search_query=_query(), max_results=2))
+    # Default queries use only general web search.
+    default_query = SearchQuery(id="q", subquestion_id="s", query="muscle growth", purpose="Find", iteration=1)
+    results = asyncio.run(composite.search(search_query=default_query, max_results=5))
+    assert calls == ["web"] and [item.id for item in results] == ["web"]
+    assert results.diagnostics["provider_counts"] == {"tavily": 1}
 
-    assert len(results) == 2
-    assert results[0].id == "relevant"
+    # Web always runs; a requested native branch joins it without dropping results.
+    calls.clear()
+    results = asyncio.run(composite.search(search_query=_query(("arxiv",)), max_results=5))
+    assert sorted(calls) == ["arxiv", "web"]
+    assert {item.id for item in results} == {"web", "arxiv"}
 
 
 def test_canonical_dedup_prefers_native_results_and_merges_provenance():
@@ -249,7 +234,8 @@ def test_discovery_counts_survive_aggregate_ranking_and_empty_results():
         ("wikipedia", Provider([]), 3),
     ], max_concurrency=3)
     results = asyncio.run(composite.search(search_query=_query(), max_results=1))
-    assert len(results) == 1 and results[0].provider == SourceProvider.TAVILY
+    # Each branch is capped by max_results; the relevance gate ranks them later.
+    assert [item.provider for item in results] == [SourceProvider.TAVILY, SourceProvider.ARXIV]
     assert results.diagnostics["provider_counts"] == {"tavily": 1, "arxiv": 1, "wikipedia": 0}
     empty = ParallelSearchProvider(branches=[("wikipedia", Provider([]), 3)], max_concurrency=1)
     results = asyncio.run(empty.search(search_query=_query(), max_results=5))
@@ -295,56 +281,62 @@ def test_search_node_preserves_discovery_counts_before_its_score_filter():
                                           question="Research the topic", allowed_sources=[ResearchSource.WEB])
     state["research"]["search_queries"] = [_query()]
     settings = SimpleNamespace(research_limits=SimpleNamespace(max_total_queries_per_job=30, max_search_results_per_query=5),
-                               search=SimpleNamespace(min_provider_score=0.7))
+                               search=SimpleNamespace())
     update = asyncio.run(research_web_search_node(state, search_provider=Provider(), settings=settings))
     assert len(update["research"]["search_results"]) == 1
     assert update["research"]["search_stats"]["provider_counts"] == {"tavily": 5, "arxiv": 3, "wikipedia": 0}
     assert update["research"]["search_stats"]["iteration"] == 1
 
 
-def test_shared_ranking_does_not_penalize_missing_provider_scores():
-    scored = _result(result_id="web", provider=SourceProvider.TAVILY, canonical_id="web:1",
-                     url="https://example.com/1", title="Agentic AI", provider_score=0.99,
-                     metadata={"discovery_provenance": [{"provider_score": 0.99}]})
-    native = _result(result_id="native", provider=SourceProvider.ARXIV, canonical_id="arxiv:1",
-                     url="https://arxiv.org/abs/2401.12345", title="Agentic AI",
-                     metadata={"discovery_provenance": [{"provider_score": None}]})
-    assert _result_rank(scored, _query().query) == _result_rank(native, _query().query)
+def test_search_node_runs_round_queries_concurrently_within_budget():
+    from types import SimpleNamespace
+    from src.agents.research.research_web_search_node import research_web_search_node
+    from src.graph.graph_state import create_initial_workflow_state
+    from src.models import ResearchSource
 
+    tracker = {"active": 0, "max_active": 0, "queries": []}
 
-def test_provider_interleaving_respects_limits_fills_empty_buckets_and_rotates():
-    results = [_result(result_id=f"web-{n}", provider=SourceProvider.TAVILY,
-                       canonical_id=f"web:{n}", url=f"https://example.com/{n}", title="Agentic AI", provider_score=0.99)
-               for n in range(5)]
-    results += [_result(result_id=provider.value, provider=provider, canonical_id=f"{provider.value}:1",
-                        url=f"https://example.com/{provider.value}", title="Agentic AI")
-                for provider in (SourceProvider.ARXIV, SourceProvider.WIKIPEDIA)]
-    ranked = rank_search_results(results, _query().query)
-    assert [item.provider for item in ranked[:3]] == [SourceProvider.TAVILY, SourceProvider.ARXIV, SourceProvider.WIKIPEDIA]
-    assert len(ranked) == 7 and len({item.id for item in ranked}) == 7
-    assert [item.id for item in ranked[3:]] == [f"web-{n}" for n in range(1, 5)]
-    assert rank_search_results(results, _query().query, provider_offset=1)[0].provider == SourceProvider.ARXIV
-    assert rank_search_results([], _query().query) == []
-    for index, best_match in enumerate((SourceProvider.TAVILY, SourceProvider.WIKIPEDIA, SourceProvider.ARXIV)):
-        varied = [item.model_copy(update={"title": "Agentic AI" if item.provider == best_match else "Other topic"}) for item in results]
-        assert rank_search_results(varied, _query().query, provider_offset=index)[0].provider == best_match
-
-
-def test_parallel_selection_keeps_native_candidates_despite_high_web_scores():
     class Provider:
-        def __init__(self, provider):
-            self.provider = provider
-
         async def search(self, *, search_query, max_results):
-            return [_result(result_id=f"{self.provider.value}-{n}", provider=self.provider,
-                            canonical_id=f"{self.provider.value}:{n}", url=f"https://example.com/{self.provider.value}/{n}",
-                            title="Agentic AI", provider_score=0.99 if self.provider == SourceProvider.TAVILY else None)
-                    for n in range(max_results)]
+            tracker["queries"].append(search_query.id)
+            tracker["active"] += 1
+            tracker["max_active"] = max(tracker["max_active"], tracker["active"])
+            await asyncio.sleep(0.01)
+            tracker["active"] -= 1
+            return [_result(result_id=search_query.id, provider=SourceProvider.TAVILY,
+                            canonical_id=f"web:{search_query.id}", url=f"https://example.com/{search_query.id}")]
 
-    composite = ParallelSearchProvider(branches=[
-        ("web", Provider(SourceProvider.TAVILY), 5), ("arxiv", Provider(SourceProvider.ARXIV), 3),
-        ("wikipedia", Provider(SourceProvider.WIKIPEDIA), 3),
-    ], max_concurrency=3)
-    selected = asyncio.run(composite.search(search_query=_query(), max_results=5))
-    assert len(selected) == 5
-    assert {item.provider for item in selected} == {SourceProvider.TAVILY, SourceProvider.ARXIV, SourceProvider.WIKIPEDIA}
+    state = create_initial_workflow_state(job_id="job", research_session_id="session",
+                                          question="Research the topic", allowed_sources=[ResearchSource.WEB])
+    state["research"]["search_queries"] = [
+        _query().model_copy(update={"id": f"q-{n}"}) for n in range(4)
+    ]
+    settings = SimpleNamespace(research_limits=SimpleNamespace(max_total_queries_per_job=3, max_search_results_per_query=5),
+                               search=SimpleNamespace())
+    update = asyncio.run(research_web_search_node(state, search_provider=Provider(), settings=settings))
+    # The job budget allows three queries; they run together and keep query order.
+    assert tracker["max_active"] == 3
+    assert [item.id for item in update["research"]["search_results"]] == ["q-0", "q-1", "q-2"]
+    assert update["research_control"].usage.queries_executed == 3
+
+
+def test_title_identity_key_normalizes_site_suffixes_and_skips_vague_titles():
+    from src.tools.search.parallel_search import title_identity_key
+
+    key = title_identity_key("International Society of Sports Nutrition Position Stand: protein and exercise.")
+    assert key == title_identity_key("[PDF] International Society of Sports Nutrition position stand: protein and exercise - PMC")
+    assert key == title_identity_key("International Society of Sports Nutrition position stand: protein and exercise | Springer Nature Link")
+    assert title_identity_key("Home") is None
+    assert title_identity_key("Weight Gain Recommendations for Athletes and Military ...") is None
+
+
+def test_pubmed_and_pmc_copies_merge_and_prefer_full_text():
+    pubmed = _result(result_id="pubmed", provider=SourceProvider.TAVILY, canonical_id="web:pubmed",
+                     url="https://pubmed.ncbi.nlm.nih.gov/31247944",
+                     title="Nutrition Recommendations for Bodybuilders in the Off-Season: A Narrative Review.")
+    pmc = _result(result_id="pmc", provider=SourceProvider.TAVILY, canonical_id="web:pmc",
+                  url="https://pmc.ncbi.nlm.nih.gov/articles/PMC6680710",
+                  title="Nutrition Recommendations for Bodybuilders in the Off-Season: A Narrative Review - PMC")
+    merged = deduplicate_search_results([pubmed, pmc])
+    assert len(merged) == 1 and merged[0].id == "pmc"
+    assert {item["result_id"] for item in merged[0].provider_metadata["discovery_provenance"]} == {"pubmed", "pmc"}

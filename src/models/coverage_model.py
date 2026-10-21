@@ -37,6 +37,15 @@ class CoverageGap(BaseModel):
     description: str = Field(min_length=1)
 
     priority: int = Field(default=3, ge=1, le=5)
+    # Only blocking gaps trigger another research round; the rest become
+    # report limitations.
+    blocking: bool = Field(
+        default=False,
+        description=(
+            "True only when this missing evidence prevents a grounded answer to a part "
+            "the user explicitly asked for. False for optional details and limitations."
+        ),
+    )
 
     suggested_queries: list[str] = Field(
         default_factory=list,

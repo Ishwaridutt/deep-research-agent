@@ -17,14 +17,16 @@ def test_query_matches_track_overlap_deduplication_and_context_limits():
 
         def search(self, query, *, top_k):
             self.calls.append(query)
-            return {"first": [a, b], "second": [a, c]}[query]
+            return {"Question?": [], "first": [a, b], "second": [a, c]}[query]
 
     retriever = Retriever()
     session = RetrievalSession(None, retriever, RetrievalContextBuilder(len, 10000, max_chunks_per_document=2))
     result = session.retrieve(RetrievalRequest("task", "Topic?", "Question?", [" first ", "first", "second"]))
-    assert retriever.calls == ["first", "second"]
+    # The subquestion is always searched first as its own intent.
+    assert retriever.calls == ["Question?", "first", "second"]
     assert [item.chunk.chunk_id for item in result.chunks] == ["a", "b"]
     assert result.query_matches == [
+        {"query": "Question?", "retrieved_count": 0, "selected_count": 0, "selected_chunk_ids": []},
         {"query": "first", "retrieved_count": 2, "selected_count": 2, "selected_chunk_ids": ["a", "b"]},
         {"query": "second", "retrieved_count": 2, "selected_count": 1, "selected_chunk_ids": ["a"]},
     ]

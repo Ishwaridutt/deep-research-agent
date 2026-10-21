@@ -3,6 +3,7 @@
 import logging
 
 from src.config import Settings
+from src.guardrails.input_classifier import prefilter_question
 from src.graph.graph_state import WorkflowState
 from src.models import (
     ErrorType,
@@ -51,6 +52,16 @@ def input_guardrail_node(
             )
         )
 
+    elif (prefilter := prefilter_question(question)).rejection is not None:
+        # Defence in depth: the service screens first, but the graph never trusts its caller.
+        errors.append(
+            ResearchError(
+                error_type=ErrorType.VALIDATION,
+                component="input_guardrail",
+                message=prefilter.rejection.user_message or "The request was not accepted for research.",
+                recoverable=False,
+            )
+        )
     elif (len(question) > settings.research_limits.max_question_chars):
         errors.append(
             ResearchError(

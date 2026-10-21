@@ -15,7 +15,7 @@ PIPELINE_NODES = frozenset({
     "research_source_selection",
     "research_web_search", "research_source_processor", "research_retrieval",
     "research_evidence_extractor", "research_coverage_evaluator", "research_routing",
-    "writer_prepare_evidence", "writer_synthesis", "writer_citation_checker",
+    "writer_prepare_evidence", "writer_synthesis", "writer_critic", "writer_citation_checker",
     "finalize_report",
 })
 
@@ -60,6 +60,7 @@ def _safe_details(
     output: Any,
     *,
     iteration: int | None = None,
+    private_sources: bool = False,
 ) -> dict[str, Any]:
     """Whitelist bounded summaries/public previews; never expose private text."""
 
@@ -228,7 +229,10 @@ def _safe_details(
         stats = _field(research, "extraction_stats", {})
         if _field(stats, "iteration") == iteration:
             details["extracted_provider_counts"] = _provider_counts(_field(stats, "extracted_provider_counts", {}))
-            for key in ("extracted_count", "reused_count", "attempted_count", "deferred_count"):
+            for key in (
+                "extracted_count", "reused_count", "attempted_count", "deferred_count", "carried_over_count",
+                "gate_passed_count", "gate_kept_min_count", "gate_rejected_count",
+            ):
                 value = _field(stats, key)
                 if isinstance(value, int) and value >= 0:
                     details[key] = value
@@ -304,6 +308,7 @@ def _safe_details(
                 "question": _text(_field(questions_by_id.get(_field(gap, "subquestion_id")), "question")),
                 "description": _text(_field(gap, "description")),
                 "priority": _field(gap, "priority"),
+                "blocking": bool(_field(gap, "blocking", False)),
             } for gap in gaps[:_DETAIL_LIMIT]],
             "details_truncated": len(assessments) > _DETAIL_LIMIT or len(gaps) > _DETAIL_LIMIT,
         }
@@ -361,7 +366,83 @@ def _safe_details(
         report = _field(writer, "final_report")
         if report is not None:
             lineage["cited"] = len(_field(report, "sources", []))
-        return {"source_lineage": lineage} if lineage else {}
+        details: dict[str, Any] = {"source_lineage": lineage} if lineage else {}
+        if node == "writer_prepare_evidence":
+            groups = _field(writer, "evidence_summary", []) or []
+            details["evidence_count"] = len(_field(writer, "evidence_ids", []))
+            details["evidence_groups"] = [{
+                "question": _text(_field(group, "question"), 300),
+                "evidence_count": _count(_field(group, "evidence_count")),
+                "source_count": _count(_field(group, "source_count")),
+            } for group in groups[:_DETAIL_LIMIT]]
+        return details
+
+    if node == "writer_synthesis":
+        writer = output.get("writer", {})
+        draft = _field(writer, "draft_report")
+        revision = _count(_field(writer, "revision_count")) > 0
+        if draft is None:
+            return {"revision": revision}
+        findings = _field(draft, "findings", [])
+        return {
+            "revision": revision,
+            "title": _text(_field(draft, "title"), 300),
+            "finding_count": len(findings),
+            "limitation_count": len(_field(draft, "limitations", [])),
+            "evidence_count": len(_field(writer, "evidence_ids", [])),
+            "findings": [{
+                "section": _text(_field(finding, "section"), 200),
+                "title": _text(_field(finding, "title"), 300),
+                "citation_count": len(_field(finding, "evidence_ids", [])),
+            } for finding in findings[:_DETAIL_LIMIT]],
+        }
+
+    if node == "writer_critic":
+        review = _field(output.get("writer", {}), "critic_review")
+        if review is None:
+            return {}
+        issues = _field(review, "issues", [])
+        issue_types: dict[str, int] = {}
+        for issue in issues[:_DETAIL_LIMIT]:
+            issue_type = str(_field(issue, "issue_type", "unknown"))
+            issue_types[issue_type] = issue_types.get(issue_type, 0) + 1
+        details = {
+            "verdict": _field(review, "verdict"),
+            "issue_count": len(issues),
+            "issue_types": issue_types,
+        }
+        # Instructions may quote private evidence, so document jobs stream counts only.
+        if not private_sources:
+            details["issues"] = [{
+                "issue_type": str(_field(issue, "issue_type", "unknown")),
+                "finding_index": _field(issue, "finding_index"),
+                "instruction": _text(_field(issue, "instruction"), 500),
+            } for issue in issues[:_DETAIL_LIMIT]]
+        return details
+
+    if node == "writer_citation_checker":
+        writer = output.get("writer", {})
+        report = _field(writer, "final_report")
+        result = _field(writer, "citation_result")
+        if report is None:
+            return {}
+        issues = _field(result, "issues", []) if result is not None else []
+        details = {
+            "verified_finding_count": len(_field(report, "findings", [])),
+            "unverified_item_count": len(_field(report, "unverified_material", [])),
+            "issue_count": len(issues),
+            "semantic_check_unavailable": any(
+                _field(error, "component") == "writer_citation_checker"
+                for error in output.get("errors", []) or []
+            ),
+        }
+        if not private_sources:
+            details["issues"] = [_text(_field(issue, "description"), 300) for issue in issues[:_DETAIL_LIMIT]]
+            details["unverified_titles"] = [
+                _text(_field(item, "title"), 300)
+                for item in _field(report, "unverified_material", [])[:_DETAIL_LIMIT]
+            ]
+        return details
 
     if node == "research_routing":
         control = output.get("research_control")
@@ -499,6 +580,9 @@ async def run_graph_with_events(
                 stage,
                 output,
                 iteration=iteration,
+                private_sources="documents" in [
+                    getattr(source, "value", source) for source in state.get("allowed_sources", [])
+                ],
             )
             failure_details = _safe_terminal_error_details(output)
             if failure_details:

@@ -38,6 +38,27 @@ class RetrievalSession:
         self.hybrid_retriever.build(self.chunks)
         print('\nRetrieval session chunking and loading completed...')
 
+    def add(self, documents: list[RetrievalDocument]) -> int:
+        """
+        Chunks and indexes only documents not yet in this session.
+
+        A job-owned session grows across research rounds, so earlier sources
+        are never re-chunked or re-embedded. Returns the number of new documents.
+        """
+        indexed_ids = {chunk.document_id for chunk in self.chunks}
+        new_documents = [
+            document for document in dict((item.document_id, item) for item in documents).values()
+            if document.document_id not in indexed_ids
+        ]
+        print(f"\nRetrieval session add: {len(new_documents)} new documents; {len(documents) - len(new_documents)} already indexed")
+        if not new_documents:
+            return 0
+        new_chunks = self.chunker.chunk_documents(new_documents)
+        self.chunks.extend(new_chunks)
+        self.hybrid_retriever.add(new_chunks)
+        print('\nRetrieval session incremental indexing completed...')
+        return len(new_documents)
+
     def retrieve(self, request: RetrievalRequest) -> RetrievalResult:
         """Retrieves and builds bounded context for one research subquestion."""
 
@@ -46,9 +67,13 @@ class RetrievalSession:
 
         # Search each intent separately, then interleave rankings so a broad query
         # cannot hide the narrow follow-up searches before context selection.
+        # The subquestion always leads: it states the evidence need in natural
+        # language, while web queries are tuned for search engines.
         queries = list(dict.fromkeys(
-            query.strip() for query in request.search_queries if query.strip()
-        )) or [request.subquestion.strip()]
+            query.strip()
+            for query in [request.subquestion, *request.search_queries]
+            if query and query.strip()
+        ))
         print("\nretrieval search intents:", queries)
         rankings = [self.search(query) for query in queries]
         retrieved_chunks = []

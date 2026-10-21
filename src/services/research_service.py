@@ -7,10 +7,13 @@ from typing import cast
 from langgraph.graph.state import CompiledStateGraph
 
 from src.config import Settings
+from src.guardrails.input_classifier import ResearchInputGuard
 from src.graph.graph_state import WorkflowState, create_initial_workflow_state
 from src.llm import LLMService
 from src.models import (
     ErrorType,
+    GuardrailDecision,
+    GuardrailResult,
     ResearchError,
     ResearchExecutionResult,
     ResearchExecutionStatus,
@@ -44,6 +47,15 @@ class ResearchRequestValidationError(ValueError):
     """Raised when a request cannot safely enter the research graph."""
 
 
+class ResearchInputRejected(ValueError):
+    """Raised when the input guardrail refuses to start research for a question."""
+
+    def __init__(self, result: GuardrailResult) -> None:
+        super().__init__(result.user_message or "The request was not accepted for research.")
+        self.category = result.category or "rejected"
+        self.user_message = str(self)
+
+
 def _failure_details(result: ResearchExecutionResult) -> dict:
     """Build a sanitized summary from errors already safe for the public API."""
 
@@ -71,6 +83,7 @@ class ResearchService:
         job_store: ResearchJobStore,
         llm_service: LLMService | None = None,
         document_service: DocumentService | None = None,
+        input_guard: ResearchInputGuard | None = None,
         max_concurrent_jobs: int = 2,
         max_pending_jobs: int = 20,
     ) -> None:
@@ -79,6 +92,7 @@ class ResearchService:
         self._job_store = job_store
         self._llm_service = llm_service
         self._document_service = document_service
+        self._input_guard = input_guard
         self._task_slots = asyncio.Semaphore(max_concurrent_jobs)
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._admission_lock = asyncio.Lock()
@@ -118,6 +132,25 @@ class ResearchService:
             )
         except ValueError as exc:
             raise ResearchRequestValidationError(str(exc)) from exc
+
+    async def _screen_question(
+        self,
+        *,
+        question: str,
+        source_selection: ResearchSourceSelection | None,
+    ) -> str:
+        """Run the input guardrail before any job, event, or research cost exists."""
+
+        if self._input_guard is None:
+            return question
+        selection = source_selection or ResearchSourceSelection()
+        normalized, result = await self._input_guard.check(
+            question,
+            has_documents=selection.mode != ResearchSourceMode.WEB,
+        )
+        if result.decision == GuardrailDecision.REJECT:
+            raise ResearchInputRejected(result)
+        return normalized
 
     def _create_state(
         self,
@@ -196,6 +229,7 @@ class ResearchService:
             source_selection=source_selection,
             owner_id=owner_id,
         )
+        question = await self._screen_question(question=question, source_selection=source_selection)
         state = self._create_state(
             question=question,
             source_selection=source_selection,
@@ -240,6 +274,8 @@ class ResearchService:
             source_selection=source_selection,
             owner_id=owner_id,
         )
+        # Rejected questions never create a job record, events, or research cost.
+        question = await self._screen_question(question=question, source_selection=source_selection)
         async with self._admission_lock:
             if self._shutting_down or len(self._tasks) >= self._max_pending_jobs:
                 raise ResearchJobQueueFull("The research job queue is currently full.")

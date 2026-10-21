@@ -37,8 +37,11 @@ const ui = {
     summary: $("report-summary"),
     findings: $("report-findings"),
     limitations: $("report-limitations"),
+    unverifiedSection: $("unverified-section"),
+    unverified: $("report-unverified"),
     sources: $("report-sources"),
     errorsSection: $("workflow-errors-section"),
+    errorsSummary: $("workflow-errors-summary"),
     errors: $("workflow-errors"),
     markdownSection: $("markdown-section"),
     markdown: $("report-markdown"),
@@ -58,6 +61,7 @@ const STAGES = {
     research_routing: "Decide next step",
     writer_prepare_evidence: "Prepare evidence",
     writer_synthesis: "Synthesize report",
+    writer_critic: "Review draft",
     writer_citation_checker: "Verify citations",
     finalize_report: "Finalize report",
 };
@@ -68,7 +72,7 @@ const RESEARCH = [
     "research_retrieval", "research_document_retrieval", "research_evidence_extractor", "research_coverage_evaluator",
     "research_routing",
 ];
-const WRITING = ["writer_prepare_evidence", "writer_synthesis", "writer_citation_checker", "finalize_report"];
+const WRITING = ["writer_prepare_evidence", "writer_synthesis", "writer_critic", "writer_citation_checker", "finalize_report"];
 const EVENT_TYPES = [
     "workflow_started", "stage_started", "stage_completed", "stage_failed",
     "research_retry", "research_stopped", "workflow_completed", "workflow_failed",
@@ -350,10 +354,12 @@ function resetReport() {
     hide(ui.result);
     ui.reportHeading.textContent = "Research report";
     hide(ui.errorsSection);
+    ui.errorsSection.open = false;
     ui.markdownSection.open = false;
     ui.summary.textContent = "";
     ui.markdown.textContent = "";
-    [ui.findings, ui.limitations, ui.sources, ui.errors, ui.metadata].forEach(clear);
+    [ui.findings, ui.limitations, ui.unverified, ui.sources, ui.errors, ui.metadata].forEach(clear);
+    hide(ui.unverifiedSection);
 }
 function resetPipeline() {
     events = [];
@@ -436,13 +442,14 @@ function appendStageMetrics(parent, metrics) {
     }
     if (grid.children.length) parent.append(grid);
 }
-function renderStageDetails(stage, round) {
+function renderStageDetails(stage, round, selected = null, keySuffix = "") {
     if (stage === "research_document_retrieval" && getStageState(stage, round) === "skipped") {
         return create("p", "stage-skip-note", "No private documents attached. Document retrieval was skipped.");
     }
     const stageRound = round ?? (stage === "research_planner" ? 1 : null);
     const eventStage = stage === "research_document_retrieval" ? "research_retrieval" : stage;
-    const event = events.filter(item => item.stage === eventStage
+    // Writer stages can run twice (draft and revision), so callers pass the run's own event.
+    const event = selected ?? events.filter(item => item.stage === eventStage
         && ["stage_completed", "stage_failed"].includes(item.event_type)
         && (stageRound === null || item.iteration === stageRound)).at(-1);
     if (!event) return null;
@@ -525,7 +532,7 @@ function renderStageDetails(stage, round) {
             const list = create("ul", "stage-detail-list");
             (group.query_matches || []).forEach(match => {
                 const item = create("li");
-                item.append(create("p", "query-text", match.query), create("small", "detail-muted", `${match.retrieved_count} retrieved · ${match.selected_count} included after context limits`));
+                item.append(create("p", "query-text", match.query), create("small", "detail-muted", `${match.retrieved_count} retrieved · ${match.selected_count} used (others were already included by another search, over the per-source cap, or over the token budget)`));
                 list.append(item);
             });
             section.append(list);
@@ -596,17 +603,96 @@ function renderStageDetails(stage, round) {
                 const item = create("li");
                 if (gap.question) item.append(create("strong", "detail-question", gap.question));
                 item.append(create("p", "", gap.description));
-                if (Number.isInteger(gap.priority)) item.append(create("small", "detail-muted", `Priority ${gap.priority}/5`));
+                const kind = gap.blocking ? "Blocking: triggers more research" : "Limitation: reported, no more research";
+                item.append(create("small", "detail-muted", `${kind}${Number.isInteger(gap.priority) ? ` · Priority ${gap.priority}/5` : ""}`));
                 list.append(item);
             });
             body.append(list);
         }
+    } else if (stage === "writer_prepare_evidence") {
+        if (!Number.isInteger(data.evidence_count)) return null;
+        caption = `${data.evidence_count} evidence passages · View by subquestion`;
+        const lineage = data.source_lineage || {};
+        appendStageMetrics(body, [
+            ["Evidence passages", data.evidence_count], ["Sources supplied", lineage.supplied_to_writer], ["Sources accepted", lineage.accepted],
+        ]);
+        body.append(create("p", "detail-muted", "Every accepted passage goes to the writer, grouped by subquestion with the strongest first."));
+        const list = create("ul", "stage-detail-list");
+        (data.evidence_groups || []).forEach(group => {
+            const item = create("li");
+            item.append(create("strong", "detail-question", group.question || "Research task"),
+                create("small", "detail-muted", `${group.evidence_count} passages · ${group.source_count} sources`));
+            list.append(item);
+        });
+        if (list.children.length) body.append(list);
+    } else if (stage === "writer_synthesis") {
+        if (!Number.isInteger(data.finding_count)) return null;
+        caption = `${data.revision ? "Revised draft" : "Draft"} · ${data.finding_count} findings · View outline`;
+        appendStageMetrics(body, [
+            ["Findings", data.finding_count], ["Evidence supplied", data.evidence_count], ["Limitations", data.limitation_count],
+        ]);
+        if (data.revision) body.append(create("p", "detail-muted", "Rewritten once from the critic's feedback, using the same evidence."));
+        if (data.title) body.append(create("strong", "detail-question", data.title));
+        const sections = new Map();
+        (data.findings || []).forEach(finding => {
+            const heading = finding.section || "Detailed Analysis";
+            if (!sections.has(heading)) {
+                const section = create("section", "stage-detail-group");
+                section.append(create("strong", "detail-question", heading), create("ul", "stage-detail-list"));
+                sections.set(heading, section);
+                body.append(section);
+            }
+            const item = create("li");
+            item.append(create("p", "", finding.title || "Finding"),
+                create("small", "detail-muted", `${finding.citation_count} cited evidence passages`));
+            sections.get(heading).children[1].append(item);
+        });
+    } else if (stage === "writer_critic") {
+        if (!data.verdict) return null;
+        const revise = data.verdict === "revise";
+        caption = revise ? `Revision requested · ${data.issue_count} issues · View feedback` : "Approved · View review";
+        body.append(create("p", revise ? "detail-warning" : "detail-muted", revise
+            ? "The draft is revised once with the same evidence. The job does not return to research."
+            : "The draft is grounded and complete enough to go to citation checking."));
+        appendStageMetrics(body, Object.entries(data.issue_types || {}).map(([type, count]) => [label(type), count]));
+        if (data.issues?.length) {
+            const list = create("ul", "stage-detail-list");
+            data.issues.forEach(issue => {
+                const item = create("li");
+                const target = Number.isInteger(issue.finding_index) ? `Finding ${issue.finding_index + 1}` : "Whole report";
+                item.append(create("strong", "detail-question", `${label(issue.issue_type)} · ${target}`), create("p", "", issue.instruction || ""));
+                list.append(item);
+            });
+            body.append(list);
+        } else if (data.issue_count) {
+            body.append(create("p", "detail-muted", "Feedback text is not included in progress events for jobs with private documents."));
+        }
+    } else if (stage === "writer_citation_checker") {
+        if (!Number.isInteger(data.verified_finding_count)) return null;
+        caption = `${data.verified_finding_count} verified · ${data.unverified_item_count} unverified · View checks`;
+        appendStageMetrics(body, [
+            ["Verified findings", data.verified_finding_count], ["Moved to unverified", data.unverified_item_count], ["Issues", data.issue_count],
+        ]);
+        if (data.semantic_check_unavailable) body.append(create("p", "detail-warning", "Semantic verification was unavailable; citations were checked for valid references only."));
+        [["Issues found", data.issues], ["Moved to 'Additional material (not citation-verified)'", data.unverified_titles]].forEach(([title, items]) => {
+            if (!items?.length) return;
+            body.append(create("strong", "detail-question", title));
+            const list = create("ul", "stage-detail-list");
+            items.forEach(text => list.append(create("li", "", text)));
+            body.append(list);
+        });
+    } else if (stage === "finalize_report") {
+        const lineage = Object.entries(data.source_lineage || {});
+        if (!lineage.length) return null;
+        caption = "View source lineage";
+        appendStageMetrics(body, lineage.map(([name, count]) => [label(name), count]));
+        body.append(create("p", "detail-muted", "Sources collected → retrieved → accepted as evidence → supplied to the writer → cited in the final report."));
     } else return null;
 
     if (data.reason) body.append(create("p", "detail-muted", data.reason));
     if (data.details_truncated) body.append(create("p", "detail-muted", "Showing the first 100 items. Totals include all items; long text is shortened with an ellipsis."));
     const output = create("details", "stage-output");
-    const key = `${stage}:${stageRound ?? "workflow"}`;
+    const key = `${stage}:${stageRound ?? "workflow"}${keySuffix}`;
     output.open = expandedStageDetails.has(key);
     output.addEventListener("toggle", () => {
         if (!output.isConnected) return;
@@ -615,29 +701,91 @@ function renderStageDetails(stage, round) {
     output.append(create("summary", "", caption), body);
     return output;
 }
+function stageRow(name, state, details) {
+    const row = create("li", "stage-row");
+    row.dataset.state = state;
+    const heading = create("div", "stage-heading");
+    heading.append(
+        create("span", "stage-node", ({ completed: "✓", failed: "×", running: "◆", pending: "·", skipped: "↷" })[state]),
+        create("span", "stage-name", name),
+        create("span", "stage-caption", ({ completed: "Done", failed: "Failed", running: "Running", pending: "Waiting", skipped: "Skipped" })[state]),
+    );
+    row.append(heading);
+    if (details) row.append(details);
+    return row;
+}
 function renderStages(stages, round = null) {
     const list = create("ol", "stage-list");
     for (const stage of stages) {
-        const state = getStageState(stage, round);
-        const row = create("li", "stage-row");
-        row.dataset.state = state;
-        const heading = create("div", "stage-heading");
-        heading.append(
-            create("span", "stage-node", ({ completed: "✓", failed: "×", running: "◆", pending: "·", skipped: "↷" })[state]),
-            create("span", "stage-name", STAGES[stage]),
-            create("span", "stage-caption", ({ completed: "Done", failed: "Failed", running: "Running", pending: "Waiting", skipped: "Skipped" })[state]),
-        );
-        row.append(heading);
-        const details = renderStageDetails(stage, round);
-        if (details) row.append(details);
-        list.append(row);
+        list.append(stageRow(STAGES[stage], getStageState(stage, round), renderStageDetails(stage, round)));
     }
     return list;
+}
+function writerRuns() {
+    // Writer stages run in order, but synthesis can run twice; keep each run separately.
+    const runs = [];
+    for (const event of events) {
+        if (!WRITING.includes(event.stage)) continue;
+        if (event.event_type === "stage_started") {
+            runs.push({ stage: event.stage, state: "running", event: null });
+        } else if (["stage_completed", "stage_failed"].includes(event.event_type)) {
+            let run = [...runs].reverse().find(item => item.stage === event.stage && !item.event);
+            if (!run) { run = { stage: event.stage }; runs.push(run); }
+            run.event = event;
+            run.state = event.event_type === "stage_completed" ? "completed" : "failed";
+        }
+    }
+    return runs;
+}
+function renderWriterGroup() {
+    const group = create("section", "pipeline-group");
+    const head = create("div", "group-head");
+    head.append(create("h3", "", "03 · Write & verify"), create("span", "group-hint",
+        withDuration("Draft, review, revise once if needed, verify", stageDuration(event => WRITING.includes(event.stage)))));
+    const list = create("ol", "stage-list");
+    const runs = writerRuns();
+    let synthesisRuns = 0;
+    runs.forEach((run, index) => {
+        const revision = run.stage === "writer_synthesis" && synthesisRuns++ > 0;
+        const state = run.state === "running" && pipelineFailed ? "failed" : run.state;
+        const name = revision ? "Revise report (critic feedback)" : STAGES[run.stage];
+        list.append(stageRow(name, state, run.event ? renderStageDetails(run.stage, null, run.event, `:${index}`) : null));
+        if (run.stage === "writer_critic" && run.event?.details?.verdict === "revise") {
+            const note = create("li", "round-note");
+            note.dataset.kind = "retry";
+            note.append(create("strong", "", "↻ Revision requested"),
+                create("p", "", `${run.event.details.issue_count ?? "Some"} issues to fix with the same evidence; at most one revision.`));
+            list.append(note);
+        }
+    });
+    // Stages not reached yet; the critic does not review a revised draft again.
+    const last = runs.length ? WRITING.indexOf(runs.at(-1).stage) : -1;
+    WRITING.slice(last + 1)
+        .filter(stage => !(stage === "writer_critic" && synthesisRuns > 1))
+        .forEach(stage => list.append(stageRow(STAGES[stage], "pending", null)));
+    group.append(head, list);
+    return group;
+}
+function formatDuration(ms) {
+    const seconds = Math.max(0, Math.round(ms / 1000));
+    const minutes = Math.floor(seconds / 60);
+    return minutes ? `${minutes} min ${seconds % 60} sec` : `${seconds} sec`;
+}
+function stageDuration(belongs) {
+    // Time from the section's first event to its last; "so far" while a stage is still running.
+    const own = events.filter(belongs);
+    const times = own.map(event => parseTimestamp(event.timestamp)).filter(Number.isFinite);
+    if (times.length < 2) return "";
+    const open = own.at(-1)?.event_type === "stage_started" && !pipelineFailed;
+    return `${formatDuration(Math.max(...times) - Math.min(...times))}${open ? " so far" : ""}`;
+}
+function withDuration(hint, duration) {
+    return duration ? `${hint} · ${duration}` : hint;
 }
 function renderGroup(title, hint, stages) {
     const group = create("section", "pipeline-group");
     const head = create("div", "group-head");
-    head.append(create("h3", "", title), create("span", "group-hint", hint));
+    head.append(create("h3", "", title), create("span", "group-hint", withDuration(hint, stageDuration(event => stages.includes(event.stage)))));
     group.append(head, renderStages(stages));
     return group;
 }
@@ -682,7 +830,8 @@ function buildRoundCard(round, latest) {
     left.append(create("span", "round-indicator", round), create("span", "", `Research round ${round}`));
     const status = retry ? "Follow-up required" : stop ? "Concluded"
         : getStageState("research_routing", round) === "completed" ? "Evaluated" : "In progress";
-    summary.append(left, create("span", "round-status", status));
+    const duration = stageDuration(event => RESEARCH.includes(event.stage) && event.iteration === round);
+    summary.append(left, create("span", "round-status", withDuration(status, duration)));
     details.append(summary);
     const body = create("div", "round-details");
     body.append(renderStages(researchStages(round), round));
@@ -714,7 +863,8 @@ function renderPipeline() {
 
     const research = create("section", "pipeline-group");
     const head = create("div", "group-head");
-    head.append(create("h3", "", "02 · Research & evaluate"), create("span", "group-hint", "Evidence-driven iterations"));
+    head.append(create("h3", "", "02 · Research & evaluate"), create("span", "group-hint",
+        withDuration("Evidence-driven iterations", stageDuration(event => RESEARCH.includes(event.stage)))));
     research.append(head);
     const rounds = researchRounds();
     if (rounds.length) {
@@ -730,7 +880,7 @@ function renderPipeline() {
     } else {
         research.append(create("p", "empty-rounds", "Research rounds will appear when planning begins."));
     }
-    ui.timeline.append(research, renderGroup("03 · Write & verify", "Grounded report", WRITING));
+    ui.timeline.append(research, renderWriterGroup());
     renderInsights();
     renderActivity();
 }
@@ -875,8 +1025,10 @@ async function readJson(response) {
     const data = await response.json();
     if (!response.ok) {
         const detail = data.detail || `Request failed (${response.status}).`;
-        const error = new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+        const message = typeof detail === "string" ? detail : (detail.message || JSON.stringify(detail));
+        const error = new Error(message);
         error.status = response.status;
+        error.guardrail = Boolean(detail?.guardrail);
         throw error;
     }
     return data;
@@ -988,6 +1140,35 @@ function renderLimitations(limitations) {
     }
     limitations.forEach(item => ui.limitations.append(renderReportMarkdown(create("li", "report-markdown"), item)));
 }
+function renderUnverified(items) {
+    clear(ui.unverified);
+    if (!Array.isArray(items) || !items.length) {
+        hide(ui.unverifiedSection);
+        return;
+    }
+    items.forEach((item, index) => {
+        const article = create("article", "finding");
+        article.append(renderReportText(create("h5"), item.title || `Unverified statement ${index + 1}`),
+            renderReportMarkdown(create("div", "report-markdown"), item.content || ""));
+        const links = (item.sources || []).map(source => {
+            const url = safeHttpUrl(source.uri || source.url);
+            const title = source.title || url || "Source";
+            if (!url) return create("span", "", title);
+            const anchor = create("a", "", title);
+            anchor.href = url;
+            anchor.target = "_blank";
+            anchor.rel = "noopener noreferrer";
+            return anchor;
+        });
+        if (links.length) {
+            const line = create("p", "detail-muted", "Possible sources: ");
+            links.forEach((link, linkIndex) => line.append(...(linkIndex ? ["; ", link] : [link])));
+            article.append(line);
+        }
+        ui.unverified.append(article);
+    });
+    show(ui.unverifiedSection);
+}
 function safeHttpUrl(value) {
     try {
         const url = new URL(value);
@@ -1030,6 +1211,7 @@ function renderErrors(errors) {
     if (!Array.isArray(errors) || !errors.length) { hide(ui.errorsSection); return; }
     errors.forEach(error => appendTextItem(ui.errors,
         `${error.component ? `[${error.component}] ` : ""}${error.message || "Unknown workflow error."}`));
+    ui.errorsSummary.textContent = `View workflow notes (${errors.length})`;
     show(ui.errorsSection);
 }
 function renderResult(data) {
@@ -1042,6 +1224,7 @@ function renderResult(data) {
         : "The research workflow could not produce a validated report.");
     renderFindings(success ? data.report.findings : []);
     renderLimitations(success ? data.report.limitations : []);
+    renderUnverified(success ? data.report.unverified_material : []);
     renderSources(success ? data.report.sources : []);
     const lineage = document.getElementById("source-lineage");
     if (lineage) {
@@ -1122,7 +1305,9 @@ async function startResearch(question, mode, documentIds) {
         if (token !== runToken) return;
         console.error("Research submission failed:", error);
         const message = error instanceof Error ? error.message : "Unexpected error.";
-        if (usesDocuments(mode) && error?.status === 422) {
+        if (error?.guardrail) {
+            showStatus("Not a research request", message, "error");
+        } else if (usesDocuments(mode) && error?.status === 422) {
             showDocumentIssue("Documents unavailable", message);
         } else {
             showStatus("Unable to start research", message, "error");

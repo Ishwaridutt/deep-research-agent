@@ -31,25 +31,25 @@ def test_research_prompts_ground_dates_and_followup_context():
     )
     query = build_query_generator_messages(
         original_question="Find recent developments.",
-        subquestion=_subquestion("sq-1"),
+        subquestions=[_subquestion("sq-1")],
         max_queries=2,
+        max_query_words=12,
         previous_queries=["previous query"],
         current_date=current_date,
     )
 
     assert current_date in planner[0].content
     assert "Resolve relative dates" in planner[0].content
-    assert "final report" in planner[0].content
     assert "consistent entities and criteria" in planner[0].content
     assert "no more than 5 subquestions" in planner[0].content
     assert "Follow-up planning:" not in planner[0].content
     assert current_date in query[0].content
-    assert "fixed scope" in query[0].content
-    assert "primary and directly attributable" in query[0].content
+    assert "scope and entities fixed" in query[0].content
+    assert "Resolve relative dates" in query[0].content
     assert "previous query" in query[1].content
     normalized_query_prompt = " ".join(query[0].content.split()).casefold()
     assert "do not answer the question or generate subquestions" in normalized_query_prompt
-    assert "no more than 2 queries" in query[0].content
+    assert "no more than 2 queries per subquestion" in normalized_query_prompt
     assert "short purpose" in query[0].content
 
 
@@ -107,9 +107,8 @@ def test_coverage_prompt_includes_safe_source_context():
     assert "2026-10-16" in messages[0].content
     assert "https://example.com/report" in messages[1].content
     assert "2026-03-01" in messages[1].content
-    assert "directly executable" in messages[0].content
     assert "previously supported" in messages[0].content
     assert '"previous_coverage":{"status":"sufficient"' in messages[1].content
-    assert "Minor omissions" in messages[0].content
-    assert "A generic" in messages[0].content
-    assert "do not require two sources" in messages[0].content
+    assert "blocking=true only when a part the user explicitly asked" in " ".join(messages[0].content.split())
+    assert "a generic passage" in messages[0].content
+    assert "Use only names found in the evidence" in messages[0].content

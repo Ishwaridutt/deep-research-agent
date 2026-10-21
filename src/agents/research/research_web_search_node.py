@@ -65,26 +65,33 @@ async def research_web_search_node(
         indent=2,
     ))
 
-    for search_query in iteration_queries:
-        if queries_executed >= query_limit:
-            logger.warning("Search execution budget exhausted; skipping remaining queries.")
-            break
+    # Respect the job query budget, then run this round's queries concurrently.
+    # The search provider's semaphore still bounds total outbound requests.
+    runnable_queries = iteration_queries[:max(0, query_limit - queries_executed)]
+    if len(runnable_queries) < len(iteration_queries):
+        logger.warning("Search execution budget exhausted; skipping remaining queries.")
+    if _seconds_remaining(state) <= 0:
+        logger.warning("Research time budget exhausted; stopping web search.")
+        runnable_queries = []
 
-        seconds_remaining = _seconds_remaining(state)
-        if seconds_remaining <= 0:
-            logger.warning("Research time budget exhausted; stopping web search.")
-            break
-
-        queries_executed += 1
+    async def run_query(search_query):
+        """Run one query and return its results or the failure to report."""
         try:
-            results = await asyncio.wait_for(
+            return await asyncio.wait_for(
                 search_provider.search(
                     search_query=search_query,
                     max_results=settings.research_limits.max_search_results_per_query,
                 ),
-                timeout=seconds_remaining,
+                timeout=max(0.001, _seconds_remaining(state)),
             )
-        except TimeoutError:
+        except (TimeoutError, SearchProviderError) as exc:
+            return exc
+
+    outcomes = await asyncio.gather(*(run_query(query) for query in runnable_queries))
+    queries_executed += len(runnable_queries)
+
+    for search_query, results in zip(runnable_queries, outcomes):
+        if isinstance(results, TimeoutError):
             failed_query_count += 1
             logger.warning("Web search timed out at the research deadline.")
             errors.append(ResearchError(
@@ -93,10 +100,10 @@ async def research_web_search_node(
                 message=f"Search timed out for query '{search_query.id}'.",
                 recoverable=True,
             ))
-            break
-        except SearchProviderError as exc:
+            continue
+        if isinstance(results, SearchProviderError):
             failed_query_count += 1
-            logger.exception(
+            logger.error(
                 "Web search failed.",
                 extra={
                     "event": "web_search_failed",
@@ -111,7 +118,7 @@ async def research_web_search_node(
             errors.append(ResearchError(
                 error_type=ErrorType.SEARCH,
                 component="research_web_search",
-                message=str(exc),
+                message=str(results),
                 recoverable=True,
             ))
             continue
@@ -136,16 +143,9 @@ async def research_web_search_node(
         failed_branches.update(diagnostics.get("failed_branches", []))
         fallback_activated |= bool(diagnostics.get("web_fallback_activated"))
 
-        # Retain unscored results for providers that do not expose relevance scores.
-        filtered_results = [
-            result for result in results
-            if result.provider_score is None
-            or result.provider_score >= settings.search.min_provider_score
-        ][:settings.research_limits.max_search_results_per_query]
-
-        # Keep one fallback result rather than dropping the entire source set.
-        if not filtered_results and results:
-            filtered_results = [max(results, key=lambda item: item.provider_score or 0.0)]
+        # No provider-score cut here: the relevance gate in the source processor is the
+        # single relevance filter, applied on one scale to every provider's results.
+        filtered_results = list(results)
 
         new_results.extend(filtered_results)
 

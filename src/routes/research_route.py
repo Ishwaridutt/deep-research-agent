@@ -9,6 +9,7 @@ from src.models import ResearchExecutionResult, ResearchRequest
 from src.models.pipeline_event import ResearchJobCreated, ResearchJobStatusResponse
 from src.services.research_pipeline_stream_service import encode_sse
 from src.services.research_service import (
+    ResearchInputRejected,
     ResearchJobQueueFull,
     ResearchRequestValidationError,
     ResearchService,
@@ -16,6 +17,11 @@ from src.services.research_service import (
 
 
 TERMINAL_STATUSES = {"completed", "failed"}
+
+
+def _rejection_detail(exc: ResearchInputRejected) -> dict:
+    """Public guardrail rejection: a fixed message and category, never classifier text."""
+    return {"message": exc.user_message, "category": exc.category, "guardrail": True}
 
 
 def create_research_router(*, research_service: ResearchService) -> APIRouter:
@@ -40,6 +46,8 @@ def create_research_router(*, research_service: ResearchService) -> APIRouter:
                 source_selection=request.source_selection,
                 owner_id=x_owner_id,
             )
+        except ResearchInputRejected as exc:
+            raise HTTPException(status_code=422, detail=_rejection_detail(exc)) from exc
         except ResearchRequestValidationError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -62,6 +70,8 @@ def create_research_router(*, research_service: ResearchService) -> APIRouter:
             )
         except ResearchJobQueueFull as exc:
             raise HTTPException(status_code=429, detail=str(exc)) from exc
+        except ResearchInputRejected as exc:
+            raise HTTPException(status_code=422, detail=_rejection_detail(exc)) from exc
         except ResearchRequestValidationError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 

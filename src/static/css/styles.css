@@ -227,6 +227,8 @@ textarea:disabled { opacity: .65; }
 .empty-message { color: var(--muted) !important; }
 .markdown-section { padding: 16px 0 0; border-top: 1px solid #334154; }
 .markdown-section summary { color: #b7c8e4; cursor: pointer; font-weight: 650; font-size: .87rem; }
+.markdown-section + .markdown-section { margin-top: 16px; }
+.workflow-notes { margin: 13px 0 0; padding-left: 20px; color: #becde2; font-size: .84rem; line-height: 1.6; }
 pre { overflow-x: auto; max-height: 500px; margin-top: 13px; padding: 19px; background: #091222; border: 1px solid #24334a; border-radius: 11px; color: #becde2; white-space: pre-wrap; overflow-wrap: anywhere; font: .79rem/1.65 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace; }
 .app-footer { display: flex; justify-content: space-between; gap: 20px; border-top: 1px solid #243449; margin-top: 42px; padding-top: 22px; color: #7187a5; font-size: .7rem; letter-spacing: .04em; }
 @media (max-width: 860px) { .workflow-grid { grid-template-columns: 1fr; } .insight-column { grid-template-columns: repeat(2, minmax(0, 1fr)); } }

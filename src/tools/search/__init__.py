@@ -18,6 +18,7 @@ from src.tools.search.parallel_search import (
     ParallelSearchProvider,
     deduplicate_search_results,
 )
+from src.tools.search.relevance_gate import SearchRelevanceGate
 
 __all__ = [
     "SearchProvider",
@@ -26,6 +27,7 @@ __all__ = [
     "BraveSearchProvider",
     "FallbackSearchProvider",
     "ParallelSearchProvider",
+    "SearchRelevanceGate",
     "WikipediaSearchProvider",
     "create_search_provider",
     "deduplicate_search_results",

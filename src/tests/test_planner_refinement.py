@@ -18,7 +18,7 @@ from src.models import (
     PlannedFollowupSubQuestion, PlannedSubQuestion, PlannerOutput,
     QueryGeneratorOutput, ResearchSource, ResearchStopReason,
     RetrievalChunk, RetrievalRequest, RetrievalResult, RetrievedChunk,
-    SearchQuery, SourceType, SubQuestion,
+    SearchQuery, SourceType, SubQuestion, SubquestionSearchQueries,
 )
 from src.models.coverage_model import EvidenceStrength, SubquestionCoverage, SubquestionCoverageStatus
 from src.retrieval.context.retrieval_context_builder import RetrievalContextBuilder
@@ -32,7 +32,10 @@ def settings(**overrides):
         max_search_query_chars=500, max_iterations=3,
         max_evidence_items=100, min_evidence_relevance=0.6,
     )
-    return SimpleNamespace(research_limits=SimpleNamespace(**(limits | overrides)))
+    return SimpleNamespace(
+        research_limits=SimpleNamespace(**(limits | overrides)),
+        search=SimpleNamespace(extraction_max_concurrency=5),
+    )
 
 
 def initial_state():
@@ -63,7 +66,25 @@ class FakeLLM:
 
     async def invoke_structured(self, **kwargs):
         self.calls.append(kwargs)
-        return next(self.outputs)
+        output = next(self.outputs)
+        # Callables build outputs from the prompt when subquestion IDs are generated at runtime.
+        return output(**kwargs) if callable(output) else output
+
+
+def query_output(groups):
+    """Build one batched query generator output from {subquestion_id: [query, ...]}."""
+    return QueryGeneratorOutput(subquestions=[
+        SubquestionSearchQueries(subquestion_id=subquestion_id, queries=[
+            GeneratedSearchQuery(query=query, purpose="Measure") for query in queries
+        ])
+        for subquestion_id, queries in groups.items()
+    ])
+
+
+def prompt_subquestion_ids(messages):
+    """Read the subquestion IDs supplied in a query generator prompt."""
+    tasks = json.loads(messages[1].content.split("<subquestions>\n")[1].split("\n</subquestions>")[0])
+    return [task["subquestion_id"] for task in tasks]
 
 
 def test_refinement_context_keeps_task_history_and_gaps_without_evidence():
@@ -178,30 +199,27 @@ def test_retrieval_uses_active_followup_instead_of_original_objective():
     assert requests[0].search_queries == [query.query]
 
 
-def test_query_allocation_reuses_unused_slots_and_rejects_old_queries():
+def test_query_allocation_spreads_budget_and_rejects_old_queries():
     state = followup_state()
     state["research"]["active_subquestions"] = [
         SubQuestion(id=f"followup-{i}", parent_subquestion_id="root", iteration=2,
                     question=f"Find missing facet {i}?", objective="Collect measurements.")
         for i in range(2)
     ]
-    llm = FakeLLM([
-        QueryGeneratorOutput(queries=[GeneratedSearchQuery(query="first facet", purpose="Measure")]),
-        QueryGeneratorOutput(queries=[
-            GeneratedSearchQuery(query=query, purpose="Measure")
-            for query in [" ORIGINAL SEARCH ", "first facet", *[f"second facet {i}" for i in range(6)]]
-        ]),
-    ])
+    llm = FakeLLM([query_output({
+        "followup-0": ["first facet"],
+        "followup-1": [" ORIGINAL SEARCH ", "first facet", *[f"second facet {i}" for i in range(6)]],
+    })])
     update = asyncio.run(research_query_generator_node(
         state, llm_service=llm, settings=settings(max_total_queries_per_job=6),
     ))
     new_queries = update["research"]["search_queries"][1:]
-    assert len(new_queries) == 5
-    assert [query.subquestion_id for query in new_queries].count("followup-0") == 1
-    assert [query.subquestion_id for query in new_queries].count("followup-1") == 4
-    assert "no more than 4 queries" in llm.calls[1]["messages"][0].content
-    assert "original search" in llm.calls[1]["messages"][1].content
-    assert all(query.iteration == 2 for query in new_queries)
+    # One batched call; five remaining slots spread as at most two per task.
+    assert len(llm.calls) == 1
+    assert "no more than 2" in llm.calls[0]["messages"][0].content
+    assert "original search" in llm.calls[0]["messages"][1].content
+    assert [query.query for query in new_queries] == ["first facet", "second facet 0", "second facet 1"]
+    assert all(query.iteration == 2 and query.providers == ["web"] for query in new_queries)
 
 
 def test_query_allocation_reserves_one_for_each_selected_task():
@@ -210,18 +228,24 @@ def test_query_allocation_reserves_one_for_each_selected_task():
         SubQuestion(id=f"task-{i}", parent_subquestion_id="root", question=f"Facet {i}?", objective="Measure.")
         for i in range(5)
     ]
-    llm = FakeLLM([
-        QueryGeneratorOutput(queries=[GeneratedSearchQuery(query=f"query {i}", purpose="Measure")])
-        for i in range(5)
-    ])
+    llm = FakeLLM([query_output({f"task-{i}": [f"query {i}", f"extra {i}"] for i in range(5)})])
     update = asyncio.run(research_query_generator_node(
         state, llm_service=llm, settings=settings(max_total_queries_per_job=6),
     ))
     assert len(update["research"]["search_queries"]) == 6
-    assert all("no more than 1 queries" in call["messages"][0].content for call in llm.calls)
+    assert len(llm.calls) == 1
+    assert "no more than 1" in llm.calls[0]["messages"][0].content
 
 
 def test_query_counts_follow_planned_tasks_across_rounds():
+    def batched(prefix):
+        def build(*, messages, **kwargs):
+            return query_output({
+                subquestion_id: [f"{prefix} aspect {i} evidence {j}" for j in range(2)]
+                for i, subquestion_id in enumerate(prompt_subquestion_ids(messages))
+            })
+        return build
+
     async def run():
         state = initial_state()
         limits = settings(max_queries_per_subquestion=2)
@@ -229,9 +253,7 @@ def test_query_counts_follow_planned_tasks_across_rounds():
             PlannerOutput(subquestions=[PlannedSubQuestion(
                 question=f"What explains aspect {i}?", objective=f"Research aspect {i}.",
             ) for i in range(5)]),
-            *[QueryGeneratorOutput(queries=[GeneratedSearchQuery(
-                query=f"initial aspect {i} evidence {j}", purpose="Collect evidence.",
-            ) for j in range(2)]) for i in range(5)],
+            batched("initial"),
         ])
         state.update(await research_planner_node(state, llm_service=initial_llm, settings=limits))
         state.update(await research_query_generator_node(state, llm_service=initial_llm, settings=limits))
@@ -241,16 +263,14 @@ def test_query_counts_follow_planned_tasks_across_rounds():
         roots = state["research"]["subquestions"]
         state["research"]["iteration_count"] = 1
         state["research_control"].pending_gaps = [CoverageGap(
-            subquestion_id=root.id, description=f"Missing outcome {j} for {root.question}",
+            subquestion_id=root.id, description=f"Missing outcome {j} for {root.question}", blocking=True,
         ) for root in roots[:3] for j in range(2)]
         followup_llm = FakeLLM([
             FollowupPlannerOutput(subquestions=[PlannedFollowupSubQuestion(
                 parent_subquestion_id=root.id, question=f"Which outcomes are missing for aspect {i}?",
                 objective="Gather the two related missing outcomes.",
             ) for i, root in enumerate(roots[:3])]),
-            *[QueryGeneratorOutput(queries=[GeneratedSearchQuery(
-                query=f"followup aspect {i} outcome {j}", purpose="Resolve missing outcome.",
-            ) for j in range(2)]) for i in range(3)],
+            batched("followup"),
         ])
         state.update(await research_planner_node(state, llm_service=followup_llm, settings=limits))
         state.update(await research_query_generator_node(state, llm_service=followup_llm, settings=limits))
@@ -270,20 +290,30 @@ def test_query_counts_follow_planned_tasks_across_rounds():
 
 def test_per_subquestion_query_limit_still_applies_without_round_cap():
     state = followup_state()
-    llm = FakeLLM([QueryGeneratorOutput(queries=[GeneratedSearchQuery(
-        query=f"new evidence {i}", purpose="Find evidence.",
-    ) for i in range(6)])])
+    llm = FakeLLM([query_output({"root": [f"new evidence {i}" for i in range(6)]})])
     result = asyncio.run(research_query_generator_node(
         state, llm_service=llm, settings=settings(max_queries_per_subquestion=2),
     ))
     assert len(result["research"]["search_queries"]) == 3  # One previous query plus two new queries.
 
 
+def test_long_queries_are_shortened_and_native_providers_keep_web():
+    state = followup_state()
+    long_query = " ".join(f"word{i}" for i in range(20))
+    llm = FakeLLM([QueryGeneratorOutput(subquestions=[SubquestionSearchQueries(subquestion_id="root", queries=[
+        GeneratedSearchQuery(query=long_query, purpose="Find papers", providers=["arxiv"]),
+    ])])])
+    result = asyncio.run(research_query_generator_node(
+        state, llm_service=llm, settings=settings(max_search_query_words=12),
+    ))
+    query = result["research"]["search_queries"][-1]
+    assert query.query == " ".join(f"word{i}" for i in range(12))
+    assert query.providers == ["web", "arxiv"]
+
+
 def test_no_unique_queries_goes_to_writer_without_an_empty_search_round():
     state = followup_state()
-    llm = FakeLLM([QueryGeneratorOutput(queries=[
-        GeneratedSearchQuery(query="ORIGINAL SEARCH", purpose="Already tried"),
-    ])])
+    llm = FakeLLM([query_output({"root": ["ORIGINAL SEARCH"]})])
     update = asyncio.run(research_query_generator_node(state, llm_service=llm, settings=settings()))
     state.update(update)
     assert route_after_planning(state) == "write_report"
@@ -313,7 +343,7 @@ def test_query_generation_skips_expired_jobs():
     assert result["research"]["search_queries"] == state["research"]["search_queries"]
 
 
-def test_query_timeout_preserves_accepted_queries_and_stops_remaining_tasks():
+def test_query_timeout_stops_the_round_without_new_queries():
     state = followup_state()
     state["allowed_sources"].append(ResearchSource.DOCUMENTS)
     state["research"]["active_subquestions"] = [SubQuestion(
@@ -327,53 +357,58 @@ def test_query_timeout_preserves_accepted_queries_and_stops_remaining_tasks():
 
         async def invoke_structured(self, **kwargs):
             self.calls.append(kwargs)
-            if len(self.calls) > 1:
-                raise TimeoutError
-            return QueryGeneratorOutput(queries=[GeneratedSearchQuery(
-                query="accepted before timeout", purpose="Find evidence.",
-            )])
+            raise TimeoutError
 
     llm = TimeoutLLM()
     result = asyncio.run(research_query_generator_node(state, llm_service=llm, settings=settings()))
-    assert len(llm.calls) == 2
-    assert all(call["metadata"].contains_private_data for call in llm.calls)
+    assert len(llm.calls) == 1
+    assert llm.calls[0]["metadata"].contains_private_data
     assert result["research"]["stop_reason"] == ResearchStopReason.TIME_BUDGET_EXHAUSTED
-    assert [query.query for query in result["research"]["search_queries"]] == [
-        "original search", "accepted before timeout",
-    ]
+    assert [query.query for query in result["research"]["search_queries"]] == ["original search"]
     assert result["research_control"].last_decision.action == "write_report"
 
 
-def test_failed_task_does_not_block_later_task_or_accept_invalid_queries():
+def test_failed_generation_falls_back_to_subquestion_text():
     state = followup_state()
     state["research"]["active_subquestions"] = [SubQuestion(
         id=f"task-{i}", question=f"Question {i}?", objective="Find evidence.",
     ) for i in range(2)]
 
-    class RecoveringLLM:
-        def __init__(self):
-            self.calls = 0
-
+    class FailingLLM:
         async def invoke_structured(self, **kwargs):
-            self.calls += 1
-            if self.calls == 1:
-                raise LLMServiceError(role=LLMRole.QUERY_GENERATOR, message="Provider unavailable.")
-            return QueryGeneratorOutput(queries=[GeneratedSearchQuery(query=query, purpose=purpose)
-                for query, purpose in [
-                    (" ", "Find evidence"), ("blank purpose", " "), ("x" * 50, "Find evidence"),
-                    (" ORIGINAL   SEARCH ", "Already attempted"), ("valid search", "Find evidence"),
-                ]])
+            raise LLMServiceError(role=LLMRole.QUERY_GENERATOR, message="Provider unavailable.")
 
-    llm = RecoveringLLM()
+    result = asyncio.run(research_query_generator_node(state, llm_service=FailingLLM(), settings=settings()))
+    assert [query.query for query in result["research"]["search_queries"][1:]] == ["Question 0?", "Question 1?"]
+    assert result["research"]["stop_reason"] is None
+    assert len(result["errors"]) == 1 and result["errors"][0].recoverable
+
+
+def test_invalid_queries_are_rejected_and_skipped_tasks_get_a_fallback():
+    state = followup_state()
+    state["research"]["active_subquestions"] = [SubQuestion(
+        id=f"task-{i}", question=f"Question {i}?", objective="Find evidence.",
+    ) for i in range(2)]
+    llm = FakeLLM([QueryGeneratorOutput(subquestions=[
+        SubquestionSearchQueries(subquestion_id="task-1", queries=[
+            GeneratedSearchQuery(query=query, purpose=purpose) for query, purpose in [
+                (" ", "Find evidence"), ("blank purpose", " "), ("x" * 50, "Find evidence"),
+                (" ORIGINAL   SEARCH ", "Already attempted"), ("valid search", "Find evidence"),
+            ]
+        ]),
+        SubquestionSearchQueries(subquestion_id="unknown", queries=[
+            GeneratedSearchQuery(query="invented task", purpose="Find evidence"),
+        ]),
+    ])])
     result = asyncio.run(research_query_generator_node(
         state, llm_service=llm, settings=settings(max_search_query_chars=20),
     ))
-    assert llm.calls == 2
-    assert result["research"]["search_queries"][-1].query == "valid search"
-    assert result["research"]["search_queries"][-1].subquestion_id == "task-1"
-    assert len(result["research"]["search_queries"]) == 2
+    queries = result["research"]["search_queries"][1:]
+    assert [(query.subquestion_id, query.query) for query in queries] == [
+        ("task-0", "Question 0?"), ("task-1", "valid search"),
+    ]
     assert result["research"]["stop_reason"] is None
-    assert len(result["errors"]) == 1 and result["errors"][0].recoverable
+    assert result["errors"] == []
 
 
 def test_multiquery_retrieval_searches_independently_and_merges_once():
@@ -391,7 +426,7 @@ def test_multiquery_retrieval_searches_independently_and_merges_once():
 
         def search(self, query, top_k):
             self.calls.append(query)
-            return {"intent A": [common, first], "intent B": [second, common]}[query]
+            return {"Compare both facets.": [], "intent A": [common, first], "intent B": [second, common]}[query]
 
     retriever = Retriever()
     session = RetrievalSession(
@@ -402,7 +437,8 @@ def test_multiquery_retrieval_searches_independently_and_merges_once():
         subquestion_id="followup", research_question="Explain the system.",
         subquestion="Compare both facets.", search_queries=["intent A", "intent B", "intent A"],
     ))
-    assert retriever.calls == ["intent A", "intent B"]
+    # The subquestion always leads as its own retrieval intent.
+    assert retriever.calls == ["Compare both facets.", "intent A", "intent B"]
     assert [item.chunk.chunk_id for item in result.chunks] == ["common", "second", "first"]
     assert result.subquestion_id == "followup"
     assert result.estimated_tokens <= 2000
@@ -428,9 +464,10 @@ def test_real_graph_replans_twice_and_accumulates_evidence_under_original_object
                     objective=f"Measure missing outcome {iteration}.",
                 )])
             if role == LLMRole.QUERY_GENERATOR:
-                return QueryGeneratorOutput(queries=[GeneratedSearchQuery(
-                    query=f"measured outcome {iteration}", purpose="Find direct evidence.",
-                )])
+                return query_output({
+                    subquestion_id: [f"measured outcome {iteration}"]
+                    for subquestion_id in prompt_subquestion_ids(messages)
+                })
             if role == LLMRole.EVIDENCE_EXTRACTOR:
                 return EvidenceExtractionOutput(evidence=[EvidenceCandidate(
                     chunk_id=f"chunk-{iteration}", relevance_score=0.9,
@@ -444,6 +481,7 @@ def test_real_graph_replans_twice_and_accumulates_evidence_under_original_object
                 status=CoverageStatus.SUFFICIENT if supported else CoverageStatus.INSUFFICIENT,
                 gaps=[] if supported else [CoverageGap(
                     subquestion_id=objective["subquestion_id"], description=f"Missing outcome {iteration + 1}.",
+                    blocking=True,
                 )],
                 assessments=[SubquestionCoverage(
                     subquestion_id=objective["subquestion_id"],

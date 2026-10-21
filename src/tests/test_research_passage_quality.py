@@ -89,11 +89,14 @@ def test_prompts_prioritize_explicit_facets_and_followup_needs_without_topic_har
                                      max_subquestions=5, current_date="2026-10-20")[0].content
     task = SubQuestion(id="followup", parent_subquestion_id="root", question="Unresolved costs?",
                        objective="Find operating and migration costs")
-    messages = build_query_generator_messages(original_question="Compare databases", subquestion=task,
-                                              max_queries=3, previous_queries=["earlier search"], current_date="2026-10-20")
+    messages = build_query_generator_messages(original_question="Compare databases", subquestions=[task],
+                                              max_queries=3, max_query_words=12, previous_queries=["earlier search"],
+                                              current_date="2026-10-20")
     assert "independent part explicitly requested" in planner
     assert "different sources" in planner
-    assert "central evidence needs" in messages[0].content
-    assert "Follow-up on unresolved gaps" in messages[1].content
-    assert "rather than an entire" in messages[0].content
+    assert "themes the user did not ask for" in planner
+    assert "specific facts, numbers, or recommendations" in messages[0].content
+    assert "at most 12 words" in messages[0].content
+    assert "follow-up on unresolved gaps" in messages[1].content
+    assert '"subquestion_id": "followup"' in messages[1].content
     assert "muscle" not in planner.lower() + messages[0].content.lower()

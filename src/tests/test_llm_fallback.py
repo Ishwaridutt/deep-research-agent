@@ -234,3 +234,21 @@ def test_model_chain_skips_provider_that_cannot_initialize(monkeypatch):
     )
 
     assert [entry.provider for entry in chain] == ["google_genai", "groq"]
+
+
+def test_model_not_found_falls_back_and_logs_the_configured_model(caplog):
+    class ModelNotFound(Exception):
+        status_code = 404
+        body = {"error": {"code": "model_not_found", "type": "invalid_request_error"}}
+
+    openai = FakeModel(ModelNotFound("The model does not exist"))
+    openai.model_name = "gpt-typo"
+    groq = FakeModel(EvidenceExtractionOutput(evidence=[]))
+    service = _service(("openai", openai), ("groq", groq))
+
+    result = asyncio.run(_invoke(service, _metadata()))
+
+    assert result == EvidenceExtractionOutput(evidence=[])
+    assert groq.calls == 1
+    failure = next(record for record in caplog.records if getattr(record, "event", "") == "llm_provider_failed")
+    assert failure.model == "gpt-typo"

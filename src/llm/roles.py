@@ -17,5 +17,7 @@ class LLMRole(str, Enum):
     COVERAGE_EVALUATOR = "coverage_evaluator"
     WRITER = "writer"
     CITATION_CHECKER = "citation_checker"
+    CRITIC = "critic"
+    INPUT_GUARDRAIL = "input_guardrail"
 
     

@@ -117,15 +117,43 @@ def test_missing_peripheral_objective_does_not_automatically_block_a_grounded_co
 
 def test_material_gap_preserves_the_planner_retry_route():
     state = initial_state()
-    gap = CoverageGap(subquestion_id="SQ-1", description="The central mechanism remains unexplained.")
+    gap = CoverageGap(subquestion_id="SQ-1", description="The central mechanism remains unexplained.", blocking=True)
+    limitation = CoverageGap(subquestion_id="SQ-1", description="Long-term data is limited.")
     state["research"]["coverage"] = normalize(state, CoverageResult(
-        status="insufficient", assessments=[assessment(status="partial")], gaps=[gap],
+        status="insufficient", assessments=[assessment(status="partial")], gaps=[gap, limitation],
     ))
     state["research"]["iteration_count"] = 1
 
     assert route(state) == "continue_research"
+    # Only blocking gaps drive follow-up planning.
     assert state["research_control"].pending_gaps == [gap]
     assert state["research"]["stop_reason"] is None
+
+
+def test_non_blocking_gaps_stop_research_even_when_the_model_says_insufficient():
+    state = initial_state()
+    limitation = CoverageGap(subquestion_id="SQ-1", description="Report limitation: optimal value is uncertain.", priority=3)
+    state["research"]["coverage"] = normalize(state, CoverageResult(
+        status="insufficient", assessments=[assessment(status="partial")], gaps=[limitation],
+    ))
+    state["research"]["iteration_count"] = 1
+
+    assert state["research"]["coverage"].status == CoverageStatus.SUFFICIENT
+    assert state["research"]["coverage"].gaps == [limitation]
+    assert route(state) == "write_report"
+    assert state["research"]["stop_reason"] == ResearchStopReason.COVERAGE_SUFFICIENT
+
+
+def test_requested_part_without_evidence_or_judgment_becomes_a_blocking_gap():
+    state = initial_state()
+    state["research"]["subquestions"].append(SubQuestion(
+        id="SQ-2", question="What fat intake is recommended?", objective="Find fat intake ranges.",
+    ))
+    result = normalize(state, CoverageResult(
+        status="sufficient", assessments=[assessment(), assessment("SQ-2", "missing", [])],
+    ))
+    assert result.status == CoverageStatus.INSUFFICIENT
+    assert [(gap.subquestion_id, gap.blocking) for gap in result.gaps] == [("SQ-2", True)]
 
 
 def test_minor_gaps_stop_after_one_round_and_reach_the_writer_without_spending_the_budget():
@@ -162,7 +190,9 @@ def test_supported_assessment_requires_valid_references_for_its_own_objective(id
     }))
     result = normalize(state, CoverageResult(status="sufficient", assessments=[assessment(ids=ids)]))
 
-    assert result.status == CoverageStatus.INSUFFICIENT
+    # Readiness needs at least one valid reference; invalid ones only downgrade the assessment.
+    expected = CoverageStatus.SUFFICIENT if "EV-1" in ids else CoverageStatus.INSUFFICIENT
+    assert result.status == expected
     assert result.assessments[0].status == SubquestionCoverageStatus.PARTIAL
     assert set(result.assessments[0].evidence_ids).issubset({"EV-1"})
     assert not result.gaps  # Reference defects are not invented research questions.
@@ -199,13 +229,14 @@ def test_no_evidence_skips_llm_and_retains_missing_objective_gaps():
 def test_unsupported_overall_judgment_does_not_manufacture_a_gap_to_spend_more_budget():
     state = initial_state()
     result = normalize(state, CoverageResult(status="insufficient", assessments=[assessment()]))
-    assert result.status == CoverageStatus.INSUFFICIENT
+    # Without a blocking gap the model's "insufficient" label does not trigger more research.
+    assert result.status == CoverageStatus.SUFFICIENT
     assert result.assessments[0].status == SubquestionCoverageStatus.SUPPORTED
     assert not result.gaps
     state["research"]["coverage"] = result
     state["research"]["iteration_count"] = 1
     assert route(state) == "write_report"
-    assert state["research"]["stop_reason"] == ResearchStopReason.NO_ACTIONABLE_GAPS
+    assert state["research"]["stop_reason"] == ResearchStopReason.COVERAGE_SUFFICIENT
 
 
 def test_invalid_or_duplicate_gaps_are_filtered_without_forcing_partial_status():
@@ -227,7 +258,7 @@ def test_failed_reference_validation_logs_rejected_readiness(caplog):
     service = FakeLLM(CoverageResult(status="sufficient", assessments=[assessment(ids=["invented"])]))
     result = asyncio.run(research_coverage_evaluator_node(initial_state(), llm_service=service))
     assert result["research"]["coverage"].status == CoverageStatus.INSUFFICIENT
-    record = next(item for item in caplog.records if getattr(item, "event", "") == "coverage_readiness_rejected")
+    record = next(item for item in caplog.records if getattr(item, "event", "") == "coverage_status_overridden")
     assert record.job_id == "job-1"
     assert record.iteration == 1
 

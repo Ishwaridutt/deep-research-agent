@@ -136,6 +136,10 @@ def _render_dict_report(
     if content:
         sections.append(str(content).strip())
 
+    unverified = _render_unverified_material(report.get("unverified_material") or [])
+    if unverified:
+        sections.append(unverified)
+
     sources = report.get("sources")
 
     if sources:
@@ -151,6 +155,37 @@ def _render_dict_report(
         return "\n\n".join(sections).strip()
 
     return str(report).strip()
+
+
+def _render_unverified_material(items: list[Any]) -> str:
+    """Render draft content that citation checking could not verify, clearly labelled."""
+
+    blocks: list[str] = []
+    for item in items:
+        if hasattr(item, "model_dump"):
+            item = item.model_dump()
+        if not isinstance(item, dict) or not str(item.get("content") or "").strip():
+            continue
+        links = []
+        for source in item.get("sources") or []:
+            if hasattr(source, "model_dump"):
+                source = source.model_dump()
+            title = str(source.get("title") or "Source").strip()
+            uri = str(source.get("uri") or "")
+            links.append(f"[{title}]({uri})" if uri.startswith(("http://", "https://")) else title)
+        block = f"### {item.get('title') or 'Unverified statement'}\n\n{str(item['content']).strip()}"
+        if links:
+            block += "\n\nPossible sources: " + "; ".join(links)
+        blocks.append(block)
+
+    if not blocks:
+        return ""
+    return (
+        "## Additional material (not citation-verified)\n\n"
+        "_These statements could not be verified against their cited evidence. "
+        "They may still be useful; check the linked sources before relying on them._\n\n"
+        + "\n\n".join(blocks)
+    )
 
 
 def _render_research_approach(

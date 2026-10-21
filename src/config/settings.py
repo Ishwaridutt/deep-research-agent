@@ -57,6 +57,10 @@ class LLMSettings(EnvironmentSettings):
     coverage_model: str = Field(min_length=1)
     writer_model: str = Field(min_length=1)
     citation_model: str = Field(min_length=1)
+    # Optional so existing .env files keep working: the critic falls back to the
+    # citation model and the input guardrail to the query generator model.
+    critic_model: str | None = None
+    guardrail_model: str | None = None
 
     llm_timeout_seconds: int = Field(default=60, ge=1)
 
@@ -96,12 +100,6 @@ class SearchSettings(EnvironmentSettings):
         ge=1,
     )
 
-    min_provider_score: float = Field(
-        default=0.7,
-        ge=0.0,
-        le=1.0,
-    )
-
     tavily_extract_depth: Literal[
         "basic",
         "advanced",
@@ -135,6 +133,8 @@ class SearchSettings(EnvironmentSettings):
     arxiv_max_pdf_pages: int = Field(default=20, ge=1)
 
     search_max_concurrency: int = Field(default=3, ge=1)
+    # Bounded parallel page extraction inside one research round.
+    extraction_max_concurrency: int = Field(default=5, ge=1)
     web_results_per_query: int = Field(default=5, ge=1)
     arxiv_results_per_query: int = Field(default=3, ge=1)
     wikipedia_results_per_query: int = Field(default=3, ge=1)
@@ -175,12 +175,12 @@ class RetrievalSettings(EnvironmentSettings):
     # Each retriever can consider more candidates than are ultimately
     # passed to the context builder.
     candidate_k: int = Field(
-        default=20,
+        default=30,
         ge=1,
     )
 
     top_k: int = Field(
-        default=8,
+        default=12,
         ge=1,
     )
 
@@ -205,13 +205,15 @@ class RetrievalSettings(EnvironmentSettings):
         min_length=1,
     )
 
+    # A larger pool lets the LLM evidence scorer do the filtering.
     max_context_tokens: int = Field(
-        default=3_000,
+        default=24_000,
         ge=1,
     )
 
+    # Generous so top_k, not the per-source cap, decides what reaches the scorer.
     max_chunks_per_document: int = Field(
-        default=3,
+        default=8,
         ge=1,
     )
 
@@ -239,6 +241,12 @@ class ResearchLimitSettings(EnvironmentSettings):
         ge=1,
     )
 
+    # Short natural queries work better for search engines and retrieval.
+    max_search_query_words: int = Field(
+        default=12,
+        ge=1,
+    )
+
     max_total_queries_per_job: int = Field(
         default=30,
         ge=1,
@@ -251,6 +259,12 @@ class ResearchLimitSettings(EnvironmentSettings):
 
     # Allow broader first-round collection without increasing the job-wide cap.
     max_extracted_pages_per_round: int = Field(default=30, ge=1)
+
+    # Pre-extraction relevance gate: cosine similarity between a candidate's
+    # title + snippet and the subquestion. Calibrate from the gate logs.
+    search_relevance_threshold: float = Field(default=0.50, ge=0.0, le=1.0)
+    # Keep the best candidates of a subquestion even when all fall below the gate.
+    search_relevance_min_keep: int = Field(default=2, ge=0)
 
     # Reserved for extraction providers where our application controls
     # the raw HTTP download. Tavily performs the remote fetch in Phase 1.
@@ -287,20 +301,8 @@ class ResearchLimitSettings(EnvironmentSettings):
         ge=1,
     )
 
-
-class WriterSettings(EnvironmentSettings):
-    """Context limits used when preparing evidence for the Writer Agent."""
-
-    # Maximum amount of accepted research evidence passed to one synthesis call.
-    max_writer_evidence_items: int = Field(
-        default=40,
-        ge=1,
-    )
-
-    max_writer_evidence_chars: int = Field(
-        default=30_000,
-        ge=1_000,
-    )
+    # LLM intent classifier in the input guardrail (deterministic checks always run).
+    input_classifier_enabled: bool = True
 
 
 class DocumentSettings(EnvironmentSettings):
@@ -384,7 +386,6 @@ class Settings(BaseModel):
     search: SearchSettings
     retrieval: RetrievalSettings
     research_limits: ResearchLimitSettings
-    writer: WriterSettings
     documents: DocumentSettings
     upload_limits: UploadLimitSettings
     voice_limits: VoiceLimitSettings
@@ -401,7 +402,6 @@ def get_settings() -> Settings:
         search=SearchSettings(),
         retrieval=RetrievalSettings(),
         research_limits=ResearchLimitSettings(),
-        writer=WriterSettings(),
         documents=DocumentSettings(),
         upload_limits=UploadLimitSettings(),
         voice_limits=VoiceLimitSettings(),

@@ -247,3 +247,26 @@ def test_blank_or_unknown_task_chunks_skip_calls_and_empty_scores_do_not_default
     result = score_state(state_with_chunks(chunk("unscored")), FakeScorer(scores()))
     assert not result["research"]["evidence"]
     assert result["errors"][0].recoverable
+
+
+def test_subquestions_are_scored_concurrently_and_applied_in_plan_order():
+    state = state_with_chunks(chunk("a"))
+    state["research"]["subquestions"].append(SubQuestion(
+        id="SQ-2", question="What are the costs?", objective="Assess costs.",
+    ))
+    state["research"]["web_retrieval_results"].append(retrieval([chunk("b")], subquestion_id="SQ-2"))
+    tracker = {"active": 0, "max_active": 0}
+
+    class SlowScorer:
+        async def invoke_structured(self, *, messages, **kwargs):
+            tracker["active"] += 1
+            tracker["max_active"] = max(tracker["max_active"], tracker["active"])
+            # The first subquestion finishes last; results must still follow plan order.
+            await asyncio.sleep(0.03 if '"chunk_id": "a"' in messages[1].content else 0.0)
+            tracker["active"] -= 1
+            identifier = "a" if '"chunk_id": "a"' in messages[1].content else "b"
+            return scores((identifier, 0.9))
+
+    result = score_state(state, SlowScorer())
+    assert tracker["max_active"] == 2
+    assert [item.chunk_id for item in result["research"]["evidence"]] == ["a", "b"]

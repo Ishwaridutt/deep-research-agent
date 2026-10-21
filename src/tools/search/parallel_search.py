@@ -2,7 +2,6 @@
 
 import asyncio
 import re
-from itertools import zip_longest
 from urllib.parse import unquote, urlsplit
 
 from src.guardrails import url_dedup_key
@@ -11,13 +10,11 @@ from src.tools.search.base import SearchProvider, SearchProviderError
 
 
 _ARXIV_VERSION = re.compile(r"v\d+$", re.IGNORECASE)
-_TOKEN = re.compile(r"[a-z0-9]{2,}")
-_YEAR = re.compile(r"\b(?:19|20)\d{2}\b")
-_SEARCH_STOPWORDS = {
-    "about", "after", "and", "before", "for", "from", "how", "into",
-    "latest", "of", "on", "or", "the", "to", "what", "when", "which",
-    "who", "why", "with",
-}
+_TITLE_PREFIX = re.compile(r"^\s*(?:\[pdf\]\s*|title:\s*)+", re.IGNORECASE)
+_TITLE_WORD = re.compile(r"[^\W_]+")
+_MIN_TITLE_WORDS = 6
+# Index pages that usually show only an abstract when a full-text copy exists elsewhere.
+_ABSTRACT_ONLY_HOSTS = {"pubmed.ncbi.nlm.nih.gov"}
 
 
 class SearchResults(list[SearchResult]):
@@ -48,8 +45,19 @@ class ParallelSearchProvider(SearchProvider):
         search_query: SearchQuery,
         max_results: int,
     ) -> list[SearchResult]:
-        # Each branch keeps its own ranking and result cap; the semaphore limits
-        # total outbound searches without forcing the providers to run sequentially.
+        # General web search always runs; arXiv and Wikipedia run only when the
+        # query generator requested them for this query.
+        requested = {"web", *getattr(search_query, "providers", ["web"])}
+        branches = [branch for branch in self._branches if branch[0] in requested]
+        skipped = sorted(requested - {name for name, _, _ in branches})
+        if skipped:
+            print(f"\nrequested search branches are not enabled (skipped): {skipped}")
+        if not branches:
+            return SearchResults([], {"provider_counts": {}, "successful_branches": [],
+                                      "failed_branches": [], "web_fallback_activated": False})
+
+        # Each branch keeps its own result cap; the semaphore limits total
+        # outbound searches without forcing the providers to run sequentially.
         outcomes = await asyncio.gather(*(
             self._search_branch(
                 name=name,
@@ -57,7 +65,7 @@ class ParallelSearchProvider(SearchProvider):
                 search_query=search_query,
                 max_results=min(limit, max_results),
             )
-            for name, provider, limit in self._branches
+            for name, provider, limit in branches
         ))
 
         # A failed provider must not discard useful results returned by the others.
@@ -73,8 +81,9 @@ class ParallelSearchProvider(SearchProvider):
                 f"'{search_query.id}': {', '.join(failures)}."
             )
 
-        deduplicated = deduplicate_search_results(results)
-        selected = rank_search_results(deduplicated, search_query.query)[:max_results]
+        # Ranking happens later in the source processor's relevance gate, which
+        # compares every candidate on one embedding scale regardless of provider.
+        selected = deduplicate_search_results(results)
         successful_branches = [
             name for name, _, error in outcomes if error is None
         ]
@@ -175,83 +184,13 @@ def deduplicate_search_results(
     return [_merge_group(group_results) for _, group_results in groups]
 
 
-def rank_search_results(
-    results: list[SearchResult], query: str, *, provider_offset: int | None = None,
-) -> list[SearchResult]:
-    """Interleave provider buckets ranked by the same query-fit signals."""
-    tokens = _search_tokens(query)
-    # Diversity is a tie-breaking opportunity, not an obligation to promote a
-    # provider's zero-overlap result. Keep those as fallback, not forced slots.
-    eligible = [result for result in results if not tokens or tokens & _search_tokens(
-        f"{result.title} {result.snippet or ''}"
-    )]
-    deferred = [result for result in results if result not in eligible]
-    if not eligible:
-        eligible, deferred = results, []
-    buckets: dict[SourceProvider, list[SearchResult]] = {}
-    for result in sorted(eligible, key=lambda item: _result_rank(item, query), reverse=True):
-        buckets.setdefault(result.provider, []).append(result)
-    # Extraction rotates a stable provider cycle, independent of which provider
-    # has the highest text score on each individual query.
-    groups = (list(buckets.values()) if provider_offset is None
-              else [buckets[provider] for provider in SourceProvider if provider in buckets])
-    if not groups:
-        return []
-    # Rotate the first provider across extraction intents so a small page budget
-    # does not always spend each query's first opportunity on the same provider.
-    offset = (provider_offset or 0) % len(groups)
-    groups = groups[offset:] + groups[:offset]
-    return [item for row in zip_longest(*groups) for item in row if item is not None] + deferred
-
-
-def _result_rank(result: SearchResult, query: str) -> tuple[float, int]:
-    """Use shared text/date signals, never incomparable raw provider scores."""
-    # break query in tokens
-    query_tokens = _search_tokens(query)
-    # Calculate how much of the query appears in the title
-    title_overlap = _overlap(query_tokens, _search_tokens(result.title))
-    # Calculate the same overlap for the snippet
-    snippet_overlap = _overlap(query_tokens, _search_tokens(result.snippet or ""))
-    provenance = result.provider_metadata.get("discovery_provenance", [])
-    # Give a small preference to a source encountered through multiple discoveries.
-    provenance_count = len(provenance)
-    # check for year match if present in query
-    query_years = set(_YEAR.findall(query))
-    source_dates = " ".join(str(result.provider_metadata.get(key) or "") for key in (
-        "published_at", "updated_at", "last_edited_at",
-    ))
-    temporal_match = 0.3 if query_years & set(_YEAR.findall(source_dates)) else 0.0
-    combined = (
-        (3.0 * title_overlap)
-        + (1.5 * snippet_overlap)
-        + (0.25 * min(max(provenance_count - 1, 0), 2))
-        + temporal_match
-    )
-    return combined, provenance_count
-
-
-def _search_tokens(value: str) -> set[str]:
-    # Removes words in your configured stopword list
-    # Returns a set, so repeated words appear only once.
-    return {
-        token for token in _TOKEN.findall(value.casefold())
-        if token not in _SEARCH_STOPWORDS
-    }
-
-
-def _overlap(expected: set[str], actual: set[str]) -> float:
-    if not expected:
-        return 0.0
-    return len(expected & actual) / len(expected)
-
-
 def _merge_group(results: list[SearchResult]) -> SearchResult:
     native_providers = {SourceProvider.ARXIV, SourceProvider.WIKIPEDIA}
 
     # Native results carry the IDs and metadata required by their native extractors.
     representative = next(
         (result for result in results if result.provider in native_providers),
-        results[0],
+        preferred_full_text_result(results),
     )
     provenance = [
         {
@@ -267,6 +206,14 @@ def _merge_group(results: list[SearchResult]) -> SearchResult:
         "discovery_provenance": provenance,
     }
     return representative.model_copy(update={"provider_metadata": metadata})
+
+
+def preferred_full_text_result(results: list[SearchResult]) -> SearchResult:
+    """Prefer a full-text copy over an abstract-only index page of the same work."""
+    return next(
+        (result for result in results if urlsplit(result.url).hostname not in _ABSTRACT_ONLY_HOSTS),
+        results[0],
+    )
 
 
 def _identity_keys(result: SearchResult) -> set[str]:
@@ -293,11 +240,40 @@ def _identity_keys(result: SearchResult) -> set[str]:
     if wikipedia_title:
         keys.add(f"wikipedia-title:{wikipedia_title}")
 
+    # The same article often appears on several hosts (PubMed abstract, PMC full
+    # text, publisher page) with no shared URL or DOI in the search result.
+    title_key = title_identity_key(result.title)
+    if title_key:
+        keys.add(title_key)
+
     try:
         keys.add(f"url:{url_dedup_key(result.url)}")
     except ValueError:
         pass
     return keys
+
+
+def title_identity_key(title: str) -> str | None:
+    """
+    Normalize a specific title into a cross-host identity key.
+
+    Site suffixes ("- PMC", "| Springer Nature Link") and prefixes ("[PDF]",
+    "Title:") are removed. Short or truncated titles return None because they
+    are not specific enough to prove two pages are the same work.
+    """
+    text = title.strip()
+    if not text or "..." in text or "\u2026" in text:
+        return None
+    text = _TITLE_PREFIX.sub("", text)
+    text = text.split(" | ")[0]
+    if " - " in text:
+        head = text.rsplit(" - ", 1)[0]
+        if len(_TITLE_WORD.findall(head)) >= _MIN_TITLE_WORDS:
+            text = head
+    words = _TITLE_WORD.findall(text.casefold())
+    if len(words) < _MIN_TITLE_WORDS:
+        return None
+    return "title:" + " ".join(words)
 
 
 def _normalize_doi(value: str) -> str:

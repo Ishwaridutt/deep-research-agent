@@ -126,6 +126,8 @@ def create_llm_service(settings: Settings) -> LLMService:
         LLMRole.COVERAGE_EVALUATOR: settings.llm.coverage_model,
         LLMRole.WRITER: settings.llm.writer_model,
         LLMRole.CITATION_CHECKER: settings.llm.citation_model,
+        LLMRole.CRITIC: settings.llm.critic_model or settings.llm.citation_model,
+        LLMRole.INPUT_GUARDRAIL: settings.llm.guardrail_model or settings.llm.query_generator_model,
     }
 
     provider_order = _provider_names(

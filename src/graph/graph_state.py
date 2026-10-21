@@ -5,6 +5,7 @@ from typing import TypedDict
 from src.models import (
     CitationCheckResult,
     CoverageResult,
+    CriticReview,
     DraftReport,
     Evidence,
     ResearchError,
@@ -41,6 +42,8 @@ class ResearchAgentState(TypedDict):
     planning_history: list[SubQuestion]
     search_queries: list[SearchQuery]
     search_results: list[SearchResult]
+    # Gate-approved candidates that missed the round page budget; retried next round.
+    deferred_search_result_ids: list[str]
     sources: list[Source]
     web_retrieval_results: list[RetrievalResult]
     document_retrieval_results: list[RetrievalResult]
@@ -68,8 +71,13 @@ class WriterAgentState(TypedDict):
 
     evidence_ids: list[str]
     source_stats: dict[str, int]
+    # Per-subquestion evidence counts shown in writer progress details.
+    evidence_summary: list[dict]
 
     draft_report: DraftReport | None
+    # The critic reviews the first draft once; at most one revision follows.
+    critic_review: CriticReview | None
+    revision_count: int
     citation_result: CitationCheckResult | None
     final_report: ResearchReport | None
 
@@ -143,6 +151,7 @@ def create_initial_workflow_state(
             planning_history=[],
             search_queries=[],
             search_results=[],
+            deferred_search_result_ids=[],
             sources=[],
             web_retrieval_results=[],
             document_retrieval_results=[],
@@ -162,7 +171,10 @@ def create_initial_workflow_state(
         writer=WriterAgentState(
             evidence_ids=[],
             source_stats={},
+            evidence_summary=[],
             draft_report=None,
+            critic_review=None,
+            revision_count=0,
             citation_result=None,
             final_report=None,
         ),

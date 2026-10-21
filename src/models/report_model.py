@@ -1,6 +1,6 @@
 """Structured writer, citation, and final report models."""
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -89,6 +89,31 @@ class SemanticFindingCheck(BaseModel):
     finding_index: int = Field(ge=0)
     supported: bool
     reason: str | None
+    unsupported_sentences: list[str] = Field(
+        default_factory=list,
+        description=(
+            "When a finding is only partly supported, the unsupported sentences copied verbatim. "
+            "Empty when the finding is fully supported or entirely unsupported."
+        ),
+    )
+
+
+class CriticIssue(BaseModel):
+    """One problem the critic wants the writer to fix."""
+
+    finding_index: int | None = Field(
+        default=None,
+        description="Index of the affected finding; null for the executive summary or the whole report.",
+    )
+    issue_type: Literal["unsupported_claim", "missing_requested_part", "contradiction", "unclear"]
+    instruction: str = Field(min_length=1, description="Specific fix for the writer.")
+
+
+class CriticReview(BaseModel):
+    """Critic verdict on a draft report: approve it or request one revision."""
+
+    verdict: Literal["approve", "revise"]
+    issues: list[CriticIssue] = Field(default_factory=list)
 
 
 class SemanticCitationCheckOutput(BaseModel):
@@ -110,6 +135,14 @@ class ReportSource(BaseModel):
     locations: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class UnverifiedMaterial(BaseModel):
+    """Draft content whose claims citation checking could not verify, kept for reader judgment."""
+
+    title: str = Field(min_length=1)
+    content: str = Field(min_length=1)
+    sources: list[ReportSource] = Field(default_factory=list)
+
+
 class ResearchReport(BaseModel):
     """Validated final report returned by the research application."""
 
@@ -118,5 +151,7 @@ class ResearchReport(BaseModel):
     findings: list[FinalReportFinding] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
     sources: list[ReportSource] = Field(default_factory=list)
+    # Not citation-verified; rendered in a separate, clearly labelled section.
+    unverified_material: list[UnverifiedMaterial] = Field(default_factory=list)
     markdown: str = ""
 

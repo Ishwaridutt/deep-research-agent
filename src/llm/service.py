@@ -82,6 +82,12 @@ def _provider_error_body(exc: Exception) -> dict:
     return provider_error if isinstance(provider_error, dict) else {}
 
 
+def _model_name(model: BaseChatModel) -> str | None:
+    """Configured model name for logs (not a secret), so a misconfigured value is visible."""
+    name = getattr(model, "model_name", None) or getattr(model, "model", None)
+    return str(name) if name else None
+
+
 def _is_retryable_output_error(exc: Exception) -> bool:
     """Retry malformed structured output, not provider or quota failures."""
 
@@ -132,12 +138,17 @@ def _provider_fallback_allowed(exc: Exception) -> bool:
     if _is_retryable_output_error(exc):
         return True
 
+    # A model name one provider does not serve is a configuration problem for
+    # that provider only; the next provider in the chain may still work.
+    if _provider_error_body(exc).get("code") == "model_not_found":
+        return True
+
     response = getattr(exc, "response", None)
     status = getattr(response, "status_code", None) or getattr(exc, "status_code", None)
     try:
         if status is not None:
             status = int(status)
-            return status in {401, 403, 408, 409, 429} or status >= 500
+            return status in {401, 403, 404, 408, 409, 429} or status >= 500
     except (TypeError, ValueError):
         pass
 
@@ -450,6 +461,7 @@ class LLMService:
                             "role": role.value,
                             "schema": output_schema.__name__,
                             "provider": provider_model.provider,
+                            "model": _model_name(provider_model.model),
                             "attempt": attempt,
                             "max_attempts": self._structured_output_attempts,
                             "failure_type": reason,

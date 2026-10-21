@@ -101,7 +101,7 @@ def test_log_and_event_search_counts_match_for_the_same_job_and_round(caplog):
             return SearchResults([], {"provider_counts": {"tavily": 5, "arxiv": 3, "wikipedia": next(self.wiki_counts)}})
 
     settings = SimpleNamespace(research_limits=SimpleNamespace(max_total_queries_per_job=30, max_search_results_per_query=5),
-                               search=SimpleNamespace(min_provider_score=0.7))
+                               search=SimpleNamespace())
     caplog.set_level(logging.INFO)
     for job, round_number, wiki_counts, expected in [
         ("new-job", 1, [1] * 12, {"tavily": 60, "arxiv": 36, "wikipedia": 12}),
@@ -245,7 +245,8 @@ def test_coverage_details_include_per_objective_reasons_and_limits_not_evidence_
     assert details["assessments"][0]["question"] == "What changed?"
     assert details["assessments"][0]["supporting_evidence_count"] == 1
     assert details["assessments"][1]["reason"] == "The minor historical cause is uncertain."
-    assert details["gaps"] == [{"question": "Why did it change?", "description": "Historical context not provided.", "priority": 2}]
+    assert details["gaps"] == [{"question": "Why did it change?", "description": "Historical context not provided.",
+                                "priority": 2, "blocking": False}]
     assert "EV-PRIVATE" not in str(details)
     assert "SECRET" not in str(details)
 
@@ -615,3 +616,46 @@ def test_terminal_node_error_emits_failed_stage_with_safe_reason():
 
     asyncio.run(run())
 
+
+
+def test_writer_stage_details_cover_each_step_and_hide_private_feedback():
+    from src.models import (
+        CitationCheckResult, CitationIssue, CriticIssue, CriticReview, DraftReport,
+        ReportFinding, ResearchReport, UnverifiedMaterial,
+    )
+
+    prepare = _safe_details("writer_prepare_evidence", {"writer": {
+        "evidence_ids": ["EV-1", "EV-2"], "source_stats": {"accepted": 2, "supplied_to_writer": 2},
+        "evidence_summary": [{"question": "What changed?", "evidence_count": 2, "source_count": 1}],
+    }})
+    assert prepare["evidence_count"] == 2
+    assert prepare["evidence_groups"] == [{"question": "What changed?", "evidence_count": 2, "source_count": 1}]
+
+    draft = DraftReport(title="Report", executive_summary="Summary. [EV-1]", findings=[
+        ReportFinding(section="Growth", title="Finding", content="Claim. [EV-1]", evidence_ids=["EV-1"]),
+    ])
+    synthesis = _safe_details("writer_synthesis", {"writer": {
+        "draft_report": draft, "revision_count": 1, "evidence_ids": ["EV-1"],
+    }})
+    assert synthesis["revision"] is True and synthesis["finding_count"] == 1
+    assert synthesis["findings"] == [{"section": "Growth", "title": "Finding", "citation_count": 1}]
+
+    review = CriticReview(verdict="revise", issues=[CriticIssue(
+        finding_index=0, issue_type="unsupported_claim", instruction="Quote from the private file.",
+    )])
+    public = _safe_details("writer_critic", {"writer": {"critic_review": review}})
+    private = _safe_details("writer_critic", {"writer": {"critic_review": review}}, private_sources=True)
+    assert public["issues"][0]["instruction"] == "Quote from the private file."
+    assert "issues" not in private and private["issue_count"] == 1
+
+    report = ResearchReport(executive_summary="Summary.", unverified_material=[
+        UnverifiedMaterial(title="Unverified", content="Claim."),
+    ])
+    citation = _safe_details("writer_citation_checker", {
+        "writer": {"final_report": report, "citation_result": CitationCheckResult(valid=False, issues=[
+            CitationIssue(finding_index=0, description="Claim exceeds evidence."),
+        ])},
+        "errors": [],
+    })
+    assert citation["unverified_item_count"] == 1 and citation["unverified_titles"] == ["Unverified"]
+    assert citation["issues"] == ["Claim exceeds evidence."] and citation["semantic_check_unavailable"] is False

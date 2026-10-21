@@ -40,34 +40,47 @@ class RetrievalHybridRetriever:
         self.vector_store: InMemoryVectorStore | None = None
         self.retriever: EnsembleRetriever | None = None
         self.chunk_lookup: dict[str, RetrievalChunk] = {}
+        self.documents: list[Document] = []
 
     def build(self, chunks: list[RetrievalChunk]) -> None:
         """Builds the session-scoped semantic and BM25 retrievers."""
 
         self.clear()
+        self.add(chunks)
+
+    def add(self, chunks: list[RetrievalChunk]) -> int:
+        """
+        Adds new chunks to the session indexes and returns how many were indexed.
+
+        Only the new chunks are embedded. BM25 and the fused retriever are rebuilt
+        over the whole corpus because BM25 statistics depend on every document.
+        """
 
         # Filter before indexing/top-k so obvious noise cannot consume context
         # slots. Both retrieval branches still search exactly the same corpus.
-        usable_chunks = [chunk for chunk in chunks if not is_public_noise(chunk)]
-        print("Retrieval passage eligibility:", len(usable_chunks), "kept;", len(chunks) - len(usable_chunks), "noise skipped")
+        new_chunks = [chunk for chunk in chunks if chunk.chunk_id not in self.chunk_lookup]
+        usable_chunks = [chunk for chunk in new_chunks if not is_public_noise(chunk)]
+        print("Retrieval passage eligibility:", len(usable_chunks), "kept;", len(new_chunks) - len(usable_chunks), "noise skipped")
         chunks = usable_chunks
 
         if not chunks:
-            return
+            return 0
 
         print('Hybrid retriever building in-memory vector store started...')
         # Convert domain chunks once so both lexical and semantic retrieval operate over the exact same corpus.
         documents = [self._to_langchain_document(chunk) for chunk in chunks]
-        self.chunk_lookup = {chunk.chunk_id: chunk for chunk in chunks}
-        result_count = min(self.candidate_k, len(documents))
+        self.chunk_lookup.update({chunk.chunk_id: chunk for chunk in chunks})
+        self.documents.extend(documents)
+        result_count = min(self.candidate_k, len(self.documents))
 
-        # Build the in-memory dense index using the shared application-scoped embedding model.
-        self.vector_store = InMemoryVectorStore(embedding=self.embeddings)
+        # Extend the in-memory dense index using the shared application-scoped embedding model.
+        if self.vector_store is None:
+            self.vector_store = InMemoryVectorStore(embedding=self.embeddings)
         self.vector_store.add_documents(documents=documents)
         semantic_retriever = self.vector_store.as_retriever(search_kwargs={"k": result_count})
 
-        # Build the sparse BM25 index from the same searchable document representation.
-        bm25_retriever = RetrievalBM25Retriever.from_documents(documents, k=result_count)
+        # Rebuild the sparse BM25 index from the same searchable document representation.
+        bm25_retriever = RetrievalBM25Retriever.from_documents(self.documents, k=result_count)
 
         # LangChain handles weighted Reciprocal Rank Fusion and chunk-level deduplication.
         self.retriever = EnsembleRetriever(
@@ -76,7 +89,8 @@ class RetrievalHybridRetriever:
             c=self.rrf_c,
             id_key="chunk_id",
         )
-        print('Hybrid retriever building in-memory vector store completed...')
+        print(f'Hybrid retriever building in-memory vector store completed... embedded={len(documents)} total={len(self.documents)}')
+        return len(documents)
 
     def search(self, query: str, top_k: int | None = None) -> list[RetrievedChunk]:
         """Returns hybrid-ranked chunks for a query."""
@@ -111,6 +125,7 @@ class RetrievalHybridRetriever:
         self.retriever = None
         self.vector_store = None
         self.chunk_lookup = {}
+        self.documents = []
         print('Hybrid retriever in-memory vector store cleared...')
 
     def _to_langchain_document(self, chunk: RetrievalChunk) -> Document:

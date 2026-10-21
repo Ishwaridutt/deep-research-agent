@@ -17,10 +17,14 @@ from src.models.evidence_model import (
 from src.models.guardrails_model import (
     GuardrailDecision,
     GuardrailResult,
+    InputCategory,
+    InputClassification,
 )
 from src.models.report_model import (
     CitationCheckResult,
     CitationIssue,
+    CriticIssue,
+    CriticReview,
     DraftReport,
     FinalReportFinding,
     ReportFinding,
@@ -28,6 +32,7 @@ from src.models.report_model import (
     ResearchReport,
     SemanticCitationCheckOutput,
     SemanticFindingCheck,
+    UnverifiedMaterial,
 )
 from src.models.research_model import (
     FollowupPlannerOutput,
@@ -39,8 +44,10 @@ from src.models.research_model import (
     ResearchRequest,
     ResearchSource,
     ResearchStopReason,
+    SearchProviderName,
     SearchQuery,
     SubQuestion,
+    SubquestionSearchQueries,
     ResearchExecutionStatus,
 )
 from src.models.source_model import (
@@ -75,6 +82,8 @@ __all__ = [
     "CoverageGap",
     "CoverageResult",
     "CoverageStatus",
+    "CriticIssue",
+    "CriticReview",
     "DraftReport",
     "ErrorType",
     "Evidence",
@@ -84,9 +93,14 @@ __all__ = [
     "GeneratedSearchQuery",
     "GuardrailDecision",
     "GuardrailResult",
+    "InputCategory",
+    "InputClassification",
     "PlannedSubQuestion",
     "PlannerOutput",
     "QueryGeneratorOutput",
+    "SearchProviderName",
+    "SubquestionSearchQueries",
+    "UnverifiedMaterial",
     "ReportFinding",
     "ReportSource",
     "ResearchError",

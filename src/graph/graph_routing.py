@@ -197,7 +197,7 @@ def _determine_stop_reason(
     ):
         return ResearchStopReason.NO_EVIDENCE_IMPROVEMENT
 
-    if not coverage.gaps:
+    if not any(gap.blocking for gap in coverage.gaps):
         return ResearchStopReason.NO_ACTIONABLE_GAPS
 
     return None
@@ -352,7 +352,8 @@ def research_routing_node(
     updated_control = control.model_copy(
         update={
             "usage": updated_usage,
-            "pending_gaps": list(coverage.gaps),
+            # Only blocking gaps drive follow-up planning; the rest are writer limitations.
+            "pending_gaps": [gap for gap in coverage.gaps if gap.blocking],
             "history": [
                 *previous_rounds,
                 round_record,
@@ -408,3 +409,34 @@ def route_after_research(
         return "terminal_error"
 
     return decision.action
+
+
+WriterRouteName = Literal[
+    "critic",
+    "revise",
+    "citation_check",
+    "terminal_error",
+]
+
+
+def route_after_synthesis(
+    state: WorkflowState,
+) -> WriterRouteName:
+    """Send the first draft to the critic; a revised draft goes straight to citation checking."""
+    if has_terminal_error(state):
+        return "terminal_error"
+    if state["writer"].get("critic_review") is None:
+        return "critic"
+    return "citation_check"
+
+
+def route_after_critic(
+    state: WorkflowState,
+) -> WriterRouteName:
+    """Allow at most one revision; the critic never returns the job to research."""
+    if has_terminal_error(state):
+        return "terminal_error"
+    review = state["writer"].get("critic_review")
+    if review is not None and review.verdict == "revise" and state["writer"].get("revision_count", 0) == 0:
+        return "revise"
+    return "citation_check"
