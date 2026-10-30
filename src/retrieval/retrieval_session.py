@@ -27,7 +27,7 @@ class RetrievalSession:
 
     def build(self, documents: list[RetrievalDocument]) -> None:
         """Chunks and indexes all documents available to the research session."""
-
+        print("Clearing before building a new retrieval session...")
         self.clear()
 
         if not documents:

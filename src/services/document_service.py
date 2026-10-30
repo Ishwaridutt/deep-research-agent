@@ -158,7 +158,7 @@ class DocumentService:
     ) -> None:
         """Parse selected files and build the existing job retrieval session."""
 
-        print("\nStarting document retrieval session for doc_id: ", document_ids)
+        print("\nStarting document service for retrieval session for doc_id: ", document_ids)
         selected_document_ids = list(dict.fromkeys(document_ids))
         documents = [
             await self.get_document(owner_id, document_id)
@@ -205,7 +205,9 @@ class DocumentService:
             chunk.metadata.get("private_document_id")
             for chunk in session.chunks
         )
+        total_doc_chunks = 0
         for document in documents:
+            total_doc_chunks += chunks_per_document[document.document_id]
             await self._save_processing_state(
                 document,
                 status=DocumentStatus.READY,
@@ -213,6 +215,7 @@ class DocumentService:
                 error_message=None,
             )
 
+        print("\nLoading completed for document retrieval session with total_doc_chunks: ", total_doc_chunks)
         # Optional cleanup: the original upload is no longer needed after
         # successful parsing and indexing. Uncomment to enable file deletion.
         # for document_id in selected_document_ids:

@@ -231,7 +231,7 @@ async def research_planner_node(
             ]
         }
 
-    subquestions = _build_subquestions(
+    planned_subquestions = _build_subquestions(
         planner_output=planner_output,
         max_subquestions=max_subquestions,
         previous_subquestions=(research.get("planning_history") or research["subquestions"]) if is_followup else (),
@@ -241,7 +241,7 @@ async def research_planner_node(
         iteration=research["iteration_count"] + 1,
     )
 
-    if not subquestions:
+    if not planned_subquestions:
         if is_followup:
             update = _stop_refinement(state, ResearchStopReason.NO_ACTIONABLE_GAPS)
             if planner_output.subquestions:
@@ -292,27 +292,31 @@ async def research_planner_node(
             "job_id": state["job_id"],
             "research_session_id": state["research_session_id"],
             "node": "research_planner",
-            "subquestion_count": len(subquestions),
+            "subquestion_count": len(planned_subquestions),
             "iteration": research["iteration_count"] + 1,
             "data": {
                 "planning_mode": "refinement" if is_followup else "initial",
-                "active_subquestion_count": len(subquestions),
+                "active_subquestion_count": len(planned_subquestions),
             },
         },
     )
     print("\ngenerated subquestions: ", json.dumps(
-        [item.model_dump() for item in subquestions],
+        [item.model_dump() for item in planned_subquestions],
         indent=2,
     ))
 
     return {
         "research": {
             **state["research"],
-            "subquestions": research["subquestions"] if is_followup else subquestions,
-            "active_subquestions": subquestions,
+            # Original objectives are set once in round 1. Follow-ups never replace them:
+            # their evidence is filed under the parent objective, and coverage and the
+            # writer assess the original objectives.
+            "subquestions": research["subquestions"] if is_followup else planned_subquestions,
+            # This round's tasks: what the query generator, retrieval, and scorer use.
+            "active_subquestions": planned_subquestions,
             "planning_history": [
                 *(research.get("planning_history") or research["subquestions"]),
-                *subquestions,
+                *planned_subquestions,
             ],
         }
     }

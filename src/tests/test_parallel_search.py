@@ -340,3 +340,39 @@ def test_pubmed_and_pmc_copies_merge_and_prefer_full_text():
     merged = deduplicate_search_results([pubmed, pmc])
     assert len(merged) == 1 and merged[0].id == "pmc"
     assert {item["result_id"] for item in merged[0].provider_metadata["discovery_provenance"]} == {"pubmed", "pmc"}
+
+
+def test_search_node_records_provider_failures_and_still_raises_unexpected_errors():
+    from types import SimpleNamespace
+    from src.agents.research.research_web_search_node import research_web_search_node
+    from src.graph.graph_state import create_initial_workflow_state
+    from src.models import ResearchSource
+
+    class Provider:
+        def __init__(self, failure):
+            self.failure = failure
+
+        async def search(self, *, search_query, max_results):
+            if search_query.id == "q-bad":
+                raise self.failure
+            return [_result(result_id=search_query.id, provider=SourceProvider.TAVILY,
+                            canonical_id=f"web:{search_query.id}", url=f"https://example.com/{search_query.id}")]
+
+    def state():
+        value = create_initial_workflow_state(job_id="job", research_session_id="session",
+                                              question="Research the topic", allowed_sources=[ResearchSource.WEB])
+        value["research"]["search_queries"] = [_query().model_copy(update={"id": query_id}) for query_id in ("q-ok", "q-bad")]
+        return value
+
+    settings = SimpleNamespace(research_limits=SimpleNamespace(max_total_queries_per_job=30, max_search_results_per_query=5),
+                               search=SimpleNamespace())
+    update = asyncio.run(research_web_search_node(
+        state(), search_provider=Provider(SearchProviderError("provider down")), settings=settings,
+    ))
+    # The failed query becomes a recoverable note; the other query's results are kept.
+    assert [item.id for item in update["research"]["search_results"]] == ["q-ok"]
+    assert update["research"]["search_stats"]["failed_query_count"] == 1
+    assert update["errors"][0].recoverable and "provider down" in update["errors"][0].message
+
+    with pytest.raises(ValueError, match="bug"):
+        asyncio.run(research_web_search_node(state(), search_provider=Provider(ValueError("bug")), settings=settings))

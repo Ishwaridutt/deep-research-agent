@@ -534,3 +534,29 @@ def test_real_graph_replans_twice_and_accumulates_evidence_under_original_object
     assert all("coverage" not in context and "accepted_findings" not in context for context in planner_inputs)
     assert planner_inputs[1]["unresolved_gaps"][0]["subquestion_id"] == root_id
     assert len(final["research_control"].history) == 3
+
+
+def test_query_helpers_clean_select_and_fall_back_without_the_node():
+    from src.agents.research.research_query_generator_node import _clean_query, _select_queries
+
+    assert _clean_query("  ", max_words=12, max_chars=500) is None
+    assert _clean_query("x" * 30, max_words=12, max_chars=20) is None
+    assert _clean_query("one two three four", max_words=2, max_chars=500) == "one two"
+
+    tasks = [SubQuestion(id=f"t{i}", question=f"Question {i}?", objective="Find.") for i in range(3)]
+    generated_queries = QueryGeneratorOutput(subquestions=[
+        SubquestionSearchQueries(subquestion_id="t0", queries=[
+            GeneratedSearchQuery(query="first", purpose="Find"), GeneratedSearchQuery(query="second", purpose="Find"),
+        ]),
+    ])
+    previous = [SearchQuery(id="old", subquestion_id="t1", query="Question 1?", purpose="Old", iteration=1)]
+    queries, fallback_ids = _select_queries(
+        subquestions=tasks, generated_queries=generated_queries, previous_queries=previous, budget=3,
+        per_subquestion=2, max_words=12, max_chars=500, iteration=2,
+    )
+    # t0 uses the model's queries; t1's fallback duplicates an old search; t2 falls back to its text.
+    assert [(query.subquestion_id, query.query) for query in queries] == [
+        ("t0", "first"), ("t0", "second"), ("t2", "Question 2?"),
+    ]
+    assert fallback_ids == ["t2"]
+    assert all(query.iteration == 2 and query.providers == ["web"] for query in queries)

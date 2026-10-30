@@ -44,7 +44,7 @@ class RetrievalHybridRetriever:
 
     def build(self, chunks: list[RetrievalChunk]) -> None:
         """Builds the session-scoped semantic and BM25 retrievers."""
-
+        print('clearing before building a new hybrid retriever...')
         self.clear()
         self.add(chunks)
 

@@ -47,14 +47,23 @@ class ParallelSearchProvider(SearchProvider):
     ) -> list[SearchResult]:
         # General web search always runs; arXiv and Wikipedia run only when the
         # query generator requested them for this query.
+        # "web" is added again for safety, so web always runs
         requested = {"web", *getattr(search_query, "providers", ["web"])}
+        # arXiv runs only if ARXIV_ENABLED is true and the query is tagged arxiv.
         branches = [branch for branch in self._branches if branch[0] in requested]
         skipped = sorted(requested - {name for name, _, _ in branches})
         if skipped:
             print(f"\nrequested search branches are not enabled (skipped): {skipped}")
         if not branches:
-            return SearchResults([], {"provider_counts": {}, "successful_branches": [],
-                                      "failed_branches": [], "web_fallback_activated": False})
+            return SearchResults(
+                [],
+                {
+                    "provider_counts": {}, 
+                    "successful_branches": [],
+                    "failed_branches": [], 
+                    "web_fallback_activated": False
+                }
+            )
 
         # Each branch keeps its own result cap; the semaphore limits total
         # outbound searches without forcing the providers to run sequentially.
@@ -69,6 +78,7 @@ class ParallelSearchProvider(SearchProvider):
         ))
 
         # A failed provider must not discard useful results returned by the others.
+        # flatten every branch’s results into one list
         results = [
             result
             for _, branch_results, _ in outcomes
@@ -160,8 +170,9 @@ def deduplicate_search_results(
 
     groups: list[tuple[set[str], list[SearchResult]]] = []
     for result in results:
+        # compute every identity key for the result (see _identity_keys)
         identities = _identity_keys(result)
-        # Find every existing group that shares at least one known identifier with this new result
+        # Find every existing group that shares at least one known identifier key with this new result
         matches = [group for group in groups if group[0] & identities]
         if not matches:
             # We have not seen anything identifying this source yet. Start a collection for it.
@@ -169,18 +180,20 @@ def deduplicate_search_results(
             continue
 
         target = matches[0]
-        # adds the new identifiers to the existing set. 
+        # adds the new identifiers to the existing set, to the first matching group.
         # Sets automatically avoid duplicate entries.
         target[0].update(identities)
         target[1].append(result)
 
         # DOI, arXiv ID, page ID, and URL aliases can reveal that two earlier
         # groups describe the same underlying source.
+        # if it matched several groups, those groups were the same source all along
+        # The extra groups are merged into the first and removed.
         for duplicate in matches[1:]:
             target[0].update(duplicate[0])
             target[1].extend(duplicate[1])
             groups.remove(duplicate)
-
+    # reduce each group to one result with _merge_group
     return [_merge_group(group_results) for _, group_results in groups]
 
 

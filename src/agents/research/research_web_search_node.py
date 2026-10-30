@@ -74,23 +74,28 @@ async def research_web_search_node(
         logger.warning("Research time budget exhausted; stopping web search.")
         runnable_queries = []
 
-    async def run_query(search_query):
-        """Run one query and return its results or the failure to report."""
-        try:
-            return await asyncio.wait_for(
+    # return_exceptions=True keeps one failed query from cancelling the others:
+    # each outcome is either that query's results or its exception.
+    timeout = max(0.001, _seconds_remaining(state))
+    outcomes = await asyncio.gather(
+        *(
+            asyncio.wait_for(
                 search_provider.search(
-                    search_query=search_query,
+                    search_query=query,
                     max_results=settings.research_limits.max_search_results_per_query,
                 ),
-                timeout=max(0.001, _seconds_remaining(state)),
+                timeout=timeout,
             )
-        except (TimeoutError, SearchProviderError) as exc:
-            return exc
-
-    outcomes = await asyncio.gather(*(run_query(query) for query in runnable_queries))
+            for query in runnable_queries
+        ),
+        return_exceptions=True,
+    )
     queries_executed += len(runnable_queries)
 
     for search_query, results in zip(runnable_queries, outcomes):
+        # Only timeouts and provider failures are recoverable; anything else is a bug.
+        if isinstance(results, BaseException) and not isinstance(results, (TimeoutError, SearchProviderError)):
+            raise results
         if isinstance(results, TimeoutError):
             failed_query_count += 1
             logger.warning("Web search timed out at the research deadline.")
@@ -145,9 +150,7 @@ async def research_web_search_node(
 
         # No provider-score cut here: the relevance gate in the source processor is the
         # single relevance filter, applied on one scale to every provider's results.
-        filtered_results = list(results)
-
-        new_results.extend(filtered_results)
+        new_results.extend(results)
 
     updated_usage = control.usage.model_copy(update={"queries_executed": queries_executed})
     updated_control = control.model_copy(update={"usage": updated_usage})
