@@ -323,6 +323,7 @@ def _safe_details(
                 "capacity_skipped_chunk_count", "missing_chunk_count", "unknown_chunk_count",
                 "duplicate_chunk_count", "failed_batch_count", "total_evidence_count",
                 "min_evidence_relevance", "capacity_reached",
+                "jev_batch_count", "llm_batch_count", "jev_threshold",
             ) if isinstance(_field(stats, key), (int, float, bool))
         }
         audit = _field(research, "evidence_audit", [])

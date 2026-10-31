@@ -43,6 +43,12 @@ class ApplicationSettings(EnvironmentSettings):
         ge=10,
     )
 
+    # Debug JSON dumps of the graph state, one folder per job:
+    # research_state.json (latest coverage evaluation) and final_state.json.
+    # They contain full source and private-document text; keep them local.
+    state_dump_enabled: bool = True
+    state_dump_directory: Path = Path("data/state_dumps")
+
 
 class LLMSettings(EnvironmentSettings):
     """Configuration for provider-independent LLM execution."""
@@ -63,6 +69,19 @@ class LLMSettings(EnvironmentSettings):
     guardrail_model: str | None = None
 
     llm_timeout_seconds: int = Field(default=60, ge=1)
+
+    # TypeSafe Jev decision model. Without an API key the guardrail and evidence
+    # scoring keep using their LLM roles. Add "typesafe" to LLM_PRIVATE_DATA_PROVIDERS
+    # to let Jev score passages from private documents.
+    typesafe_api_key: SecretStr | None = None
+    jev_model: str = "jev-1.14.0"
+    jev_api_url: str = "https://api.typesafe.ai/v1/systemone"
+    jev_timeout_seconds: float = Field(default=15, ge=1)
+    jev_max_concurrency: int = Field(default=8, ge=1)
+    jev_max_retries: int = Field(default=2, ge=0)
+    jev_retry_delay_seconds: float = Field(default=1.0, ge=0.0)
+    guardrail_use_jev: bool = True
+    evidence_use_jev: bool = True
 
     # Provider-level retries for transient transport/API failures.
     llm_max_retries: int = Field(default=2, ge=0)
@@ -289,6 +308,9 @@ class ResearchLimitSettings(EnvironmentSettings):
         le=1.0,
         description="Minimum LLM relevance score for retaining an original retrieved chunk as evidence.",
     )
+
+    # Jev returns a yes-probability per passage, on a different scale from the LLM score.
+    evidence_jev_threshold: float = Field(default=0.70, ge=0.0, le=1.0)
 
     # Maximum number of useful evidence items retained by one research job.
     max_evidence_items: int = Field(

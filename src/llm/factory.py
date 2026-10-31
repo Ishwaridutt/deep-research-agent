@@ -4,11 +4,14 @@ from langchain.chat_models import init_chat_model
 from langchain_core.language_models.chat_models import BaseChatModel
 
 from src.config import Settings
+from src.llm.jev_service import JevService
 from src.llm.roles import LLMRole
 from src.llm.service import LLMProviderModel, LLMService
 
 
 SUPPORTED_PROVIDERS = {"openai", "google_genai", "groq"}
+# Jev is not a chat provider, but it may be trusted with private data.
+JEV_PROVIDER = "typesafe"
 
 
 def _resolve_model(
@@ -59,14 +62,14 @@ def _create_chat_model(
     )
 
 
-def _provider_names(value: str, *, setting_name: str) -> list[str]:
+def _provider_names(value: str, *, setting_name: str, allowed: set[str] = SUPPORTED_PROVIDERS) -> list[str]:
     providers = list(dict.fromkeys(
         provider.strip().lower() for provider in value.split(",") if provider.strip()
     ))
-    unsupported = set(providers) - SUPPORTED_PROVIDERS
+    unsupported = set(providers) - allowed
     if not providers or unsupported:
         raise ValueError(
-            f"{setting_name} must contain only: {sorted(SUPPORTED_PROVIDERS)}"
+            f"{setting_name} must contain only: {sorted(allowed)}"
         )
     return providers
 
@@ -137,6 +140,7 @@ def create_llm_service(settings: Settings) -> LLMService:
     private_data_providers = set(_provider_names(
         settings.llm.llm_private_data_providers,
         setting_name="LLM_PRIVATE_DATA_PROVIDERS",
+        allowed=SUPPORTED_PROVIDERS | {JEV_PROVIDER},
     ))
     models = {
         role: _create_model_chain(
@@ -154,3 +158,27 @@ def create_llm_service(settings: Settings) -> LLMService:
         private_data_providers=private_data_providers,
     )
 
+
+def create_jev_service(settings: Settings) -> JevService | None:
+    """Create the shared Jev client, or None when no TypeSafe API key is configured."""
+
+    llm = settings.llm
+    if llm.typesafe_api_key is None or not llm.typesafe_api_key.get_secret_value().strip():
+        return None
+    if not (llm.guardrail_use_jev or llm.evidence_use_jev):
+        return None
+    private_data_providers = _provider_names(
+        llm.llm_private_data_providers,
+        setting_name="LLM_PRIVATE_DATA_PROVIDERS",
+        allowed=SUPPORTED_PROVIDERS | {JEV_PROVIDER},
+    )
+    return JevService(
+        api_key=llm.typesafe_api_key.get_secret_value(),
+        model=llm.jev_model,
+        api_url=llm.jev_api_url,
+        timeout_seconds=llm.jev_timeout_seconds,
+        max_concurrency=llm.jev_max_concurrency,
+        max_retries=llm.jev_max_retries,
+        retry_delay_seconds=llm.jev_retry_delay_seconds,
+        private_data_allowed=JEV_PROVIDER in private_data_providers,
+    )

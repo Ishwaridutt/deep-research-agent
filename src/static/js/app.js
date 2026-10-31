@@ -61,7 +61,7 @@ const STAGES = {
     research_routing: "Decide next step",
     writer_prepare_evidence: "Prepare evidence",
     writer_synthesis: "Synthesize report",
-    writer_critic: "Review draft",
+    writer_critic: "Critic review",
     writer_citation_checker: "Verify citations",
     finalize_report: "Finalize report",
 };
@@ -547,7 +547,8 @@ function renderStageDetails(stage, round, selected = null, keySuffix = "") {
             ["Scored", data.scored_chunk_count], ["Kept this round", data.accepted_chunk_count],
             ["Below threshold", data.low_relevance_chunk_count], ["Capacity skipped", data.capacity_skipped_chunk_count],
         ]);
-        if (Number.isFinite(data.min_evidence_relevance)) body.append(create("p", "detail-muted", `Minimum relevance: ${data.min_evidence_relevance.toFixed(2)}. Below-threshold passages are filtered, not necessarily factually incorrect.`));
+        if (data.jev_batch_count && Number.isFinite(data.jev_threshold)) body.append(create("p", "detail-muted", `Scored by Jev for ${data.jev_batch_count} ${data.jev_batch_count === 1 ? "task" : "tasks"}: passages need a usefulness probability of at least ${data.jev_threshold.toFixed(2)}.`));
+        if (Number.isFinite(data.min_evidence_relevance) && (data.llm_batch_count || !data.jev_batch_count)) body.append(create("p", "detail-muted", `${data.jev_batch_count ? `Scored by the LLM for ${data.llm_batch_count} ${data.llm_batch_count === 1 ? "task" : "tasks"}. ` : ""}Minimum relevance: ${data.min_evidence_relevance.toFixed(2)}. Below-threshold passages are filtered, not necessarily factually incorrect.`));
         body.append(create("p", "detail-muted", `Total evidence retained across rounds: ${data.total_evidence_count ?? "Not recorded"}. Previously accepted passages are not rescored.`));
         const invalid = (data.missing_chunk_count || 0) + (data.unknown_chunk_count || 0) + (data.duplicate_chunk_count || 0);
         if (invalid) body.append(create("p", "detail-warning", `Scoring response issues: ${data.missing_chunk_count || 0} missing, ${data.unknown_chunk_count || 0} unknown IDs, ${data.duplicate_chunk_count || 0} duplicate judgments. These decisions were not accepted.`));

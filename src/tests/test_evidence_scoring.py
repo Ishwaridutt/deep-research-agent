@@ -8,7 +8,7 @@ import pytest
 
 from src.agents.research.research_evidence_extractor_node import research_evidence_extractor_node
 from src.graph.graph_state import create_initial_workflow_state
-from src.llm import LLMRole, LLMServiceError
+from src.llm import JevServiceError, LLMRole, LLMServiceError
 from src.models import (
     Evidence, EvidenceExtractionOutput, ResearchSource, RetrievalChunk,
     RetrievalResult, RetrievedChunk, SearchQuery, SourceType, SubQuestion,
@@ -121,6 +121,7 @@ def test_configured_threshold_filters_original_chunks_including_boundary(thresho
     assert record.data == {
         "scored_chunk_count": 3, "low_relevance_chunk_count": 3 - len(expected),
         "accepted_chunk_count": len(expected), "min_evidence_relevance": threshold,
+        "jev_threshold": None, "jev_batch_count": 0, "llm_batch_count": 1,
     }
 
 
@@ -270,3 +271,80 @@ def test_subquestions_are_scored_concurrently_and_applied_in_plan_order():
     result = score_state(state, SlowScorer())
     assert tracker["max_active"] == 2
     assert [item.chunk_id for item in result["research"]["evidence"]] == ["a", "b"]
+
+
+class FakeJev:
+    """Returns a probability per passage content; raises for contents listed in fail."""
+
+    def __init__(self, probabilities, *, private_data_allowed=False, fail=()):
+        self.probabilities = probabilities
+        self.private_data_allowed = private_data_allowed
+        self.fail = set(fail)
+        self.calls = []
+
+    async def noul(self, **kwargs):
+        self.calls.append(kwargs)
+        content = kwargs["state"]["passage"]["content"]
+        if content in self.fail:
+            raise JevServiceError("Jev unavailable")
+        return self.probabilities[content]
+
+
+def jev_score_state(state, service, jev, *, llm_threshold=0.6, jev_threshold=0.7):
+    return asyncio.run(research_evidence_extractor_node(
+        state, llm_service=service, jev_service=jev,
+        settings=SimpleNamespace(research_limits=SimpleNamespace(
+            max_evidence_items=100, min_evidence_relevance=llm_threshold, evidence_jev_threshold=jev_threshold,
+        )),
+    ))
+
+
+def test_jev_scores_each_passage_and_applies_its_own_threshold():
+    state = state_with_chunks(chunk("high", "useful"), chunk("edge", "borderline"), chunk("low", "unrelated"))
+    jev = FakeJev({"useful": 0.92, "borderline": 0.7, "unrelated": 0.65})
+    llm = FakeScorer()
+    result = jev_score_state(state, llm, jev)
+
+    evidence = result["research"]["evidence"]
+    assert [item.chunk_id for item in evidence] == ["high", "edge"]
+    assert evidence[0].relevance_score == 0.92 and evidence[0].provenance["relevance_scorer"] == "jev"
+    assert llm.calls == [] and len(jev.calls) == 3
+    assert jev.calls[0]["state"]["subquestion"] == "What do the results show?"
+    stats = result["research"]["evidence_stats"]
+    assert stats["jev_batch_count"] == 1 and stats["llm_batch_count"] == 0 and stats["jev_threshold"] == 0.7
+    assert stats["low_relevance_chunk_count"] == 1
+    rows = result["research"]["evidence_audit"][0]["passages"]
+    assert [row["decision"] for row in rows] == ["accepted", "accepted", "below_threshold"]
+
+
+def test_jev_failure_rescores_the_whole_batch_with_the_llm_threshold():
+    state = state_with_chunks(chunk("a", "first"), chunk("b", "second"))
+    jev = FakeJev({"first": 0.99}, fail={"second"})
+    llm = FakeScorer(scores(("a", 0.65), ("b", 0.4)))
+    result = jev_score_state(state, llm, jev)
+
+    evidence = result["research"]["evidence"]
+    assert [item.chunk_id for item in evidence] == ["a"]
+    assert evidence[0].relevance_score == 0.65 and evidence[0].provenance["relevance_scorer"] == "llm"
+    assert len(llm.calls) == 1
+    stats = result["research"]["evidence_stats"]
+    assert stats["jev_batch_count"] == 0 and stats["llm_batch_count"] == 1
+
+
+@pytest.mark.parametrize("allowed,expected_scorer", [(False, "llm"), (True, "jev")])
+def test_private_jobs_use_jev_only_when_typesafe_is_trusted(allowed, expected_scorer):
+    state = state_with_chunks(chunk("a", "content"))
+    state["allowed_sources"] = [ResearchSource.WEB, ResearchSource.DOCUMENTS]
+    jev = FakeJev({"content": 0.9}, private_data_allowed=allowed)
+    llm = FakeScorer(scores(("a", 0.9)))
+    result = jev_score_state(state, llm, jev)
+
+    assert result["research"]["evidence"][0].provenance["relevance_scorer"] == expected_scorer
+    assert bool(jev.calls) is allowed and bool(llm.calls) is not allowed
+    assert ("jev_threshold" in result["research"]["evidence_stats"]) is allowed
+
+
+def test_without_jev_the_llm_path_and_stats_are_unchanged():
+    result = score_state(state_with_chunks(chunk("a")), FakeScorer(scores(("a", 0.9))))
+    stats = result["research"]["evidence_stats"]
+    assert stats["llm_batch_count"] == 1 and stats["jev_batch_count"] == 0 and "jev_threshold" not in stats

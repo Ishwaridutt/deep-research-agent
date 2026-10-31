@@ -33,7 +33,7 @@ The project addresses a common failure mode in research assistants: sending larg
 
 | Research problem | How the project addresses it |
 |---|---|
-| Chit-chat, simple lookups, or prompt-injection attempts waste research budget. | An input guardrail (deterministic checks plus an LLM intent classifier) rejects non-research requests before a job is created. |
+| Chit-chat, simple lookups, or prompt-injection attempts waste research budget. | An input guardrail (deterministic checks plus a Jev or LLM intent classifier) rejects non-research requests before a job is created. |
 | A broad question is difficult to answer in one prompt. | The planner converts the question into bounded subquestions and objectives. |
 | Search results contain duplicates, snippets, boilerplate, and irrelevant text. | Provider adapters normalize results, canonical identifiers and titles merge duplicates, a relevance gate skips off-topic pages before extraction, deterministic cleaning removes noise, and retrieval selects relevant passages. |
 | One provider can be unavailable or rate-limited. | Search, extraction, and LLM calls use ordered fallbacks with bounded retries and circuit breakers. |
@@ -44,7 +44,8 @@ The project addresses a common failure mode in research assistants: sending larg
 
 ## Key Features
 
-- **Input guardrail:** Unicode normalization and injection patterns are checked without an LLM; an LLM classifier then allows only research requests. Rejected questions never create a job.
+- **Input guardrail:** Unicode normalization and injection patterns are checked without an LLM; an intent classifier (TypeSafe Jev when configured, otherwise an LLM) then allows only research requests. Rejected questions never create a job.
+- **Jev decision model (optional):** With a `TYPESAFE_API_KEY`, the input guardrail and evidence scoring call TypeSafe's Jev directly. It returns calibrated probabilities instead of generated text, so these high-volume decisions are faster and cheaper. Each falls back to its LLM role if Jev fails.
 - **Multi-stage LangGraph workflow:** Explicit nodes handle input validation, planning, query generation, source selection, retrieval, evidence relevance scoring, coverage evaluation, writing, critique, citation checking, and rendering.
 - **Three research modes:** Run web-only, document-only, or hybrid research from the same API and UI.
 - **Parallel public search:** A round's queries run concurrently. General web search (Tavily) always runs; arXiv and Wikipedia run only for queries the query generator tags for them.
@@ -98,7 +99,7 @@ flowchart LR
     User[Browser or API client]
     API[FastAPI routes]
     Service[ResearchService preflight and job lifecycle]
-    Guard[Input guardrail: checks + LLM classifier]
+    Guard[Input guardrail: checks + Jev or LLM classifier]
     Invoke{Execution mode}
     Graph[15-node compiled LangGraph]
     Providers[Search, extraction, and LLM providers]
@@ -138,7 +139,7 @@ flowchart LR
 6. Create one shared embedding service and local tokenizer.
 7. Create the retrieval-session factory and the search relevance gate (both reuse the shared embedding model).
 8. Create the application-scoped document service.
-9. Create the role-based LLM service.
+9. Create the role-based LLM service and, when a TypeSafe key is set, the shared Jev client (closed at shutdown).
 10. Build and compile the LangGraph workflow.
 11. Create `ResearchService` with the input guardrail, register routes, and mount the frontend (served with `Cache-Control: no-cache` so UI updates load after a restart).
 
@@ -231,7 +232,7 @@ Hybrid mode follows the public-search branch, but `research_source_selection` al
 | `research_web_search` | One public search source is incomplete and may fail. | Runs the round's queries concurrently through the parallel composite provider and retains normalized results and diagnostics. |
 | `research_source_processor` | Search results are not evidence-ready documents. | Merges copies of the same page or paper, applies the relevance gate, extracts the selected pages in parallel (provider-native for arXiv/Wikipedia), cleans them, and creates normalized `Source` objects. Gate-approved pages that miss the round's page cap are carried to the next round. |
 | `research_retrieval` | Entire sources are too large and noisy for an LLM. | Adds only new public sources to the job-owned web session, reuses the job-owned private session, searches with each active task's subquestion text plus its queries, and builds separate bounded web/document contexts. |
-| `research_evidence_extractor` | Retrieved passages may be irrelevant, while rewriting them can lose useful detail. | Scores each new chunk against its active task, objective, and current queries (one LLM call per subquestion, run concurrently); retains original passages meeting `MIN_EVIDENCE_RELEVANCE`. Evidence stays linked to the original objective with task, query, iteration, and source provenance. |
+| `research_evidence_extractor` | Retrieved passages may be irrelevant, while rewriting them can lose useful detail. | Scores each new chunk against its active task, objective, and current queries: one Jev yes/no question per chunk when Jev is configured, otherwise one LLM call per subquestion; all run concurrently. Retains original passages meeting `EVIDENCE_JEV_THRESHOLD` (Jev) or `MIN_EVIDENCE_RELEVANCE` (LLM). Evidence stays linked to the original objective with task, query, iteration, and source provenance. |
 | `research_coverage_evaluator` | The system must know when enough evidence exists to write. | Assesses stable original objectives, validates evidence IDs, and lists gaps marked `blocking` (a requested part has no usable evidence) or not (a limitation). Gap descriptions name entities found in the evidence so follow-up searches can target them. Final status is set in code: insufficient only when a blocking gap exists. |
 | `research_routing` | An LLM should not control an unbounded loop. | Deterministically checks coverage, iteration count, query usage, extraction attempts, elapsed time, and evidence gain; continues at `research_planner` only for blocking gaps, otherwise stops for writing. |
 | `writer_prepare_evidence` | The writer needs the full evidence set in a usable order. | Supplies all accepted evidence, grouped by subquestion in plan order with the strongest first, and records per-subquestion counts for the UI. Only evidence IDs are stored in writer state. |
@@ -480,6 +481,14 @@ The pipeline selects and transforms data while retaining identifiers needed to t
 
 Each subquestion's chunks are scored in one LLM call, and the calls for different subquestions run concurrently; results are applied in plan order so evidence IDs and capacity stay deterministic.
 
+#### Jev evidence scoring
+
+When a `TYPESAFE_API_KEY` is configured and `EVIDENCE_USE_JEV=true`, each new chunk gets one Jev `noul` question ("Does the passage contain substantive evidence that helps answer the subquestion?"). The state holds the original question, subquestion, objective, current queries, and the passage. Jev returns the probability that the answer is yes, which becomes the chunk's relevance score. Passages are kept at or above `EVIDENCE_JEV_THRESHOLD` (default `0.70`), because Jev probabilities are on a different scale from the LLM's 0–1 score.
+
+- If Jev fails for any chunk of a subquestion, that whole subquestion is rescored by the LLM with `MIN_EVIDENCE_RELEVANCE`, so one batch never mixes the two scales.
+- Each evidence item records `relevance_scorer` (`jev` or `llm`) in its provenance. The progress view shows which scorer handled how many tasks and the threshold it used.
+- The same code serves web, document, and hybrid jobs. The only difference is one privacy rule: in jobs with private documents, Jev scores only when `LLM_PRIVATE_DATA_PROVIDERS` lists `typesafe`; otherwise the LLM scores those jobs.
+
 Web and document evidence joins one downstream collection. Deduplication uses original objective ID plus chunk ID, preserving equal text from different source chunks. Already accepted chunks are not rescored for that objective, and evidence from earlier rounds remains available. Full retained passages increase writer context costs: the writer receives all accepted evidence (bounded by `MAX_EVIDENCE_ITEMS`).
 
 Follow-up evidence uses the original objective's ID in `Evidence.subquestion_id`. Provenance records `research_subquestion_id`, `research_iteration`, and `research_query_ids` for the task that discovered it. These query IDs identify task-level search intent, not an exact per-chunk query match. Coverage and writing therefore retain access to evidence from all rounds.
@@ -560,6 +569,8 @@ Nodes request logical roles rather than concrete provider SDKs:
 - `citation_checker`
 - `input_guardrail` (optional `GUARDRAIL_MODEL`; defaults to `QUERY_GENERATOR_MODEL`)
 
+Two decisions can run on TypeSafe's Jev instead of an LLM role: the input guardrail (a `choice` question over the six intent categories) and evidence scoring (a `noul` question per passage). `JevService` calls `POST /v1/systemone` directly with one shared HTTP client. It limits concurrent requests (`JEV_MAX_CONCURRENCY`) and retries timeouts, 408, 429, and 5xx responses with backoff. Any remaining failure falls back to the `input_guardrail` or `evidence_extractor` LLM role.
+
 Each role can define its own ordered provider/model chain. Cheap, fast models suit the high-volume steps (query generation, evidence scoring, input classification); stronger models suit the judgment steps (planning, coverage, writing, critique, citation checking).
 
 These are structured LLM calls, not autonomous agent executors. The graph contains no ReAct loop, LLM tool-selection loop, nested LangGraph, human interrupt, or checkpoint-backed resume path. Search, extraction, parsing, retrieval, persistence, and rendering are invoked directly by application code.
@@ -601,6 +612,7 @@ The service:
 | arXiv content | Bounded PDF | arXiv abstract | PDF disabled, unavailable, invalid, oversized, or unparsable |
 | Wikipedia content | MediaWiki API | None | Branch remains recoverable when other public branches succeed |
 | Structured LLM role | First configured eligible provider | Next configured provider | Classified call failure and private-data policy eligibility |
+| Input classification, evidence scoring | Jev (when configured) | The role's LLM chain | Jev failure after retries, or a private-document job without `typesafe` in `LLM_PRIVATE_DATA_PROVIDERS` (evidence only) |
 
 ## Jobs, Events, and UI Updates
 
@@ -665,7 +677,7 @@ Writer stages also have expandable details, listed in the order they ran:
 
 - **Prepare evidence:** passages and sources per subquestion, and the source funnel.
 - **Synthesize report:** draft or revision, title, outline by section, and citations per finding.
-- **Review draft (critic):** verdict, issue types, and each issue's instruction. When the critic requests changes, a "↻ Revision requested" note and a separate "Revise report (critic feedback)" row appear.
+- **Critic review:** verdict, issue types, and each issue's instruction. When the critic requests changes, a "↻ Revision requested" note and a separate "Revise report (critic feedback)" row appear.
 - **Verify citations:** verified findings, items moved to the unverified section, issues found, and whether semantic verification was unavailable.
 - **Finalize report:** collected → retrieved → accepted → supplied to writer → cited counts.
 
@@ -921,12 +933,18 @@ Use `.env.example` as the complete configuration reference.
 | `OPENAI_API_KEY`, `GOOGLE_API_KEY`, `GROQ_API_KEY` | Provider credentials. |
 | `LLM_PROVIDER` | Default provider for unqualified model names. |
 | `LLM_PROVIDER_ORDER` | Global provider preference order. |
-| `LLM_PRIVATE_DATA_PROVIDERS` | Providers allowed to receive private-document content. |
+| `LLM_PRIVATE_DATA_PROVIDERS` | Providers allowed to receive private-document content. Add `typesafe` to let Jev score private passages. |
 | `*_MODEL` | Provider-qualified model chain for each logical role. `CRITIC_MODEL` and `GUARDRAIL_MODEL` are optional. |
 | `LLM_TIMEOUT_SECONDS` | Per-provider timeout. |
 | `LLM_MAX_RETRIES` | Provider SDK retry count. |
 | `LLM_STRUCTURED_OUTPUT_METHOD` | LangChain structured-output method. |
 | `LLM_STRUCTURED_OUTPUT_ATTEMPTS` | Bounded parsing/schema attempts. |
+| `TYPESAFE_API_KEY` | Enables Jev. Leave empty to keep the guardrail and evidence scoring on their LLM roles. |
+| `JEV_MODEL` | Pinned Jev version. Default: `jev-1.14.0`. |
+| `JEV_API_URL` | Default: `https://api.typesafe.ai/v1/systemone`. |
+| `JEV_TIMEOUT_SECONDS`, `JEV_MAX_RETRIES`, `JEV_RETRY_DELAY_SECONDS` | Per-request timeout and retry with backoff. |
+| `JEV_MAX_CONCURRENCY` | Concurrent Jev requests across the process. Default: 8. |
+| `GUARDRAIL_USE_JEV`, `EVIDENCE_USE_JEV` | Turn Jev on or off for each step. Default: true. |
 
 ### Search and Extraction Settings
 
@@ -973,12 +991,26 @@ All retrieval variables use the `RETRIEVAL_` prefix.
 | `SEARCH_RELEVANCE_MIN_KEEP` | Candidates each subquestion keeps even below the threshold. Default: 2. |
 | `MAX_SOURCE_DOWNLOAD_BYTES` | Bounded source/PDF download size. |
 | `MIN_SOURCE_CONTENT_CHARS`, `MAX_SOURCE_CONTENT_CHARS` | Cleaner acceptance limits. |
-| `MIN_EVIDENCE_RELEVANCE` | Minimum accepted evidence relevance. |
+| `MIN_EVIDENCE_RELEVANCE` | Minimum accepted evidence relevance for LLM scores. |
+| `EVIDENCE_JEV_THRESHOLD` | Minimum Jev yes-probability for accepting a passage. Default: 0.70. |
 | `MAX_EVIDENCE_ITEMS` | Maximum accumulated evidence. |
 | `MAX_ITERATIONS` | Maximum research rounds. |
-| `INPUT_CLASSIFIER_ENABLED` | Run the LLM intent classifier in the input guardrail. Deterministic checks always run. Default: true. |
+| `INPUT_CLASSIFIER_ENABLED` | Run the intent classifier (Jev or LLM) in the input guardrail. Deterministic checks always run. Default: true. |
 | `DOCUMENT_MAX_TOTAL_SIZE_BYTES` | Per-owner upload quota in the in-memory registry. |
 | `DOCUMENT_UPLOAD_DIRECTORY` | Local uploaded-file directory. |
+
+### Debug State Dumps
+
+| Variable | Purpose |
+|---|---|
+| `STATE_DUMP_ENABLED` | Write the LangGraph state to JSON files instead of the console. Default: true. |
+| `STATE_DUMP_DIRECTORY` | Default: `data/state_dumps` (git-ignored). Each job gets a folder named after its job ID. |
+
+Each job folder holds two files:
+- `research_state.json`: the state after the coverage evaluator. Each research round overwrites it, so it ends as the state of the last round.
+- `final_state.json`: the whole state (research and writer) after `finalize_report`.
+
+The files contain full source text, including private-document passages, so keep them local. A failed write is logged as `state_dump_failed` and never fails the job.
 
 ## Project Structure
 
@@ -998,10 +1030,12 @@ All retrieval variables use the `RETRIEVAL_` prefix.
 │   ├── graph/
 │   │   ├── graph_builder.py          # LangGraph nodes and edges
 │   │   ├── graph_routing.py          # Deterministic conditional routing
-│   │   └── graph_state.py            # Workflow state ownership
+│   │   ├── graph_state.py            # Workflow state ownership
+│   │   └── state_dump.py             # Debug JSON dumps of the graph state
 │   ├── guardrails/                   # Input validation, input classifier, URL validation
 │   ├── llm/
-│   │   ├── factory.py                # Provider/model-chain construction
+│   │   ├── factory.py                # Provider/model-chain and Jev client construction
+│   │   ├── jev_service.py            # TypeSafe Jev client (noul and choice questions)
 │   │   ├── roles.py                  # Logical LLM responsibilities
 │   │   └── service.py                # Structured output, policy, and fallback
 │   ├── models/                       # Pydantic domain and API contracts

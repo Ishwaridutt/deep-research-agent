@@ -148,6 +148,15 @@ test("evidence progress separates filtering, capacity skips, invalid decisions, 
     }
 });
 
+test("evidence progress names the Jev and LLM scorers with their thresholds", () => {
+    const base = {scored_chunk_count: 4, accepted_chunk_count: 2, low_relevance_chunk_count: 2, capacity_skipped_chunk_count: 0, total_evidence_count: 2, min_evidence_relevance: 0.6};
+    let text = renderer([event("research_evidence_extractor", {...base, jev_batch_count: 2, llm_batch_count: 0, jev_threshold: 0.7})]).renderStageDetails("research_evidence_extractor", 1).textContent;
+    assert.ok(text.includes("Scored by Jev for 2 tasks") && text.includes("0.70"));
+    assert.ok(!text.includes("Minimum relevance"));
+    text = renderer([event("research_evidence_extractor", {...base, jev_batch_count: 1, llm_batch_count: 1, jev_threshold: 0.7})]).renderStageDetails("research_evidence_extractor", 1).textContent;
+    assert.ok(text.includes("Scored by Jev for 1 task:") && text.includes("Scored by the LLM for 1 task.") && text.includes("Minimum relevance: 0.60"));
+});
+
 test("coverage shows individual insufficient objectives and nonblocking limitations", () => {
     const data = {
         coverage_status: "sufficient", assessment_counts: {supported: 2, partial: 1, missing: 0, conflicting: 0},
@@ -331,11 +340,11 @@ test("writer runs show the draft, critic feedback, a separate revision row, and 
         run("writer_citation_checker", "stage_started"),
     ]);
     vm.runInContext(`WRITING = ["writer_prepare_evidence", "writer_synthesis", "writer_critic", "writer_citation_checker", "finalize_report"];
-        Object.assign(STAGES, {writer_prepare_evidence: "Prepare evidence", writer_critic: "Review draft",
+        Object.assign(STAGES, {writer_prepare_evidence: "Prepare evidence", writer_critic: "Critic review",
             writer_citation_checker: "Verify citations", finalize_report: "Finalize report"});`, context);
     const list = context.renderWriterGroup().children[1];
     const names = list.children.map(row => row.children[0]?.children?.[1]?.textContent?.trim() || row.textContent.trim().split(" ")[0]);
-    assert.deepEqual(names, ["Prepare evidence", "Synthesize report", "Review draft", "↻", "Revise report (critic feedback)", "Verify citations", "Finalize report"]);
+    assert.deepEqual(names, ["Prepare evidence", "Synthesize report", "Critic review", "↻", "Revise report (critic feedback)", "Verify citations", "Finalize report"]);
     assert.deepEqual(list.children.filter(row => row.dataset?.state).map(row => row.dataset.state),
         ["completed", "completed", "completed", "completed", "running", "pending"]);
     const critic = list.children[2].children[1];

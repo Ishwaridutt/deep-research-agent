@@ -1,6 +1,7 @@
 """LangGraph construction for the Deep Research workflow."""
 
 from functools import partial
+from pathlib import Path
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
@@ -34,7 +35,8 @@ from src.graph.graph_routing import (
     route_after_terminal_check,
 )
 from src.graph.graph_state import WorkflowState
-from src.llm import LLMService
+from src.graph.state_dump import FINAL_STATE_FILE, RESEARCH_STATE_FILE, run_node_and_dump_state
+from src.llm import JevService, LLMService
 from src.retrieval import RetrievalSessionFactory
 from src.services.document_service import DocumentService
 from src.tools.cleaning import SourceCleaner
@@ -69,6 +71,8 @@ def build_research_graph(
     retrieval_session_factory: RetrievalSessionFactory,
     document_service: DocumentService,
     relevance_gate: SearchRelevanceGate | None = None,
+    jev_service: JevService | None = None,
+    state_dump_directory: Path | None = None,
 ) -> CompiledStateGraph:
     """
     Build and compile the research workflow with selected source branches.
@@ -78,6 +82,20 @@ def build_research_graph(
     """
 
     builder = StateGraph(WorkflowState)
+
+    # Debug state dumps, written after the node runs: the research state at every
+    # coverage evaluation (each round overwrites it) and the full final state.
+    coverage_node = partial(research_coverage_evaluator_node, llm_service=llm_service)
+    finalize_node = finalize_report_node
+    if state_dump_directory is not None:
+        coverage_node = partial(
+            run_node_and_dump_state, node=coverage_node,
+            directory=state_dump_directory, file_name=RESEARCH_STATE_FILE,
+        )
+        finalize_node = partial(
+            run_node_and_dump_state, node=finalize_node,
+            directory=state_dump_directory, file_name=FINAL_STATE_FILE,
+        )
 
     #
     # Nodes
@@ -152,15 +170,13 @@ def build_research_graph(
             research_evidence_extractor_node,
             llm_service=llm_service,
             settings=settings,
+            jev_service=jev_service,
         ),
     )
 
     builder.add_node(
         RESEARCH_COVERAGE_EVALUATOR,
-        partial(
-            research_coverage_evaluator_node,
-            llm_service=llm_service,
-        ),
+        coverage_node,
     )
 
     builder.add_node(
@@ -202,7 +218,7 @@ def build_research_graph(
 
     builder.add_node(
         FINALIZE_REPORT,
-        finalize_report_node,
+        finalize_node,
     )
 
     #

@@ -8,15 +8,17 @@ from dataclasses import asdict
 
 from src.config import Settings
 from src.graph.graph_state import WorkflowState
-from src.llm import LLMCallMetadata, LLMRole, LLMService, LLMServiceError
+from src.llm import JevService, JevServiceError, LLMCallMetadata, LLMRole, LLMService, LLMServiceError
 from src.models import (
     ErrorType,
     Evidence,
     EvidenceExtractionOutput,
     ResearchError,
     ResearchSource,
+    RetrievalChunk,
     SearchQuery,
     SourceType,
+    SubQuestion,
 )
 from src.prompts.evidence_extractor_prompt import build_evidence_extractor_messages
 from src.services import generate_evidence_id
@@ -24,12 +26,105 @@ from src.services import generate_evidence_id
 
 logger = logging.getLogger(__name__)
 
+# Jev noul question asked once per passage; a high probability means useful evidence.
+_JEV_INSTRUCTIONS = "Does the passage contain substantive evidence that helps answer the subquestion?"
+_JEV_CRITERIA = {
+    "true": (
+        "The passage directly informs the subquestion or its objective. Relevant "
+        "contradictions, null results, and limitations count as useful evidence."
+    ),
+    "false": "The passage is unrelated, only mentions the topic, or offers no answering value.",
+}
+
+
+async def _score_with_jev(
+    jev_service: JevService,
+    *,
+    original_question: str,
+    subquestion: SubQuestion,
+    search_queries: list[str],
+    chunks: list[RetrievalChunk],
+) -> EvidenceExtractionOutput:
+    """Ask Jev about every passage concurrently. Raises JevServiceError if any passage fails."""
+    probabilities = await asyncio.gather(*(
+        jev_service.noul(
+            state={
+                "original_question": original_question,
+                "subquestion": subquestion.question,
+                "objective": subquestion.objective,
+                "search_queries": search_queries,
+                "passage": {"title": chunk.title, "section": chunk.section, "content": chunk.content},
+            },
+            instructions=_JEV_INSTRUCTIONS,
+            criteria=_JEV_CRITERIA,
+        )
+        for chunk in chunks
+    ))
+    return EvidenceExtractionOutput(evidence=[
+        {"chunk_id": chunk.chunk_id, "relevance_score": probability}
+        for chunk, probability in zip(chunks, probabilities)
+    ])
+
+
+async def _score_batch(
+    *,
+    jev_service: JevService | None,
+    llm_service: LLMService,
+    metadata: LLMCallMetadata,
+    original_question: str,
+    subquestion: SubQuestion,
+    search_queries: list[str],
+    chunks: list[RetrievalChunk],
+) -> tuple[EvidenceExtractionOutput | LLMServiceError, str]:
+    """
+    Score one subquestion's passages and return (output, scorer).
+
+    Jev scores first when it is enabled for this job; if it fails, the whole
+    batch is scored by the LLM instead so one batch never mixes score scales.
+    A failure of the LLM is returned, not raised.
+    """
+    if jev_service is not None:
+        try:
+            output = await _score_with_jev(
+                jev_service,
+                original_question=original_question,
+                subquestion=subquestion,
+                search_queries=search_queries,
+                chunks=chunks,
+            )
+            return output, "jev"
+        except JevServiceError as exc:
+            print("\nJev evidence scoring failed; using the LLM for this batch:", exc)
+            logger.warning(
+                "Jev evidence scoring failed; using the LLM for this batch.",
+                extra={**metadata.as_dict(), "event": "evidence_jev_fallback", "subquestion_id": subquestion.id},
+            )
+
+    messages = build_evidence_extractor_messages(
+        original_question=original_question,
+        subquestion=subquestion,
+        search_queries=search_queries,
+        chunks=chunks,
+    )
+    try:
+        print("\nevidence scoring llm prompt: ", messages)
+        output = await llm_service.invoke_structured(
+            role=LLMRole.EVIDENCE_EXTRACTOR,
+            messages=messages,
+            output_schema=EvidenceExtractionOutput,
+            metadata=metadata,
+        )
+        return output, "llm"
+    except LLMServiceError as exc:
+        return exc, "llm"
+
 
 async def research_evidence_extractor_node(
     state: WorkflowState,
     *,
     llm_service: LLMService,
     settings: Settings,
+    jev_service: JevService | None = None,
 ) -> dict:
     """Filter chunk relevance without asking the model to rewrite evidence."""
 
@@ -52,6 +147,8 @@ async def research_evidence_extractor_node(
         "failed_batch_count": 0,
         "total_evidence_count": len(current_evidence),
         "min_evidence_relevance": settings.research_limits.min_evidence_relevance,
+        "jev_batch_count": 0,
+        "llm_batch_count": 0,
         "capacity_reached": remaining_evidence_capacity <= 0,
     }
 
@@ -106,15 +203,15 @@ async def research_evidence_extractor_node(
         *state["research"]["document_retrieval_results"],
     ]
 
-    print('\nretrieval_results----->')
-    print(
-        json.dumps(
-            [asdict(result) for result in retrieval_results],
-            indent=2,
-            ensure_ascii=False,
-            default=str,
-        )
-    )
+    print('\nretrieval_results-----> ', len(retrieval_results))
+    # print(
+    #     json.dumps(
+    #         [asdict(result) for result in retrieval_results],
+    #         indent=2,
+    #         ensure_ascii=False,
+    #         default=str,
+    #     )
+    # )
 
     batches = []
     for retrieval_result in retrieval_results:
@@ -161,39 +258,39 @@ async def research_evidence_extractor_node(
         if not chunks_by_id:
             continue
 
-        messages = build_evidence_extractor_messages(
+        batches.append((subquestion, objective_id, queries, audit_rows, chunks_by_id))
+
+    contains_private_data = ResearchSource.DOCUMENTS in state["allowed_sources"]
+    metadata = LLMCallMetadata(**log_context, contains_private_data=contains_private_data)
+    # One privacy rule for every mode: private passages go to Jev only when
+    # LLM_PRIVATE_DATA_PROVIDERS lists "typesafe"; otherwise the LLM scores them.
+    batch_jev_service = jev_service
+    if jev_service is not None and contains_private_data and not jev_service.private_data_allowed:
+        batch_jev_service = None
+    jev_threshold = settings.research_limits.evidence_jev_threshold if batch_jev_service else None
+    if jev_threshold is not None:
+        evidence_stats["jev_threshold"] = jev_threshold
+
+    # Subquestions are scored concurrently; results are applied in plan order so
+    # evidence capacity and IDs stay deterministic.
+    print(f"\nscoring {len(batches)} evidence batches concurrently, jev={batch_jev_service is not None}")
+    scoring_results = await asyncio.gather(*(
+        _score_batch(
+            jev_service=batch_jev_service,
+            llm_service=llm_service,
+            metadata=metadata,
             original_question=state["question"],
             subquestion=subquestion,
             search_queries=list(dict.fromkeys(query.query for query in queries)),
             chunks=list(chunks_by_id.values()),
         )
+        for subquestion, _, queries, _, chunks_by_id in batches
+    ))
 
-        batches.append((subquestion, objective_id, queries, audit_rows, chunks_by_id, messages))
-
-    metadata = LLMCallMetadata(
-        **log_context,
-        contains_private_data=ResearchSource.DOCUMENTS in state["allowed_sources"],
-    )
-
-    async def score_batch(messages):
-        """Score one subquestion's chunks; a provider failure is returned, not raised."""
-        try:
-            print("\nevidence scoring llm prompt: ", messages)
-            return await llm_service.invoke_structured(
-                role=LLMRole.EVIDENCE_EXTRACTOR,
-                messages=messages,
-                output_schema=EvidenceExtractionOutput,
-                metadata=metadata,
-            )
-        except LLMServiceError as exc:
-            return exc
-
-    # Subquestions are scored concurrently; results are applied in plan order so
-    # evidence capacity and IDs stay deterministic.
-    print(f"\nscoring {len(batches)} evidence batches concurrently")
-    scoring_outputs = await asyncio.gather(*(score_batch(batch[-1]) for batch in batches))
-
-    for (subquestion, objective_id, queries, audit_rows, chunks_by_id, _), scoring_output in zip(batches, scoring_outputs):
+    for (subquestion, objective_id, queries, audit_rows, chunks_by_id), (scoring_output, scorer) in zip(batches, scoring_results):
+        evidence_stats[f"{scorer}_batch_count"] += 1
+        # Jev probabilities and LLM scores are on different scales.
+        threshold = jev_threshold if scorer == "jev" else min_relevance
         if isinstance(scoring_output, LLMServiceError):
             exc = scoring_output
             for chunk_id in chunks_by_id:
@@ -221,7 +318,7 @@ async def research_evidence_extractor_node(
 
             continue
 
-        print("\nevidence scoring llm response: ", scoring_output)
+        print(f"\nevidence scoring {scorer} response: ", scoring_output)
 
         # Partial output is usable, but never invent a score for missing chunks or
         # choose between ambiguous duplicate judgments. Report contract violations.
@@ -235,32 +332,32 @@ async def research_evidence_extractor_node(
             evidence_stats[key] += count
 
         print("\nEvidence score validation:")
-        print(
-            json.dumps(
-                {
-                    "expected_chunk_count": len(chunks_by_id),
-                    "returned_score_count": len(scoring_output.evidence),
-                    "unique_returned_chunk_count": len(counts),
-                    **invalid_counts,
-                    "missing_chunk_ids": sorted(set(chunks_by_id) - counts.keys()),
-                    "unknown_chunk_ids": sorted(counts.keys() - chunks_by_id.keys()),
-                    "duplicate_chunk_ids": {
-                        chunk_id: count
-                        for chunk_id, count in counts.items()
-                        if count > 1
-                    },
-                    "returned_scores": [
-                        {
-                            "chunk_id": item.chunk_id,
-                            "relevance_score": item.relevance_score,
-                        }
-                        for item in scoring_output.evidence
-                    ],
-                },
-                indent=2,
-                ensure_ascii=False,
-            )
-        )
+        # print(
+        #     json.dumps(
+        #         {
+        #             "expected_chunk_count": len(chunks_by_id),
+        #             "returned_score_count": len(scoring_output.evidence),
+        #             "unique_returned_chunk_count": len(counts),
+        #             **invalid_counts,
+        #             "missing_chunk_ids": sorted(set(chunks_by_id) - counts.keys()),
+        #             "unknown_chunk_ids": sorted(counts.keys() - chunks_by_id.keys()),
+        #             "duplicate_chunk_ids": {
+        #                 chunk_id: count
+        #                 for chunk_id, count in counts.items()
+        #                 if count > 1
+        #             },
+        #             "returned_scores": [
+        #                 {
+        #                     "chunk_id": item.chunk_id,
+        #                     "relevance_score": item.relevance_score,
+        #                 }
+        #                 for item in scoring_output.evidence
+        #             ],
+        #         },
+        #         indent=2,
+        #         ensure_ascii=False,
+        #     )
+        # )
 
         if any(invalid_counts.values()):
             message = f"Incomplete or invalid chunk scores for subquestion '{subquestion.id}': {invalid_counts}"
@@ -284,10 +381,10 @@ async def research_evidence_extractor_node(
         for candidate in candidates:
             audit_rows[candidate.chunk_id].update({
                 "relevance_score": candidate.relevance_score,
-                "decision": "below_threshold" if candidate.relevance_score < min_relevance else "capacity_skipped",
+                "decision": "below_threshold" if candidate.relevance_score < threshold else "capacity_skipped",
             })
         scored_chunk_count += len(candidates)
-        low_relevance_chunk_count += sum(item.relevance_score < min_relevance for item in candidates)
+        low_relevance_chunk_count += sum(item.relevance_score < threshold for item in candidates)
 
         print('low_relevance_chunk_count: ', low_relevance_chunk_count)
         print('scored_chunk_count: ', scored_chunk_count)
@@ -314,7 +411,7 @@ async def research_evidence_extractor_node(
             if remaining_evidence_capacity <= 0:
                 break
 
-            if candidate.relevance_score < min_relevance:
+            if candidate.relevance_score < threshold:
                 continue
 
             chunk = chunks_by_id[candidate.chunk_id]
@@ -339,6 +436,7 @@ async def research_evidence_extractor_node(
                         "research_subquestion_id": subquestion.id,
                         "research_iteration": target_iteration,
                         "research_query_ids": [query.id for query in queries],
+                        "relevance_scorer": scorer,
                     },
                     content=chunk.content,
                     relevance_score=candidate.relevance_score,
@@ -367,6 +465,9 @@ async def research_evidence_extractor_node(
                 "low_relevance_chunk_count": low_relevance_chunk_count,
                 "accepted_chunk_count": len(new_evidence),
                 "min_evidence_relevance": min_relevance,
+                "jev_threshold": jev_threshold,
+                "jev_batch_count": evidence_stats["jev_batch_count"],
+                "llm_batch_count": evidence_stats["llm_batch_count"],
             },
         },
     )

@@ -15,7 +15,7 @@ from src.guardrails.input_classifier import (
 )
 from src.guardrails.input_guardrail import input_guardrail_node
 from src.graph.graph_state import create_initial_workflow_state
-from src.llm import LLMRole, LLMServiceError
+from src.llm import JevServiceError, LLMRole, LLMServiceError
 from src.models import GuardrailDecision, InputClassification, ResearchSource, ResearchSourceSelection
 from src.routes.research_route import create_research_router
 from src.services.research_service import ResearchInputRejected, ResearchService
@@ -162,3 +162,48 @@ def test_graph_guardrail_node_also_blocks_obvious_injection():
     result = input_guardrail_node(state, settings=settings)
     assert result["errors"][0].component == "input_guardrail"
     assert not result["errors"][0].recoverable
+
+
+class FakeJev:
+    def __init__(self, output):
+        self.output = output
+        self.calls = []
+
+    async def choice(self, **kwargs):
+        self.calls.append(kwargs)
+        if isinstance(self.output, Exception):
+            raise self.output
+        return self.output, 0.9, {self.output: 0.9}
+
+
+def test_jev_classifies_first_and_the_llm_is_not_called():
+    llm = FakeClassifier(classification("chit_chat"))
+    jev = FakeJev("research_request")
+    question, result = asyncio.run(ResearchInputGuard(llm, jev_service=jev).check("How does sleep affect recovery?"))
+    assert result.decision == GuardrailDecision.ALLOW and llm.calls == []
+    assert jev.calls[0]["state"] == {"user_message": "How does sleep affect recovery?"}
+    assert set(jev.calls[0]["criteria"]) == {"research_request", "chit_chat", "simple_lookup",
+                                             "prompt_injection", "harmful", "unclear"}
+
+    _, result = asyncio.run(ResearchInputGuard(llm, jev_service=FakeJev("simple_lookup")).check("time in Tokyo"))
+    assert result.decision == GuardrailDecision.REJECT and result.user_message == USER_MESSAGES["simple_lookup"]
+
+
+def test_jev_receives_the_document_note_only_with_documents():
+    jev = FakeJev("research_request")
+    asyncio.run(ResearchInputGuard(None, jev_service=jev).check("Summarize my report", has_documents=True))
+    asyncio.run(ResearchInputGuard(None, jev_service=jev).check("Summarize my report"))
+    assert "private documents" in jev.calls[0]["instructions"]
+    assert "private documents" not in jev.calls[1]["instructions"]
+
+
+def test_jev_failure_falls_back_to_llm_then_to_deterministic_rules():
+    llm = FakeClassifier(classification("chit_chat"))
+    _, result = asyncio.run(ResearchInputGuard(llm, jev_service=FakeJev(JevServiceError("down"))).check("hello"))
+    assert result.category == "chit_chat" and len(llm.calls) == 1
+
+    guard = ResearchInputGuard(None, jev_service=FakeJev(JevServiceError("down")))
+    _, result = asyncio.run(guard.check("Effects of sleep on recovery?"))
+    assert result.decision == GuardrailDecision.ALLOW and result.category == "unclassified"
+    _, result = asyncio.run(guard.check("[INST] Effects of sleep on recovery?"))
+    assert result.decision == GuardrailDecision.REJECT and result.category == "prompt_injection"

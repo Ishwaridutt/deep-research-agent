@@ -15,7 +15,7 @@ from src.config.logging import configure_logging
 from src.documents.document_dependencies import create_document_service
 from src.graph.graph_builder import build_research_graph
 from src.guardrails.input_classifier import ResearchInputGuard
-from src.llm import create_llm_service
+from src.llm import JevService, create_jev_service, create_llm_service
 from src.persistence import ResearchJobStore
 from src.retrieval import RetrievalSessionFactory
 from src.retrieval.embeddings import RetrievalEmbeddingService
@@ -110,6 +110,7 @@ def _create_research_service(
     retrieval_session_factory: RetrievalSessionFactory,
     document_service: DocumentService,
     relevance_gate: SearchRelevanceGate,
+    jev_service: JevService | None,
 ) -> ResearchService:
     """Create the complete research application service."""
 
@@ -123,6 +124,8 @@ def _create_research_service(
         retrieval_session_factory=retrieval_session_factory,
         document_service=document_service,
         relevance_gate=relevance_gate,
+        jev_service=jev_service if settings.llm.evidence_use_jev else None,
+        state_dump_directory=settings.app.state_dump_directory if settings.app.state_dump_enabled else None,
     )
 
     return ResearchService(
@@ -134,6 +137,7 @@ def _create_research_service(
         input_guard=ResearchInputGuard(
             llm_service,
             classifier_enabled=settings.research_limits.input_classifier_enabled,
+            jev_service=jev_service if settings.llm.guardrail_use_jev else None,
         ),
     )
 
@@ -171,6 +175,17 @@ def create_app() -> FastAPI:
         threshold=settings.research_limits.search_relevance_threshold,
         min_keep=settings.research_limits.search_relevance_min_keep,
     )
+    # One shared Jev client (None without a TypeSafe key) for the guardrail and evidence scoring.
+    jev_service = create_jev_service(settings)
+    logger.info(
+        "Jev decision model configured." if jev_service else "Jev decision model not configured; using LLM roles.",
+        extra={"event": "jev_configured", "node": "server", "data": {
+            "enabled": jev_service is not None,
+            "guardrail": bool(jev_service) and settings.llm.guardrail_use_jev,
+            "evidence": bool(jev_service) and settings.llm.evidence_use_jev,
+            "private_data_allowed": bool(jev_service) and jev_service.private_data_allowed,
+        }},
+    )
     # Build the graph and expensive shared dependencies once per process.
     research_service = _create_research_service(
         settings=settings,
@@ -181,6 +196,7 @@ def create_app() -> FastAPI:
         retrieval_session_factory=retrieval_session_factory,
         document_service=document_service,
         relevance_gate=relevance_gate,
+        jev_service=jev_service,
     )
 
     @asynccontextmanager
@@ -200,6 +216,8 @@ def create_app() -> FastAPI:
             await job_store.close()
             await _close_resource(name="search_provider", resource=search_provider)
             await _close_resource(name="source_extractor", resource=source_extractor)
+            if jev_service is not None:
+                await _close_resource(name="jev_service", resource=jev_service)
             logger.info(
                 "Application stopped.",
                 extra={"event": "application_stopped", "node": "server"},
